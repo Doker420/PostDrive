@@ -199,9 +199,11 @@ G4F_TIMEOUT = int(config.get('AI', 'G4F_TIMEOUT', fallback='45'))
 # Имена провайдеров в g4f меняются от версии к версии, поэтому список
 # из конфига фильтруется по реально существующим классам, а если ничего
 # не осталось — провайдеры ищутся автоматически (см. _g4f_providers).
+# ВАЖНО: только провайдеры, работающие БЕЗ ключа и БЕЗ оплаты.
+# PollinationsAI/OpenAIFM убраны: перешли на платную модель (402 No cake credits).
 G4F_PROVIDERS = [p.strip() for p in config.get(
     'AI', 'G4F_PROVIDERS',
-    fallback='PollinationsAI,Yqcloud,TeachAnything,OpenAIFM,Qwen,GLM'
+    fallback='Yqcloud,ChatGptOss,GLM,Qwen,TeachAnything,PhindAi,Cloudflare,DeepAI,OperaAria,You'
 ).split(',') if p.strip()]
 # Пусто = использовать default_model каждого провайдера (надёжнее, чем
 # навязывать имя модели, которого у провайдера может не быть).
@@ -1242,15 +1244,22 @@ class AccountSessionManager:
 
     # Шаблон системного промта. {instruction} — то, что пользователь пишет в настройках
     # (например: "дополнительно призыв глянуть профиль или био").
+    # Максимальная длина комментария. Живой подписчик не пишет простыни,
+    # а длинный текст мгновенно выдаёт бота и ловит бан.
+    MAX_COMMENT_CHARS = 320
+
     AI_SYSTEM_TEMPLATE = (
         "Ты — живой человек, читающий Telegram-канал, а не бот. "
-        "Напиши ОДИН короткий комментарий (1-2 предложения) к посту ниже на языке поста.\n"
+        "Напиши ОДИН короткий комментарий (максимум 2 предложения, "
+        "не длиннее 300 символов) к посту ниже на языке поста.\n"
         "Правила:\n"
         "- пиши естественно и по теме поста, как обычный подписчик;\n"
         "- без приветствий, без кавычек, без хештегов, без markdown;\n"
+        "- НИКАКИХ списков, таблиц, заголовков, пунктов и разметки;\n"
+        "- не давай советов, анализа и инструкций, если об этом не просили;\n"
         "- не пересказывай пост и не повторяй его дословно;\n"
         "- не упоминай, что ты ИИ, и не объясняй свой ответ;\n"
-        "- в ответе только текст комментария.\n"
+        "- в ответе только текст комментария, одним абзацем.\n"
         "{instruction_block}"
     )
 
@@ -1274,6 +1283,13 @@ class AccountSessionManager:
 
         system = AccountSessionManager.AI_SYSTEM_TEMPLATE.format(instruction_block=instruction_block)
         messages = [{"role": "system", "content": system}]
+        # Пример диалога: показываем модели ожидаемый формат ответа.
+        # Без этого reasoning-модели (gpt-oss и подобные) отвечают развёрнутым
+        # разбором с таблицами вместо живой реплики.
+        messages.append({"role": "user", "content":
+                         "Текст поста:\nСегодня рынок снова удивил: активы прибавили 5% за сутки."})
+        messages.append({"role": "assistant", "content":
+                         "Вот это скачок, давно такого не было. Интересно, удержится ли."})
         if post_text:
             messages.append({"role": "user", "content": f"Текст поста:\n{post_text[:1500]}"})
         else:
@@ -1296,6 +1312,40 @@ class AccountSessionManager:
         if len(result) > 1 and result[0] in '"\u00ab\u201c\'' and result[-1] in '"\u00bb\u201d\'':
             result = result[1:-1].strip()
         result = result.replace('**', '').replace('__', '')
+
+        # ── Обрезаем «простыни» ──
+        # Модели вроде gpt-oss любят отвечать разбором с таблицами и списками.
+        # Для комментария это мгновенный признак бота, поэтому берём только
+        # связный текст и ограничиваем длину.
+        lines = []
+        for raw_line in result.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                if lines:
+                    break          # первый абзац закончился — дальше не нужно
+                continue
+            # таблицы, заголовки, списки, нумерация — мусор для комментария
+            if line.startswith('|') or set(line) <= set('|-: '):
+                break
+            if line.startswith('#') or line.startswith('---'):
+                break
+            if re.match(r'^([-*•]|\d+[.)])\s+', line):
+                break
+            lines.append(line)
+        if lines:
+            result = ' '.join(lines).strip()
+
+        limit = AccountSessionManager.MAX_COMMENT_CHARS
+        if len(result) > limit:
+            cut = result[:limit]
+            # обрезаем по границе предложения, иначе по последнему пробелу
+            marks = [cut.rfind(m) for m in ('. ', '! ', '? ', '…')]
+            best = max(marks)
+            if best > limit * 0.4:
+                result = cut[:best + 1]
+            else:
+                sp = cut.rfind(' ')
+                result = (cut[:sp] if sp > limit * 0.4 else cut).rstrip(' ,;:—-') + '…'
         return result.strip()
 
     # ==================== TELEGRAM CALL GUARD (FloodWait & bans) ====================
@@ -1517,7 +1567,7 @@ class AccountSessionManager:
                             "HTTP-Referer": "https://t.me/poster_bot",
                             "X-Title": "PostDrive"
                         },
-                        json={"model": AI_MODEL, "messages": messages, "max_tokens": 200, "temperature": 0.8}
+                        json={"model": AI_MODEL, "messages": messages, "max_tokens": 160, "temperature": 0.9}
                     )
                     response.raise_for_status()
                     data = response.json()
@@ -1536,7 +1586,7 @@ class AccountSessionManager:
                 oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
                 model_name = AI_MODEL if AI_MODEL.startswith('gpt') else 'gpt-4o-mini'
                 response = await oai.chat.completions.create(
-                    model=model_name, messages=messages, max_tokens=200, temperature=0.8
+                    model=model_name, messages=messages, max_tokens=160, temperature=0.9
                 )
                 cleaned = self._clean_ai_output(response.choices[0].message.content)
                 if cleaned:
@@ -1562,7 +1612,7 @@ class AccountSessionManager:
     async def _groq_chat(self, model: str, messages: list) -> Optional[str]:
         """Один запрос к Groq. Бросает _ModelGoneError, если модель снята с обслуживания."""
         import json as json_mod
-        payload = {"model": model, "messages": messages, "max_tokens": 200, "temperature": 0.8}
+        payload = {"model": model, "messages": messages, "max_tokens": 160, "temperature": 0.9}
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
@@ -1595,6 +1645,31 @@ class AccountSessionManager:
             return await asyncio.to_thread(_urllib_request)
 
     _g4f_provider_cache = None
+    # Провайдеры, которые начали требовать оплату (402 / credits / proof-of-work).
+    # Пополняется на лету и больше не опрашивается до перезапуска бота.
+    _g4f_paid = set()
+
+    # Провайдеры, заведомо требующие ключ/оплату или проксирующие платные API.
+    # Держим отдельным списком, чтобы не тратить на них попытки.
+    G4F_PAID_PROVIDERS = {
+        'PollinationsAI', 'Pollinations', 'PollinationsImage', 'PollinationsAudio',
+        'OpenaiChat', 'OpenaiAccount', 'OpenAIFM', 'Copilot', 'CopilotApp',
+        'MetaAI', 'Gemini', 'GeminiPro', 'Claude', 'Perplexity', 'Groq',
+        'Nvidia', 'HuggingSpace', 'LMArena', 'OpenRouterFree', 'Custom',
+    }
+
+    @staticmethod
+    def _is_paid_error(e) -> bool:
+        """Похоже ли исключение на требование оплаты/регистрации."""
+        name = type(e).__name__
+        if name in ('PaymentRequiredError', 'MissingAuthError', 'ModelNotAllowedError'):
+            return True
+        txt = str(e).lower()
+        markers = ('402', 'payment required', 'no cake credits', 'proof-of-work',
+                   'credits', 'sign up', 'api key', 'unauthorized', '401',
+                   'quota', 'subscription', 'insufficient')
+        return any(m in txt for m in markers)
+
 
     @classmethod
     def _g4f_providers(cls):
@@ -1618,6 +1693,8 @@ class AccountSessionManager:
         found = []
 
         for name in G4F_PROVIDERS:
+            if name in cls.G4F_PAID_PROVIDERS or name in cls._g4f_paid:
+                continue
             try:
                 provider = getattr(G4FProviders, name, None)
             except Exception:
@@ -1655,6 +1732,11 @@ class AccountSessionManager:
                             'search', 'cached', 'custom', 'ollama'
                         )):
                             continue
+                        if cname in ('provider', 'Provider', 'BaseProvider'):
+                            continue
+                        # платные/требующие регистрации — мимо
+                        if cname in cls.G4F_PAID_PROVIDERS or cname in cls._g4f_paid:
+                            continue
                         seen.add(cname)
                         found.append((cls_, cname))
             except Exception as e:
@@ -1687,7 +1769,7 @@ class AccountSessionManager:
             pass
 
         def _sync_call(provider, model):
-            kwargs = {"messages": messages, "max_tokens": 200}
+            kwargs = {"messages": messages, "max_tokens": 160}
             if model:
                 kwargs["model"] = model
             client = G4FClient(provider=provider) if provider else G4FClient()
@@ -1700,6 +1782,8 @@ class AccountSessionManager:
             return ""
 
         for provider, label in attempts:
+            if label in self._g4f_paid:
+                continue          # уже просил денег — не тратим время
             # Если модели в конфиге не заданы — берём default_model провайдера
             models = G4F_MODELS or [getattr(provider, 'default_model', None) or None]
             for model in models:
@@ -1715,9 +1799,25 @@ class AccountSessionManager:
                 except asyncio.TimeoutError:
                     logging.warning(f"⚠️ g4f {label}/{model or 'default'}: таймаут {G4F_TIMEOUT}s")
                 except Exception as e:
+                    if self._is_paid_error(e):
+                        # Провайдер перешёл на платную модель (402 / credits /
+                        # proof-of-work). Бесплатным он уже не станет — исключаем
+                        # его до перезапуска, чтобы не долбиться в стену.
+                        self._g4f_paid.add(label)
+                        logging.warning(
+                            f"💰 g4f {label}: требует оплату — исключён из бесплатного пула"
+                        )
+                        break
                     logging.warning(f"⚠️ g4f {label}/{model or 'default'}: "
                                     f"{type(e).__name__}: {str(e)[:120]}")
-        logging.error("❌ g4f: все провайдеры недоступны")
+        if self._g4f_paid:
+            logging.error(
+                "❌ g4f: бесплатные провайдеры не ответили "
+                f"(платные, исключены: {', '.join(sorted(self._g4f_paid))}). "
+                "Для стабильной работы добавьте бесплатный GROQ_API_KEY в config.ini."
+            )
+        else:
+            logging.error("❌ g4f: все провайдеры недоступны")
         return ""
 
     async def start_neurocomment(self, account_id: int, bot, user_id: int):
