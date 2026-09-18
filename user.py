@@ -129,7 +129,6 @@ GROQ_DECOMMISSIONED = {
 OPENAI_API_KEY = config.get('AI', 'OPENAI_API_KEY', fallback='').strip()
 ANTHROPIC_API_KEY = config.get('AI', 'ANTHROPIC_API_KEY', fallback='').strip()
 GEMINI_API_KEY = config.get('AI', 'GEMINI_API_KEY', fallback='').strip()
-G4F_API_KEY = config.get('AI', 'G4F_API_KEY', fallback='').strip()
 GROQ_API_KEY = config.get('AI', 'GROQ_API_KEY', fallback='').strip()
 OPENROUTER_API_KEY = config.get('AI', 'OPENROUTER_API_KEY', fallback='').strip()
 
@@ -138,13 +137,17 @@ G4F_ENABLED = config.get('AI', 'G4F_ENABLED', fallback='true').strip().lower() i
 G4F_TIMEOUT = int(config.get('AI', 'G4F_TIMEOUT', fallback='45'))
 # Явные провайдеры перебираются первыми: они не требуют манифеста с g4f.dev,
 # из-за недоступности которого g4f 8.x падает целиком.
+# Имена провайдеров в g4f меняются от версии к версии, поэтому список
+# из конфига фильтруется по реально существующим классам, а если ничего
+# не осталось — провайдеры ищутся автоматически (см. _g4f_providers).
 G4F_PROVIDERS = [p.strip() for p in config.get(
     'AI', 'G4F_PROVIDERS',
-    fallback='PollinationsAI,Blackbox,DDG,ChatGptEs,Free2GPT,Liaobots,Yqcloud'
+    fallback='PollinationsAI,Yqcloud,TeachAnything,OpenAIFM,Qwen,GLM'
 ).split(',') if p.strip()]
+# Пусто = использовать default_model каждого провайдера (надёжнее, чем
+# навязывать имя модели, которого у провайдера может не быть).
 G4F_MODELS = [m.strip() for m in config.get(
-    'AI', 'G4F_MODELS',
-    fallback='gpt-4o-mini,gpt-4o,llama-3.3-70b,deepseek-v3'
+    'AI', 'G4F_MODELS', fallback=''
 ).split(',') if m.strip()]
 
 
@@ -1519,8 +1522,80 @@ class AccountSessionManager:
                     raise RuntimeError(f"HTTP {he.code}: {body}")
             return await asyncio.to_thread(_urllib_request)
 
+    _g4f_provider_cache = None
+
+    @classmethod
+    def _g4f_providers(cls):
+        """Список (класс_провайдера, имя) для перебора.
+
+        g4f НЕ требует API-ключа — это обёртка над публичными провайдерами.
+        Имена классов меняются от версии к версии (в 8.5.1 больше нет Blackbox,
+        DDG, ChatGptEs, Free2GPT, Liaobots), поэтому:
+          1) берём из конфига только реально существующие классы;
+          2) если не осталось ничего — сканируем пакет и находим все рабочие
+             провайдеры, не требующие авторизации.
+
+        Сканирование идёт по подмодулям напрямую: обращение к некоторым
+        атрибутам g4f.Provider дёргает загрузку манифеста с g4f.dev, и при
+        недоступности домена падает вся генерация.
+        """
+        if cls._g4f_provider_cache is not None:
+            return cls._g4f_provider_cache
+
+        import g4f.Provider as G4FProviders
+        found = []
+
+        for name in G4F_PROVIDERS:
+            try:
+                provider = getattr(G4FProviders, name, None)
+            except Exception:
+                provider = None
+            if provider is not None and getattr(provider, 'working', False):
+                found.append((provider, name))
+
+        if not found:
+            logging.warning(
+                "⚠️ g4f: провайдеры из config.ini не найдены в установленной "
+                "версии g4f — ищу доступные автоматически"
+            )
+            try:
+                import importlib, pkgutil, inspect
+                seen = set()
+                for mod_info in pkgutil.iter_modules(G4FProviders.__path__):
+                    if mod_info.name.startswith('_'):
+                        continue
+                    try:
+                        mod = importlib.import_module(f"g4f.Provider.{mod_info.name}")
+                    except Exception:
+                        continue
+                    for cname, cls_ in inspect.getmembers(mod, inspect.isclass):
+                        if cname.startswith('_') or cname in seen:
+                            continue
+                        if not cls_.__module__.startswith('g4f.'):
+                            continue
+                        if not (getattr(cls_, 'working', False) and not getattr(cls_, 'needs_auth', False)):
+                            continue
+                        # Отсеиваем картиночные/аудио и поисковые провайдеры —
+                        # для генерации текста они непригодны
+                        low = cname.lower()
+                        if any(k in low for k in (
+                            'image', 'flux', 'audio', 'sd35', 'stability',
+                            'search', 'cached', 'custom', 'ollama'
+                        )):
+                            continue
+                        seen.add(cname)
+                        found.append((cls_, cname))
+            except Exception as e:
+                logging.warning(f"⚠️ g4f: автопоиск провайдеров не удался: {e}")
+
+        if found:
+            logging.info(f"🤖 g4f: доступно провайдеров — {len(found)}: "
+                         f"{', '.join(n for _, n in found[:8])}")
+        cls._g4f_provider_cache = found
+        return found
+
     async def _g4f_chat(self, messages: list) -> str:
-        """g4f-фолбэк.
+        """g4f-фолбэк. Ключ не нужен: это доступ к публичным провайдерам.
 
         В g4f 8.x клиент при первом вызове тянет список провайдеров с g4f.dev.
         Если сети до него нет (или домен лежит), падает вся генерация — поэтому
@@ -1540,26 +1615,22 @@ class AccountSessionManager:
             pass
 
         def _sync_call(provider, model):
-            kwargs = {"model": model, "messages": messages, "max_tokens": 200}
+            kwargs = {"messages": messages, "max_tokens": 200}
+            if model:
+                kwargs["model"] = model
             client = G4FClient(provider=provider) if provider else G4FClient()
             resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content
 
-        attempts = []
-        # Сначала явные провайдеры (не требуют манифеста с g4f.dev), потом авто-режим
-        for prov_name in G4F_PROVIDERS:
-            try:
-                import g4f.Provider as G4FProviders
-                provider = getattr(G4FProviders, prov_name, None)
-            except Exception:
-                provider = None
-            if provider is None:
-                continue
-            attempts.append((provider, prov_name))
-        attempts.append((None, 'auto'))
+        attempts = list(self._g4f_providers())
+        if not attempts:
+            logging.error("❌ g4f: не найдено ни одного рабочего провайдера")
+            return ""
 
         for provider, label in attempts:
-            for model in G4F_MODELS:
+            # Если модели в конфиге не заданы — берём default_model провайдера
+            models = G4F_MODELS or [getattr(provider, 'default_model', None) or None]
+            for model in models:
                 try:
                     result = await asyncio.wait_for(
                         asyncio.to_thread(_sync_call, provider, model),
@@ -1567,12 +1638,13 @@ class AccountSessionManager:
                     )
                     cleaned = self._clean_ai_output(result)
                     if cleaned:
-                        logging.info(f"🤖 g4f:{label}/{model} → {cleaned[:80]}")
+                        logging.info(f"🤖 g4f:{label}/{model or 'default'} → {cleaned[:80]}")
                         return cleaned
                 except asyncio.TimeoutError:
-                    logging.warning(f"⚠️ g4f {label}/{model}: таймаут {G4F_TIMEOUT}s")
+                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: таймаут {G4F_TIMEOUT}s")
                 except Exception as e:
-                    logging.warning(f"⚠️ g4f {label}/{model}: {type(e).__name__}: {str(e)[:120]}")
+                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: "
+                                    f"{type(e).__name__}: {str(e)[:120]}")
         logging.error("❌ g4f: все провайдеры недоступны")
         return ""
 

@@ -50,18 +50,23 @@ MODEL = openai/gpt-oss-20b
 OPENAI_API_KEY = 
 ANTHROPIC_API_KEY = 
 GEMINI_API_KEY = 
-G4F_API_KEY = 
 GROQ_API_KEY =
 OPENROUTER_API_KEY =
 
 ; ── Бесплатный фолбэк g4f ────────────────────────────────────────
+; ВАЖНО: g4f НЕ требует API-ключа. Это обёртка над публичными провайдерами,
+; поэтому никакого G4F_API_KEY здесь нет и быть не должно.
 ; g4f работает без ключей, но регулярно недоступен: провайдеры отваливаются,
 ; а сам пакет в версии 8.x тянет список провайдеров с g4f.dev.
 ; Для продакшена используйте GROQ_API_KEY (бесплатный и стабильный).
 G4F_ENABLED = true
 G4F_TIMEOUT = 45
-G4F_PROVIDERS = PollinationsAI,Blackbox,DDG,ChatGptEs,Free2GPT,Liaobots,Yqcloud
-G4F_MODELS = gpt-4o-mini,gpt-4o,llama-3.3-70b,deepseek-v3
+; Имена провайдеров меняются от версии к версии g4f. Если указанных здесь
+; классов нет в установленной версии, бот сам найдёт рабочие — список ниже
+; это лишь приоритет. G4F_MODELS можно оставить пустым: тогда для каждого
+; провайдера берётся его default_model (надёжнее, чем навязывать имя модели).
+G4F_PROVIDERS = PollinationsAI,Yqcloud,TeachAnything,OpenAIFM,Qwen,GLM
+G4F_MODELS =
 
 [PAYMENTS]
 ; Telegram Stars (нативная оплата в Telegram, без KYC).
