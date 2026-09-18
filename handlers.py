@@ -2983,24 +2983,75 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await callback.answer("🗑 Список очищен")
         await nc_channels_callback(callback, state)
 
-    @dp.callback_query(F.data.startswith('nccl_'))
-    async def nc_channel_list_callback(callback: CallbackQuery, state: FSMContext):
-        # nccl_{account_id}_{page}
-        parts = callback.data.split('_')
-        account_id = int(parts[1])
-        page = int(parts[2]) if len(parts) > 2 else 0
-        per_page = 8
+    _nc_scanning = set()
 
+    async def _load_nc_channels(callback: CallbackQuery, state: FSMContext,
+                                account_id: int, refresh: bool = False):
+        """Поиск каналов с комментариями. Предупреждает, что это долго,
+        и не даёт запустить два сканирования одновременно."""
         cache_key = f"nc_channels_cache_{account_id}"
-        data = await state.get_data()
-        cached = data.get(cache_key)
-        if not cached:
-            await callback.answer("⏳ Ищу каналы с открытыми комментариями...")
-            cached, err = await account_manager.list_commentable_channels(account_id)
+
+        if account_id in _nc_scanning:
+            await callback.answer(
+                "⏳ Поиск каналов уже идёт.\n\n"
+                "Дождитесь окончания — не нажимайте кнопки.",
+                show_alert=True
+            )
+            return None, "busy"
+
+        _nc_scanning.add(account_id)
+        try:
+            await callback.answer("⏳ Начинаю поиск...")
+            total_channels = db.count_account_chats(account_id, chat_types=('channel',))
+            # ~0.2с на канал: проверка идёт пачками по 4 канала
+            eta = max(10, int(total_channels * 0.2))
+            try:
+                await edit_message(
+                    callback,
+                    "🔍 <b>Ищу каналы с открытыми комментариями</b>\n\n"
+                    f"Каналов для проверки: <b>{total_channels or '?'}</b>\n"
+                    f"Примерное время: <b>~{eta // 60} мин {eta % 60} сек</b>\n\n"
+                    "⚠️ <b>Не нажимайте кнопки</b> — Telegram ограничивает частоту\n"
+                    "запросов, поэтому каждый канал проверяется отдельно.\n\n"
+                    "<i>Список появится автоматически.</i>",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+            cached, err = await account_manager.list_commentable_channels(
+                account_id, refresh=refresh
+            )
             if err:
-                await callback.answer(f"❌ {err}", show_alert=True)
-                return
+                try:
+                    await edit_message(callback, f"❌ {err}", reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(
+                            text="◀️ Назад", callback_data=f"nc_channels_{account_id}")]]))
+                except Exception:
+                    await callback.answer(f"❌ {err}", show_alert=True)
+                return None, err
             await state.update_data(**{cache_key: cached, 'nc_account_id': account_id})
+            return cached, None
+        finally:
+            _nc_scanning.discard(account_id)
+
+    async def _render_nc_channels(callback: CallbackQuery, state: FSMContext,
+                                  account_id: int, page: int = 0,
+                                  cached=None, notice: str = ""):
+        """Отрисовка списка каналов.
+
+        Параметры передаются явно — CallbackQuery у pydantic v2 заморожен,
+        присваивание callback.data роняет обработчик (frozen_instance).
+        """
+        per_page = 8
+        cache_key = f"nc_channels_cache_{account_id}"
+        if cached is None:
+            data = await state.get_data()
+            cached = data.get(cache_key)
+        if not cached:
+            cached, err = await _load_nc_channels(callback, state, account_id)
+            if err:
+                return
 
         if not cached:
             await callback.answer(
@@ -3036,21 +3087,25 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await edit_message(callback,
             f"📢 <b>Каналы с открытыми комментариями</b>\n\n"
             f"Найдено: {total} | Выбрано: {len(selected)}\n"
-            f"Страница {page+1}/{total_pages}",
+            f"Страница {page+1}/{total_pages}" + (f"\n\n{notice}" if notice else ""),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
+
+    @dp.callback_query(F.data.startswith('nccl_'))
+    async def nc_channel_list_callback(callback: CallbackQuery, state: FSMContext):
+        # nccl_{account_id}_{page}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
+        await _render_nc_channels(callback, state, account_id, page)
 
     @dp.callback_query(F.data.startswith('ncrf_'))
     async def nc_refresh_channels_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[1])
-        await callback.answer("🔄 Обновляю...")
-        cached, err = await account_manager.list_commentable_channels(account_id, refresh=True)
+        cached, err = await _load_nc_channels(callback, state, account_id, refresh=True)
         if err:
-            await callback.answer(f"❌ {err}", show_alert=True)
             return
-        await state.update_data(**{f"nc_channels_cache_{account_id}": cached})
-        callback.data = f"nccl_{account_id}_0"
-        await nc_channel_list_callback(callback, state)
+        await _render_nc_channels(callback, state, account_id, 0, cached=cached)
 
     @dp.callback_query(F.data.startswith('nctg_'))
     async def nc_toggle_channel_callback(callback: CallbackQuery, state: FSMContext):
@@ -3062,6 +3117,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         data = await state.get_data()
         cached = data.get(f"nc_channels_cache_{account_id}", [])
+        if not cached:
+            # FSM-состояние потеряно (перезапуск бота) — список нужно искать заново
+            await callback.answer(
+                "⚠️ Список устарел. Нажмите «🔄 Обновить список».", show_alert=True
+            )
+            return
         entry = next((c for c in cached if c['chat_id'] == chat_id), None)
         ref = f"@{entry['username']}" if entry and entry.get('username') else chat_id
 
@@ -3073,9 +3134,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             channels.append(ref)
         _nc_save_channels(account_id, callback.from_user.id, channels)
-        await callback.answer()
-        callback.data = f"nccl_{account_id}_{page}"
-        await nc_channel_list_callback(callback, state)
+        await callback.answer("☑️ Выбран" if ref in channels else "⬜ Снят")
+        await _render_nc_channels(callback, state, account_id, page, cached=cached)
 
     @dp.message(NeuroCommentStates.WAITING_TARGET_CHANNELS)
     async def process_nc_channels(message: Message, state: FSMContext):

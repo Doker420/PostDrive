@@ -2148,23 +2148,52 @@ class AccountSessionManager:
 
         channels = db.get_account_chats(account_id, chat_types=('channel',))
         result = []
-        for ch in channels:
+
+        # Проверяем каналы небольшими пачками: последовательный обход при
+        # сотне каналов занимал минуты. Параллелизм намеренно низкий —
+        # Telegram отдаёт FloodWait за частые get_chat.
+        sem = asyncio.Semaphore(4)
+
+        async def _check(ch):
             cid = ch['chat_id']
-            try:
-                chat_ref = int(cid) if cid.lstrip('-').isdigit() else cid
-                chat_obj = await client.get_chat(chat_ref)
-                discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
-                if discussion_id:
-                    result.append({
-                        'chat_id': cid,
-                        'title': ch.get('chat_title') or cid,
-                        'username': ch.get('chat_username') or '',
-                        'discussion_id': discussion_id
-                    })
-            except Exception as e:
-                logging.debug(f"list_commentable_channels skip {cid}: {e}")
-                continue
-            await asyncio.sleep(0.15)  # мягкий rate-limit, чтобы не ловить FloodWait
+            async with sem:
+                try:
+                    chat_ref = int(cid) if cid.lstrip('-').isdigit() else cid
+                    chat_obj = await self.tg_call(
+                        lambda: client.get_chat(chat_ref),
+                        account_id=account_id,
+                        description=f"get_chat {cid}",
+                        notify=False, max_retries=2
+                    )
+                    if chat_obj is None:
+                        return None
+                    discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
+                    if discussion_id:
+                        return {
+                            'chat_id': cid,
+                            'title': ch.get('chat_title') or cid,
+                            'username': ch.get('chat_username') or '',
+                            'discussion_id': discussion_id
+                        }
+                except AccountBlockedError:
+                    raise
+                except Exception as e:
+                    logging.debug(f"list_commentable_channels skip {cid}: {e}")
+                await asyncio.sleep(0.1)   # мягкий rate-limit
+                return None
+
+        try:
+            found = await asyncio.gather(*(_check(ch) for ch in channels),
+                                         return_exceptions=True)
+        except AccountBlockedError as e:
+            return [], str(e)
+
+        for item in found:
+            if isinstance(item, AccountBlockedError):
+                return [], str(item)
+            if isinstance(item, dict):
+                result.append(item)
+        result.sort(key=lambda c: (c['title'] or '').lower())
         return result, None
 
     # ==================== CHAT LIST & SYNC ====================
