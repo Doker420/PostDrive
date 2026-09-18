@@ -93,6 +93,13 @@ async def _shutdown():
     except:
         pass
 
+    # Close DB pool
+    try:
+        logger.info(f"DB pool stats before shutdown: {db.pool_stats()}")
+        db.close()
+    except Exception as e:
+        logger.warning(f"DB pool close failed: {e}")
+
     logger.info("Graceful shutdown complete.")
 
 def _signal_handler(sig, frame):

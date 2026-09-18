@@ -3,6 +3,11 @@ import time
 import asyncio
 import logging
 import os
+import queue
+import threading
+import contextlib
+import contextvars
+import functools
 from typing import List, Dict, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -28,30 +33,139 @@ def get_db_sync(db_path: str = 'database.db') -> 'DBConnection':
         _db_instance = DBConnection(db_path)
     return _db_instance
 
-class DBConnection(object):
-    def __init__(self, db_path: str = 'database.db'):
+class _AutoCursor:
+    """Fallback-курсор для прямого доступа к db.c вне метода класса.
+
+    Захватывает соединение из пула и держит его до сборки мусора. В штатном
+    режиме недостижим: все публичные методы DBConnection обёрнуты в
+    _with_pooled_connection и уже имеют закреплённое соединение.
+    """
+    __slots__ = ('_db', '_pooled', '_cm')
+
+    def __init__(self, db):
+        self._db = db
+        self._cm = db.connection()
+        self._pooled = self._cm.__enter__()
+
+    def __getattr__(self, item):
+        return getattr(self._pooled.cursor, item)
+
+    def __del__(self):
+        try:
+            self._cm.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+def _with_pooled_connection(func):
+    """Закрепляет за вызовом метода одно соединение из пула.
+
+    Благодаря реентрантности connection() вложенные вызовы методов БД
+    переиспользуют то же соединение, поэтому execute() и fetchone() внутри
+    одного метода всегда работают на одном курсоре и не могут перемешаться
+    с запросами конкурентной задачи.
+    """
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self.connection():
+            return func(self, *args, **kwargs)
+    return wrapper
+
+
+class _PoolBoundMeta(type):
+    """Автоматически оборачивает публичные методы в _with_pooled_connection."""
+
+    _SKIP = {
+        'connection', 'transaction', 'close', 'pool_stats', 'c', 'conn_ctx',
+        '_cursor', '_new_raw_conn', '_apply_pragmas', '_acquire_raw', '_current',
+        '_dict_fetchone', '_dict_fetchall',
+    }
+
+    def __new__(mcls, name, bases, ns):
+        for attr, value in list(ns.items()):
+            if attr.startswith('__') or attr in mcls._SKIP:
+                continue
+            if isinstance(value, (staticmethod, classmethod, property)):
+                continue
+            if callable(value) and not asyncio.iscoroutinefunction(value):
+                ns[attr] = _with_pooled_connection(value)
+        return super().__new__(mcls, name, bases, ns)
+
+
+class _PooledConnection:
+    """Обёртка над sqlite3.Connection, которая возвращает себя в пул при release()."""
+    __slots__ = ('raw', 'cursor', 'pool', 'depth')
+
+    def __init__(self, raw, pool):
+        self.raw = raw
+        self.cursor = raw.cursor()
+        self.pool = pool
+        self.depth = 0  # счётчик вложенных захватов внутри одной задачи
+
+    # Прозрачное проксирование Connection API (execute/commit/rollback/...)
+    def __getattr__(self, item):
+        return getattr(self.raw, item)
+
+
+class DBConnection(metaclass=_PoolBoundMeta):
+    """SQLite-доступ с пулом соединений.
+
+    Каждая asyncio-задача (или поток) получает собственное соединение и собственный
+    курсор на время работы. Это устраняет гонку, при которой два конкурентных
+    обработчика делали execute() и fetchone() на одном общем курсоре и получали
+    чужие строки. Записи сериализуются через отдельный write-лок, чтение идёт
+    параллельно благодаря WAL.
+    """
+
+    # Сколько одновременных соединений держать. Читатели в WAL не блокируют друг друга.
+    POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', '12'))
+
+    def __init__(self, db_path: str = 'database.db', pool_size: Optional[int] = None):
         self.db_path = db_path
-        self._cursor_ref = None  # shared cursor, lazily created by the c property
-        self.conn = sqlite3.connect(
+        self.pool_size = pool_size or self.POOL_SIZE
+
+        self._pool: "queue.LifoQueue[_PooledConnection]" = queue.LifoQueue()
+        self._all_conns: List[_PooledConnection] = []
+        self._pool_lock = threading.Lock()
+        self._created = 0
+
+        # Соединение, закреплённое за текущей задачей/потоком (реентрантность)
+        self._local = threading.local()
+        self._ctx_conn: contextvars.ContextVar = contextvars.ContextVar(
+            f'db_conn_{id(self)}', default=None
+        )
+
+        # Служебное соединение для миграций/DDL и для legacy-доступа вне задач
+        self.conn = self._new_raw_conn()
+
+        self._write_lock = asyncio.Lock()      # для async-писателей
+        self._thread_write_lock = threading.RLock()  # для sync-писателей
+
+        self._apply_pragmas(self.conn)
+        self.create_tables()
+        self.update_db()
+        self.seed_default_tariffs()
+        self.cleanup_old_data()
+
+        # Register as shared singleton
+        global _db_instance
+        _db_instance = self
+        logger.info(f"DB pool initialised: size={self.pool_size} path={self.db_path}")
+
+    # ── Connection factory ────────────────────────────────────────
+    def _new_raw_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
             timeout=30,               # wait up to 30s for locks instead of immediate error
             isolation_level=None,     # autocommit mode; we manage transactions explicitly
         )
-        self.conn.row_factory = sqlite3.Row
-        self._write_lock = asyncio.Lock()
-        self._apply_pragmas()
-        self.create_tables()
-        self.update_db()
-        self.seed_default_tariffs()
-        self.cleanup_old_data()
-        # Register as shared singleton
-        global _db_instance
-        _db_instance = self
+        conn.row_factory = sqlite3.Row
+        return conn
 
-    def _apply_pragmas(self):
+    def _apply_pragmas(self, conn: sqlite3.Connection, verbose: bool = True):
         """Apply performance and safety pragmas. WAL mode allows concurrent reads while writing."""
-        c = self.conn.cursor()
+        c = conn.cursor()
         c.execute('PRAGMA journal_mode=WAL')
         c.execute('PRAGMA busy_timeout=30000')      # 30s lock timeout
         c.execute('PRAGMA synchronous=NORMAL')      # safe + fast with WAL
@@ -60,21 +174,150 @@ class DBConnection(object):
         c.execute('PRAGMA temp_store=MEMORY')       # temp tables in RAM
         c.execute('PRAGMA mmap_size=268435456')     # 256MB memory-mapped IO
         c.close()
-        logger.info(f"DB pragmas applied (WAL mode, busy_timeout=30s) for {self.db_path}")
+        if verbose:
+            logger.info(f"DB pragmas applied (WAL mode, busy_timeout=30s) for {self.db_path}")
 
-    # ── Cursor management ─────────────────────────────────────────
+    # ── Pool management ───────────────────────────────────────────
+    def _acquire_raw(self, timeout: float = 30.0) -> _PooledConnection:
+        """Достаёт соединение из пула, при необходимости создавая новое."""
+        try:
+            return self._pool.get_nowait()
+        except queue.Empty:
+            pass
+        with self._pool_lock:
+            if self._created < self.pool_size:
+                pooled = _PooledConnection(self._new_raw_conn(), self)
+                self._apply_pragmas(pooled.raw, verbose=False)
+                self._created += 1
+                self._all_conns.append(pooled)
+                return pooled
+        # Пул исчерпан — ждём освобождения
+        try:
+            return self._pool.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"DB pool exhausted (size={self.pool_size}), no connection in {timeout}s")
+
+    def _current(self) -> Optional[_PooledConnection]:
+        """Соединение, закреплённое за текущим контекстом (задачей или потоком)."""
+        pooled = self._ctx_conn.get()
+        if pooled is not None:
+            return pooled
+        return getattr(self._local, 'conn', None)
+
+    @contextlib.contextmanager
+    def connection(self):
+        """Закрепляет соединение из пула за текущим контекстом.
+
+        Реентрантно: вложенные вызовы переиспользуют то же соединение, поэтому
+        транзакция внутри метода, который сам вызывает другие методы БД,
+        остаётся целостной.
+        """
+        existing = self._current()
+        if existing is not None:
+            existing.depth += 1
+            try:
+                yield existing
+            finally:
+                existing.depth -= 1
+            return
+
+        pooled = self._acquire_raw()
+        pooled.depth = 1
+        token = self._ctx_conn.set(pooled)
+        self._local.conn = pooled
+        try:
+            yield pooled
+        finally:
+            pooled.depth = 0
+            try:
+                self._ctx_conn.reset(token)
+            except ValueError:
+                self._ctx_conn.set(None)
+            self._local.conn = None
+            try:
+                # Не тащим незакрытую транзакцию в следующего пользователя
+                if pooled.raw.in_transaction:
+                    pooled.raw.rollback()
+            except Exception:
+                pass
+            self._pool.put(pooled)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Атомарная транзакция на выделенном соединении (write-путь)."""
+        with self._thread_write_lock:
+            with self.connection() as pooled:
+                if pooled.depth > 1:
+                    # уже внутри внешней транзакции — не открываем вложенную
+                    yield pooled
+                    return
+                try:
+                    pooled.raw.execute('BEGIN IMMEDIATE')
+                    yield pooled
+                    pooled.raw.commit()
+                except Exception:
+                    try:
+                        pooled.raw.rollback()
+                    except Exception:
+                        pass
+                    raise
+
+    def close(self):
+        """Закрывает все соединения пула."""
+        with self._pool_lock:
+            for pooled in self._all_conns:
+                try:
+                    pooled.cursor.close()
+                    pooled.raw.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
+            self._created = 0
+        while True:
+            try:
+                self._pool.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        logger.info("DB pool closed")
+
+    def pool_stats(self) -> Dict[str, int]:
+        return {
+            'size': self.pool_size,
+            'created': self._created,
+            'idle': self._pool.qsize(),
+            'in_use': self._created - self._pool.qsize(),
+        }
+
+    # ── Cursor access (backwards compatible) ──────────────────────
     @property
     def c(self):
-        """Returns a shared cursor. SQLite cursors are lightweight and the
-        connection-level locking (WAL mode + busy_timeout) handles concurrency.
-        Using a single cursor avoids the bug where execute() and fetchone()
-        would run on different cursors."""
-        if self._cursor_ref is None:
-            self._cursor_ref = self.conn.cursor()
-        return self._cursor_ref
+        """Курсор текущего контекста.
+
+        Если задача уже держит соединение (через connection()/transaction()),
+        отдаём его курсор. Иначе — автоматически берём соединение из пула на
+        время одного вызова, чтобы старый код `self.c.execute(...)` продолжал
+        работать и при этом был изолирован от других задач.
+        """
+        pooled = self._current()
+        if pooled is not None:
+            return pooled.cursor
+        return _AutoCursor(self)
+
+    @property
+    def conn_ctx(self):
+        """Соединение текущего контекста (или служебное)."""
+        pooled = self._current()
+        return pooled.raw if pooled is not None else self.conn
 
     def _cursor(self):
-        return self.conn.cursor()
+        pooled = self._current()
+        if pooled is not None:
+            return pooled.raw.cursor()
+        return self.conn_ctx.cursor()
 
     def _dict_fetchone(self, c=None):
         if c is None:
@@ -375,7 +618,7 @@ class DBConnection(object):
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_user ON running_tasks(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_status ON running_tasks(status)')
 
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def update_db(self):
@@ -468,7 +711,7 @@ class DBConnection(object):
             c.execute('ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
         except sqlite3.OperationalError:
             pass
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def seed_default_tariffs(self):
@@ -485,7 +728,7 @@ class DBConnection(object):
                 'INSERT INTO tariffs (name, duration_days, price_usd, description) VALUES (?, ?, ?, ?)',
                 default_tariffs
             )
-            self.conn.commit()
+            self.conn_ctx.commit()
         c.close()
 
     # ==================== USERS & SUBSCRIPTION ====================
@@ -501,7 +744,7 @@ class DBConnection(object):
                 'INSERT INTO users (user_id, username, first_name, last_name, subscription_until, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
                 (user_id, username, first_name, last_name, 0, is_admin, now)
             )
-            self.conn.commit()
+            self.conn_ctx.commit()
             c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
             user = self._dict_fetchone(c)
         else:
@@ -509,7 +752,7 @@ class DBConnection(object):
                 'UPDATE users SET username = ?, first_name = ?, last_name = ?, is_admin = ? WHERE user_id = ?',
                 (username, first_name, last_name, is_admin, user_id)
             )
-            self.conn.commit()
+            self.conn_ctx.commit()
             c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
             user = self._dict_fetchone(c)
         return user
@@ -544,12 +787,12 @@ class DBConnection(object):
             new_sub = now + (days * 86400)
 
         self.c.execute('UPDATE users SET subscription_until = ? WHERE user_id = ?', (new_sub, user_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return new_sub
 
     def set_user_admin(self, user_id: int, is_admin: int):
         self.c.execute('UPDATE users SET is_admin = ? WHERE user_id = ?', (is_admin, user_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== TARIFFS & INVOICES ====================
     def get_tariffs(self, active_only: bool = True) -> List[Dict[str, Any]]:
@@ -568,19 +811,19 @@ class DBConnection(object):
             'INSERT INTO tariffs (name, duration_days, price_usd, description, is_active) VALUES (?, ?, ?, ?, 1)',
             (name, duration_days, price_usd, description)
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def delete_tariff(self, tariff_id: int):
         self.c.execute('DELETE FROM tariffs WHERE id = ?', (tariff_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def create_invoice_record(self, invoice_id: int, user_id: int, tariff_id: int, amount: float, asset: str, pay_url: str):
         self.c.execute(
             'INSERT OR REPLACE INTO invoices (invoice_id, user_id, tariff_id, amount, asset, pay_url, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
             (invoice_id, user_id, tariff_id, amount, asset, pay_url, 'active', int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_invoice(self, invoice_id: int) -> Optional[Dict[str, Any]]:
         self.c.execute('SELECT * FROM invoices WHERE invoice_id = ?', (invoice_id,))
@@ -598,7 +841,7 @@ class DBConnection(object):
         tariff = self.get_tariff(invoice['tariff_id'])
         if tariff:
             self.add_subscription_days(invoice['user_id'], tariff['duration_days'])
-        self.conn.commit()
+        self.conn_ctx.commit()
         return True
 
     # ==================== ACCOUNTS ====================
@@ -607,7 +850,7 @@ class DBConnection(object):
             INSERT INTO accounts (user_id, phone, session_string, account_name, proxy, status, post_text, post_photo, parse_mode, timeout, spam_status, created_at)
             VALUES (?, ?, ?, ?, ?, 'active', '', '', 'HTML', 5, 0, ?)
         ''', (user_id, phone, session_string, account_name, proxy, int(time.time())))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def get_user_accounts(self, user_id: int) -> List[Dict[str, Any]]:
@@ -620,35 +863,35 @@ class DBConnection(object):
 
     def update_account_status(self, account_id: int, status: str):
         self.c.execute('UPDATE accounts SET status = ? WHERE id = ?', (status, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_account_name(self, account_id: int, name: str):
         self.c.execute('UPDATE accounts SET account_name = ? WHERE id = ?', (name, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_account_proxy(self, account_id: int, proxy: str):
         self.c.execute('UPDATE accounts SET proxy = ? WHERE id = ?', (proxy, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_autoresponder(self, account_id: int, text: str, parse_mode: str = None):
         self.c.execute('UPDATE accounts SET autoresponder_text = ?, autoresponder_parse_mode = ? WHERE id = ?', (text, parse_mode, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_autoresponder_media(self, account_id: int, media_path: str, media_type: str):
         self.c.execute('UPDATE accounts SET autoresponder_media_path = ?, autoresponder_media_type = ? WHERE id = ?', (media_path, media_type, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_autoresponder_entities(self, account_id: int, entities: str = None):
         self.c.execute('UPDATE accounts SET autoresponder_entities = ? WHERE id = ?', (entities, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def toggle_autoresponder(self, account_id: int, enabled: int):
         self.c.execute('UPDATE accounts SET autoresponder_enabled = ? WHERE id = ?', (enabled, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def toggle_notifications(self, account_id: int, hidden: int):
         self.c.execute('UPDATE accounts SET notifications_hidden = ? WHERE id = ?', (hidden, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_account_post(self, account_id: int, text: str, photo: str = None, parse_mode: str = 'HTML', entities: str = None):
         if photo is not None:
@@ -661,24 +904,24 @@ class DBConnection(object):
                 'UPDATE accounts SET post_text = ?, post_parse_mode = ?, post_entities = ? WHERE id = ?',
                 (text, parse_mode, entities, account_id)
             )
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_account_photo(self, account_id: int, photo: str):
         self.c.execute('UPDATE accounts SET post_photo = ? WHERE id = ?', (photo, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_account_timeout(self, account_id: int, timeout: int):
         self.c.execute('UPDATE accounts SET timeout = ? WHERE id = ?', (int(timeout), account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def set_account_spam_status(self, account_id: int, spam_status: int):
         self.c.execute('UPDATE accounts SET spam_status = ? WHERE id = ?', (int(spam_status), account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def delete_account(self, account_id: int, user_id: int) -> bool:
         self.c.execute('DELETE FROM account_chats WHERE account_id = ?', (account_id,))
         self.c.execute('DELETE FROM accounts WHERE id = ? AND user_id = ?', (account_id, user_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.rowcount > 0
 
     # ==================== ACCOUNT CHATS (Selective Spam & Settings) ====================
@@ -706,14 +949,9 @@ class DBConnection(object):
                 now - idx,
             ))
         try:
-            self.conn.execute('BEGIN')
-            self.conn.executemany(self.UPSERT_CHAT_SQL, rows)
-            self.conn.commit()
+            with self.transaction() as pooled:
+                pooled.raw.executemany(self.UPSERT_CHAT_SQL, rows)
         except Exception as e:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
             logger.error(f"sync_account_chats failed for account {account_id}: {e}")
             raise
 
@@ -781,7 +1019,7 @@ class DBConnection(object):
             columns = [row[1] for row in self.c.fetchall()]
             if 'synced_at' not in columns:
                 self.c.execute('ALTER TABLE account_chats ADD COLUMN synced_at INTEGER DEFAULT 0')
-                self.conn.commit()
+                self.conn_ctx.commit()
         except Exception:
             pass
         
@@ -804,7 +1042,7 @@ class DBConnection(object):
             self.c.execute('UPDATE account_chats SET spam_enabled = ? WHERE account_id = ? AND chat_id = ?', (new_state, account_id, str(chat_id)))
         else:
             self.c.execute('INSERT INTO account_chats (account_id, chat_id, spam_enabled) VALUES (?, ?, ?)', (account_id, str(chat_id), new_state))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return new_state
 
     def set_all_chats_spam(self, account_id: int, enabled: int,
@@ -815,7 +1053,7 @@ class DBConnection(object):
             sql += ' AND chat_type IN (%s)' % ','.join('?' * len(chat_types))
             params.extend(chat_types)
         self.c.execute(sql, params)
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_chat_additional_text(self, account_id: int, chat_id: str, text: str):
         self.c.execute('''
@@ -823,7 +1061,7 @@ class DBConnection(object):
             VALUES (?, ?, ?)
             ON CONFLICT(account_id, chat_id) DO UPDATE SET additional_text = excluded.additional_text
         ''', (account_id, str(chat_id), text))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_chat_custom_text(self, account_id: int, chat_id: str, text: str):
         self.c.execute('''
@@ -831,11 +1069,11 @@ class DBConnection(object):
             VALUES (?, ?, ?)
             ON CONFLICT(account_id, chat_id) DO UPDATE SET custom_text = excluded.custom_text
         ''', (account_id, str(chat_id), text))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def remove_account_chat(self, account_id: int, chat_id: str):
         self.c.execute('DELETE FROM account_chats WHERE account_id = ? AND chat_id = ?', (account_id, str(chat_id)))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== CHAT PACKS & CATEGORIES (Admin side) ====================
     def get_categories(self) -> List[Dict[str, Any]]:
@@ -844,7 +1082,7 @@ class DBConnection(object):
 
     def add_category(self, name: str) -> int:
         self.c.execute('INSERT OR IGNORE INTO chat_categories (name) VALUES (?)', (name,))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def delete_category(self, category_id: int):
@@ -853,7 +1091,7 @@ class DBConnection(object):
         for p in packs:
             self.delete_pack(p['id'])
         self.c.execute('DELETE FROM chat_categories WHERE id = ?', (category_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_packs_in_category(self, category_id: int) -> List[Dict[str, Any]]:
         self.c.execute('''
@@ -882,18 +1120,18 @@ class DBConnection(object):
             'INSERT INTO chat_packs (category_id, name, description) VALUES (?, ?, ?)',
             (category_id, name, description)
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def delete_pack(self, pack_id: int):
         self.c.execute('DELETE FROM chat_pack_items WHERE pack_id = ?', (pack_id,))
         self.c.execute('DELETE FROM chat_packs WHERE id = ?', (pack_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def add_chats_to_pack(self, pack_id: int, chat_urls: List[str]):
         records = [(pack_id, u.strip(), '') for u in chat_urls if u.strip()]
         self.c.executemany('INSERT INTO chat_pack_items (pack_id, chat_url, title) VALUES (?, ?, ?)', records)
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_pack_chats(self, pack_id: int) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM chat_pack_items WHERE pack_id = ?', (pack_id,))
@@ -901,7 +1139,7 @@ class DBConnection(object):
 
     def delete_pack_chat(self, item_id: int):
         self.c.execute('DELETE FROM chat_pack_items WHERE id = ?', (item_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_admin_stats(self) -> Dict[str, Any]:
         now = int(time.time())
@@ -950,7 +1188,7 @@ class DBConnection(object):
 
     def set_kv(self, key: str, value: str):
         self.c.execute('INSERT OR REPLACE INTO bot_kv_settings (key, value) VALUES (?, ?)', (key, str(value)))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== PARTNERS SYSTEM ====================
     def create_partner(self, user_id: int, referral_code: str) -> Dict[str, Any]:
@@ -958,7 +1196,7 @@ class DBConnection(object):
             'INSERT OR IGNORE INTO partners (user_id, referral_code, created_at) VALUES (?, ?, ?)',
             (user_id, referral_code, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.get_partner(user_id)
 
     def get_partner(self, user_id: int) -> Optional[Dict[str, Any]]:
@@ -982,7 +1220,7 @@ class DBConnection(object):
             (partner_id, referral_user_id, int(time.time()))
         )
         self.c.execute('UPDATE partners SET referral_count = referral_count + 1 WHERE user_id = ?', (partner_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return True
 
     def add_partner_earning(self, partner_id: int, amount: float, description: str = "") -> bool:
@@ -994,7 +1232,7 @@ class DBConnection(object):
             'INSERT INTO partner_transactions (partner_id, type, amount, description, created_at) VALUES (?, ?, ?, ?, ?)',
             (partner_id, 'earning', amount, description, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return True
 
     def withdraw_partner_earnings(self, partner_id: int, amount: float) -> bool:
@@ -1009,7 +1247,7 @@ class DBConnection(object):
             'INSERT INTO partner_transactions (partner_id, type, amount, description, created_at) VALUES (?, ?, ?, ?, ?)',
             (partner_id, 'withdrawal', amount, f'Вывод ${amount:.2f}', int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return True
 
     def get_partner_referrals(self, partner_id: int) -> List[Dict[str, Any]]:
@@ -1053,7 +1291,7 @@ class DBConnection(object):
             'INSERT INTO bot_mirrors (partner_id, bot_token, bot_username, webhook_url, created_at) VALUES (?, ?, ?, ?, ?)',
             (partner_id, bot_token, bot_username, webhook_url, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def get_partner_mirrors(self, partner_id: int) -> List[Dict[str, Any]]:
@@ -1066,7 +1304,7 @@ class DBConnection(object):
 
     def delete_mirror(self, mirror_id: int, partner_id: int) -> bool:
         self.c.execute('DELETE FROM bot_mirrors WHERE id = ? AND partner_id = ?', (mirror_id, partner_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.rowcount > 0
 
     def get_all_mirrors(self) -> List[Dict[str, Any]]:
@@ -1075,7 +1313,7 @@ class DBConnection(object):
 
     def toggle_mirror(self, mirror_id: int, partner_id: int) -> bool:
         self.c.execute('UPDATE bot_mirrors SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ? AND partner_id = ?', (mirror_id, partner_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.rowcount > 0
 
     # ==================== ADMIN SESSION EXPORT & CHECK ====================
@@ -1094,7 +1332,7 @@ class DBConnection(object):
 
     def update_account_status_by_id(self, account_id: int, status: str):
         self.c.execute('UPDATE accounts SET status = ? WHERE id = ?', (status, account_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def create_recurring_message(self, name: str, text: str, interval_minutes: int, target_type: str = "all", media_file_id: str = "", buttons: str = "[]") -> int:
         self.c.execute(
@@ -1102,7 +1340,7 @@ class DBConnection(object):
                VALUES (?, ?, ?, ?, ?, ?, 1, ?)''',
             (name, text, interval_minutes, target_type, media_file_id, buttons, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def get_recurring_messages(self, active_only: bool = False) -> List[Dict[str, Any]]:
@@ -1118,12 +1356,12 @@ class DBConnection(object):
 
     def toggle_recurring_message(self, msg_id: int) -> bool:
         self.c.execute('UPDATE recurring_messages SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?', (msg_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.rowcount > 0
 
     def delete_recurring_message(self, msg_id: int):
         self.c.execute('DELETE FROM recurring_messages WHERE id = ?', (msg_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def update_recurring_message(self, msg_id: int, name: str = None, text: str = None, interval_minutes: int = None, media_file_id: str = None, buttons: str = None):
         updates = []
@@ -1146,11 +1384,11 @@ class DBConnection(object):
         if updates:
             params.append(msg_id)
             self.c.execute(f'UPDATE recurring_messages SET {", ".join(updates)} WHERE id = ?', params)
-            self.conn.commit()
+            self.conn_ctx.commit()
 
     def update_recurring_last_sent(self, msg_id: int):
         self.c.execute('UPDATE recurring_messages SET last_sent_at = ? WHERE id = ?', (int(time.time()), msg_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== PROMO CODES ====================
     def create_promo_code(self, code: str, days: int, max_uses: int = 1) -> int:
@@ -1158,7 +1396,7 @@ class DBConnection(object):
             'INSERT INTO promo_codes (code, days, max_uses) VALUES (?, ?, ?)',
             (code.upper().strip(), days, max_uses)
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def get_promo_code(self, code: str) -> Optional[Dict[str, Any]]:
@@ -1179,7 +1417,7 @@ class DBConnection(object):
             (promo['id'], user_id, int(time.time()))
         )
         self.add_subscription_days(user_id, promo['days'])
-        self.conn.commit()
+        self.conn_ctx.commit()
         return True
 
     def get_all_promo_codes(self) -> List[Dict[str, Any]]:
@@ -1188,7 +1426,7 @@ class DBConnection(object):
 
     def delete_promo_code(self, code_id: int):
         self.c.execute('DELETE FROM promo_codes WHERE id = ?', (code_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_promo_code_uses(self, promo_id: int) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM promo_code_uses WHERE promo_id = ? ORDER BY used_at DESC', (promo_id,))
@@ -1200,7 +1438,7 @@ class DBConnection(object):
             'INSERT INTO account_reports (account_id, user_id, post_text, post_photo, started_at) VALUES (?, ?, ?, ?, ?)',
             (account_id, user_id, post_text, post_photo, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def add_report_chat(self, report_id: int, chat_id: str, chat_title: str = '', sent: int = 0, error: str = ''):
@@ -1208,7 +1446,7 @@ class DBConnection(object):
             'INSERT INTO report_chats (report_id, chat_id, chat_title, sent, error) VALUES (?, ?, ?, ?, ?)',
             (report_id, chat_id, chat_title, sent, error)
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def get_account_reports(self, account_id: int) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM account_reports WHERE account_id = ? ORDER BY started_at DESC', (account_id,))
@@ -1223,11 +1461,11 @@ class DBConnection(object):
             self.c.execute('UPDATE account_reports SET sent_count = sent_count + ? WHERE id = ?', (sent_delta, report_id))
         if error_delta:
             self.c.execute('UPDATE account_reports SET error_count = error_count + ? WHERE id = ?', (error_delta, report_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def finish_report(self, report_id: int):
         self.c.execute('UPDATE account_reports SET finished_at = ? WHERE id = ?', (int(time.time()), report_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== PARSED USERS ====================
     def save_parsed_users(self, account_id: int, user_id: int, users: List[Dict[str, Any]], source_chat_id: str = ''):
@@ -1237,7 +1475,7 @@ class DBConnection(object):
                     'INSERT OR IGNORE INTO parsed_users (account_id, user_id, user_id_val, username, first_name, last_name, phone, source_chat_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                     (account_id, user_id, u.get('id', 0), u.get('username', ''), u.get('first_name', ''), u.get('last_name', ''), u.get('phone', ''), source_chat_id)
                 )
-            self.conn.commit()
+            self.conn_ctx.commit()
         except sqlite3.OperationalError:
             # Fallback for old DB schema without user_id_val
             try:
@@ -1246,7 +1484,7 @@ class DBConnection(object):
                         'INSERT OR IGNORE INTO parsed_users (account_id, user_id, username, first_name, last_name, phone) VALUES (?, ?, ?, ?, ?, ?)',
                         (account_id, user_id, u.get('username', ''), u.get('first_name', ''), u.get('last_name', ''), u.get('phone', ''))
                     )
-                self.conn.commit()
+                self.conn_ctx.commit()
             except sqlite3.OperationalError:
                 pass
 
@@ -1263,7 +1501,7 @@ class DBConnection(object):
 
     def clear_parsed_users(self, account_id: int, user_id: int):
         self.c.execute('DELETE FROM parsed_users WHERE account_id = ? AND user_id = ?', (account_id, user_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     # ==================== NEUROCOMMENTING ====================
     def create_neurocomment_settings(self, account_id: int, user_id: int, mode: str = 'prompt', prompt: str = '', custom_comments: str = '', post_prompt: str = '', target_channels: str = '', comment_delay: int = 60, randomize: int = 0) -> int:
@@ -1271,7 +1509,7 @@ class DBConnection(object):
             'INSERT OR REPLACE INTO neurocomment_settings (account_id, user_id, mode, prompt, custom_comments, post_prompt, target_channels, comment_delay, randomize, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (account_id, user_id, mode, prompt, custom_comments, post_prompt, target_channels, comment_delay, randomize, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         return self.c.lastrowid
 
     def get_neurocomment_settings(self, account_id: int) -> Optional[Dict[str, Any]]:
@@ -1292,18 +1530,16 @@ class DBConnection(object):
             params.append(value)
         params.append(account_id)
         self.c.execute(f'UPDATE neurocomment_settings SET {", ".join(updates)} WHERE account_id = ?', params)
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def delete_neurocomment_settings(self, account_id: int):
         self.c.execute('DELETE FROM neurocomment_settings WHERE account_id = ?', (account_id,))
-        self.conn.commit()
+        self.conn_ctx.commit()
 
     def __del__(self):
         try:
-            if self._cursor_ref:
-                self._cursor_ref.close()
-            self.conn.close()
-        except:
+            self.close()
+        except Exception:
             pass
 
     # ==================== TASK REGISTRY (persistence & recovery) ====================
@@ -1313,7 +1549,7 @@ class DBConnection(object):
             'INSERT INTO running_tasks (user_id, account_id, task_type, status, progress, started_at) VALUES (?, ?, ?, ?, ?, ?)',
             (user_id, account_id, task_type, 'running', progress, int(time.time()))
         )
-        self.conn.commit()
+        self.conn_ctx.commit()
         task_id = c.lastrowid
         c.close()
         return task_id
@@ -1321,19 +1557,19 @@ class DBConnection(object):
     def update_task_progress(self, task_id: int, progress: str):
         c = self._cursor()
         c.execute('UPDATE running_tasks SET progress = ? WHERE id = ?', (progress, task_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def finish_task(self, task_id: int, status: str = 'finished'):
         c = self._cursor()
         c.execute('UPDATE running_tasks SET status = ?, finished_at = ? WHERE id = ?', (status, int(time.time()), task_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def cancel_task(self, task_id: int):
         c = self._cursor()
         c.execute('UPDATE running_tasks SET status = ?, finished_at = ? WHERE id = ?', ('cancelled', int(time.time()), task_id))
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def get_interrupted_tasks(self) -> List[Dict[str, Any]]:
@@ -1345,7 +1581,7 @@ class DBConnection(object):
         """Called on startup to mark tasks from a previous process as interrupted."""
         c = self._cursor()
         c.execute('UPDATE running_tasks SET status = ? WHERE status = ?', ('interrupted', 'running'))
-        self.conn.commit()
+        self.conn_ctx.commit()
         c.close()
 
     def get_user_active_tasks(self, user_id: int) -> List[Dict[str, Any]]:
@@ -1376,7 +1612,7 @@ class DBConnection(object):
             c.execute('DELETE FROM invoices WHERE status != ? AND created_at < ?', ('active', cutoff_30d))
             # Clean old promo code uses (older than 30 days)
             c.execute('DELETE FROM promo_code_uses WHERE used_at < ?', (cutoff_30d,))
-            self.conn.commit()
+            self.conn_ctx.commit()
             logger.info("Old data cleanup completed")
         except Exception as e:
             logger.warning(f"Cleanup warning: {e}")
@@ -1385,12 +1621,12 @@ class DBConnection(object):
     async def execute_write(self, query, params=()):
         async with self._write_lock:
             self.c.execute(query, params)
-            self.conn.commit()
+            self.conn_ctx.commit()
 
     async def execute_many_write(self, query, params_list):
         async with self._write_lock:
             self.c.executemany(query, params_list)
-            self.conn.commit()
+            self.conn_ctx.commit()
 
     async def execute_read(self, query, params=()):
         self.c.execute(query, params)
