@@ -1,0 +1,60 @@
+{
+	"product_id": 67,
+	"version_id": 110,
+	"version": "1.0.1",
+	"buyer_id": 223,
+	"watermark_id": "wm_223_110_2e0a48cb-0d5c-41d3-9741-84a482cd0e19",
+	"generated_at_utc": "2026-08-01T03:25:44.949008139Z",
+	"files": [
+		{
+			"path": "README.MD",
+			"sha256": "0294e6357a1e66aaf6781fa15b4b48f1b2449815c24ca0e5635edc536d81d4f6",
+			"size": 1859
+		},
+		{
+			"path": "config.ini",
+			"sha256": "1de6e70859c839959262add920646ea88398189161de4294d35c90015a2016a9",
+			"size": 150
+		},
+		{
+			"path": "database.db",
+			"sha256": "cb8d653a6c69e25b52940202cf63319f5660e10ecdbb499345e4c15500da408c",
+			"size": 45056
+		},
+		{
+			"path": "documents/file_0.txt",
+			"sha256": "37759999096174d32f26cccee25052e55b6a72cc00fff0db9c97128118d75669",
+			"size": 20263
+		},
+		{
+			"path": "documents/file_1.txt",
+			"sha256": "37759999096174d32f26cccee25052e55b6a72cc00fff0db9c97128118d75669",
+			"size": 20263
+		},
+		{
+			"path": "documents/file_14.txt",
+			"sha256": "f5088ddbf3302c46172f61aa9fdb5091a73b3245f7b04028498098519fbf081c",
+			"size": 6255
+		},
+		{
+			"path": "main.py",
+			"sha256": "c650c559c9800c4932ed536a489b88d25d07a366a0562c8058b16802447ff7a1",
+			"size": 46873
+		},
+		{
+			"path": "requirements.txt",
+			"sha256": "91fb4f53f95c9cec3053df9f46ab061457b3945cfa4f5135919b0c14d578b50b",
+			"size": 50
+		},
+		{
+			"path": "sqliter.py",
+			"sha256": "ca6e35cdd0e08ee13ccfe267d85476eaac85edae87a30e1028037375ab3aa5ec",
+			"size": 17895
+		},
+		{
+			"path": "user.py",
+			"sha256": "44aae9826275959f41e1ed00166f16df9afdb04516a54d2be387c26d3107514d",
+			"size": 18248
+		}
+	]
+}

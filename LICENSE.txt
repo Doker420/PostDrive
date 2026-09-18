@@ -1,0 +1,11 @@
+LICENSE NOTICE
+==============
+ProductID: 67
+VersionID: 110
+Version: 1.0.1
+BuyerID: 223
+WatermarkID: wm_223_110_2e0a48cb-0d5c-41d3-9741-84a482cd0e19
+
+This archive is personalized for the buyer above.
+Redistribution is prohibited. In case of leak, watermark identifies the source.
+

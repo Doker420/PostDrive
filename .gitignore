@@ -1,0 +1,24 @@
+# Config with secrets
+config.ini
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.session
+*.session-journal
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Downloads / media
+downloads/
+photos/
+img/
+
+# Local sessions
+sessions_export.txt

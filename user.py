@@ -1,0 +1,2796 @@
+import asyncio
+import random
+import time
+import os
+import sys
+import json
+import re
+import logging
+import configparser
+import aiohttp
+from typing import Optional, Dict, Any, List, Tuple
+from pyrogram import Client, enums, filters
+from pyrogram import utils
+from pyrogram.handlers import MessageHandler
+from pyrogram.types import MessageEntity
+from sqliter import DBConnection, get_db_sync
+
+config = configparser.ConfigParser()
+config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
+config.read(config_path)
+
+_original_handle_updates = Client.handle_updates
+
+async def _safe_handle_updates(self, updates):
+    try:
+        return await _original_handle_updates(self, updates)
+    except ValueError as e:
+        if "Peer id invalid" in str(e):
+            logging.warning(f"⚠️ Invalid peer update ignored: {e}")
+            return
+        raise
+    except KeyError as e:
+        if "ID not found" in str(e):
+            logging.warning(f"⚠️ Missing peer update ignored: {e}")
+            return
+        raise
+
+Client.handle_updates = _safe_handle_updates
+AI_MODEL = config.get('AI', 'MODEL', fallback='llama-3.1-70b-versatile').strip()
+OPENAI_API_KEY = config.get('AI', 'OPENAI_API_KEY', fallback='').strip()
+ANTHROPIC_API_KEY = config.get('AI', 'ANTHROPIC_API_KEY', fallback='').strip()
+GEMINI_API_KEY = config.get('AI', 'GEMINI_API_KEY', fallback='').strip()
+G4F_API_KEY = config.get('AI', 'G4F_API_KEY', fallback='').strip()
+GROQ_API_KEY = config.get('AI', 'GROQ_API_KEY', fallback='').strip()
+OPENROUTER_API_KEY = config.get('AI', 'OPENROUTER_API_KEY', fallback='').strip()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot_debug.log", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+db = get_db_sync()
+
+def parse_proxy_string(proxy_str: str) -> Optional[Dict[str, Any]]:
+    if not proxy_str or not proxy_str.strip():
+        return None
+    
+    proxy_str = proxy_str.strip()
+    scheme = "socks5"
+    
+    if "://" in proxy_str:
+        scheme_part, rest = proxy_str.split("://", 1)
+        scheme = scheme_part.lower()
+        if scheme not in ["socks5", "socks4", "http", "https"]:
+            scheme = "socks5"
+        proxy_str = rest
+
+    # Pattern 1: user:pass@host:port
+    if "@" in proxy_str:
+        auth_part, host_part = proxy_str.split("@", 1)
+        user_pass = auth_part.split(":", 1)
+        username = user_pass[0]
+        password = user_pass[1] if len(user_pass) > 1 else ""
+        host_port = host_part.split(":", 1)
+        hostname = host_port[0]
+        port = int(host_port[1]) if len(host_port) > 1 else 1080
+        return {
+            "scheme": scheme,
+            "hostname": hostname,
+            "port": port,
+            "username": username,
+            "password": password
+        }
+
+    # Pattern 2: host:port:user:pass
+    parts = proxy_str.split(":")
+    if len(parts) == 4:
+        return {
+            "scheme": scheme,
+            "hostname": parts[0],
+            "port": int(parts[1]),
+            "username": parts[2],
+            "password": parts[3]
+        }
+    elif len(parts) == 2:
+        return {
+            "scheme": scheme,
+            "hostname": parts[0],
+            "port": int(parts[1])
+        }
+    return None
+
+
+def convert_pyrogram_entities_to_json(entities) -> Optional[str]:
+    if not entities:
+        return None
+    try:
+        entities_data = []
+        for ent in entities:
+            entity_type = None
+            extra = {}
+            if ent.type == enums.MessageEntityType.BOLD:
+                entity_type = 'bold'
+            elif ent.type == enums.MessageEntityType.ITALIC:
+                entity_type = 'italic'
+            elif ent.type == enums.MessageEntityType.UNDERLINE:
+                entity_type = 'underline'
+            elif ent.type == enums.MessageEntityType.STRIKETHROUGH:
+                entity_type = 'strikethrough'
+            elif ent.type == enums.MessageEntityType.SPOILER:
+                entity_type = 'spoiler'
+            elif ent.type == enums.MessageEntityType.CODE:
+                entity_type = 'code'
+            elif ent.type == enums.MessageEntityType.PRE:
+                entity_type = 'pre'
+                if getattr(ent, 'language', None):
+                    extra['language'] = ent.language
+            elif ent.type == enums.MessageEntityType.TEXT_LINK:
+                entity_type = 'text_link'
+                if getattr(ent, 'url', None):
+                    extra['url'] = ent.url
+            elif ent.type == enums.MessageEntityType.TEXT_MENTION:
+                entity_type = 'text_mention'
+                if getattr(ent, 'user', None):
+                    extra['user_id'] = ent.user.id
+            elif ent.type == enums.MessageEntityType.CUSTOM_EMOJI:
+                entity_type = 'custom_emoji'
+                if getattr(ent, 'custom_emoji_id', None):
+                    extra['custom_emoji_id'] = ent.custom_emoji_id
+            elif ent.type == enums.MessageEntityType.URL:
+                entity_type = 'url'
+            elif ent.type == enums.MessageEntityType.MENTION:
+                entity_type = 'mention'
+            elif ent.type == enums.MessageEntityType.HASHTAG:
+                entity_type = 'hashtag'
+            elif ent.type == enums.MessageEntityType.CASHTAG:
+                entity_type = 'cashtag'
+            elif ent.type == enums.MessageEntityType.BOT_COMMAND:
+                entity_type = 'bot_command'
+            elif ent.type == enums.MessageEntityType.EMAIL:
+                entity_type = 'email'
+            elif ent.type == enums.MessageEntityType.PHONE_NUMBER:
+                entity_type = 'phone_number'
+            elif ent.type == enums.MessageEntityType.BLOCKQUOTE:
+                entity_type = 'blockquote'
+            else:
+                continue
+            entities_data.append({
+                'type': entity_type,
+                'offset': ent.offset,
+                'length': ent.length,
+                **extra
+            })
+        return json.dumps(entities_data, ensure_ascii=False)
+    except Exception as err:
+        print(f"⚠️ Ошибка сохранения entities: {err}")
+        return None
+
+
+async def convert_entities_to_pyrogram(entities_json: str, client: Client = None) -> Optional[List[MessageEntity]]:
+    if not entities_json:
+        return None
+    try:
+        entities_data = json.loads(entities_json)
+        entities = []
+        
+        type_map = {
+            'bold': enums.MessageEntityType.BOLD,
+            'italic': enums.MessageEntityType.ITALIC,
+            'underline': enums.MessageEntityType.UNDERLINE,
+            'strikethrough': enums.MessageEntityType.STRIKETHROUGH,
+            'spoiler': enums.MessageEntityType.SPOILER,
+            'code': enums.MessageEntityType.CODE,
+            'pre': enums.MessageEntityType.PRE,
+            'text_link': enums.MessageEntityType.TEXT_LINK,
+            'text_mention': enums.MessageEntityType.TEXT_MENTION,
+            'custom_emoji': enums.MessageEntityType.CUSTOM_EMOJI,
+            'url': enums.MessageEntityType.URL,
+            'mention': enums.MessageEntityType.MENTION,
+            'hashtag': enums.MessageEntityType.HASHTAG,
+            'cashtag': enums.MessageEntityType.CASHTAG,
+            'bot_command': enums.MessageEntityType.BOT_COMMAND,
+            'email': enums.MessageEntityType.EMAIL,
+            'phone_number': enums.MessageEntityType.PHONE_NUMBER,
+            'blockquote': enums.MessageEntityType.BLOCKQUOTE,
+        }
+        
+        for e in entities_data:
+            entity_type = e.get('type')
+            offset = e.get('offset', 0)
+            length = e.get('length', 0)
+            pyro_type = type_map.get(entity_type)
+            if not pyro_type:
+                continue
+            
+            kwargs = {
+                'type': pyro_type,
+                'offset': offset,
+                'length': length
+            }
+            if entity_type == 'text_link' and e.get('url'):
+                kwargs['url'] = e['url']
+            elif entity_type == 'text_mention' and e.get('user_id'):
+                if client:
+                    try:
+                        user = await client.get_users(e['user_id'])
+                        kwargs['user'] = user
+                    except Exception:
+                        pass
+            elif entity_type == 'custom_emoji' and e.get('custom_emoji_id'):
+                kwargs['custom_emoji_id'] = int(e['custom_emoji_id'])
+            elif entity_type == 'pre' and e.get('language'):
+                kwargs['language'] = e['language']
+            
+            entities.append(MessageEntity(**kwargs))
+        return entities if entities else None
+    except Exception as err:
+        print(f"⚠️ Ошибка конвертации entities: {err}")
+        return None
+    except Exception as err:
+        print(f"⚠️ Ошибка конвертации entities: {err}")
+        return None
+
+AR_HISTORY: Dict[int, Dict] = {}  # account_id -> {user_id: timestamp}
+_AR_HISTORY_TTL = 86400  # 24 hours — auto-evict entries older than this
+
+def cleanup_ar_history():
+    """Remove AR_HISTORY entries older than TTL. Called periodically."""
+    now = time.time()
+    expired = []
+    for account_id, users in AR_HISTORY.items():
+        expired_users = [uid for uid, ts in users.items() if now - ts > _AR_HISTORY_TTL]
+        for uid in expired_users:
+            del users[uid]
+        if not users:
+            expired.append(account_id)
+    for aid in expired:
+        del AR_HISTORY[aid]
+
+async def autoresponder_callback(client: Client, message):
+    try:
+        if not client.name.startswith("acc_"):
+            return
+        account_id_str = client.name.split('_')[1]
+        if not account_id_str.isdigit():
+            return
+        account_id = int(account_id_str)
+        
+        account = db.get_account(account_id)
+        if not account or not account.get('autoresponder_enabled'):
+            return
+            
+        user_id = message.from_user.id if message.from_user else None
+        if not user_id:
+            return
+            
+        if account_id not in AR_HISTORY:
+            AR_HISTORY[account_id] = {}
+            
+        if user_id in AR_HISTORY[account_id]:
+            return # Deduplication
+            
+        # Store timestamp for TTL cleanup
+        AR_HISTORY[account_id][user_id] = time.time()
+            
+        text = account.get('autoresponder_text')
+        ar_entities_json = account.get('autoresponder_entities')
+        media_path = account.get('autoresponder_media_path')
+        media_type = account.get('autoresponder_media_type')
+        
+        # Spin text if text is present
+        if text:
+            try:
+                import re
+                import random
+                def spin(m):
+                    return random.choice(m.group(1).split('|'))
+                text = re.sub(r'\{([^}]+)\}', spin, text)
+            except Exception:
+                pass
+        
+        # ⭐ КОПИРУЕМ ENTITIES из БД
+        entities = None
+        if ar_entities_json:
+            try:
+                converted = await convert_entities_to_pyrogram(ar_entities_json, client)
+                if converted:
+                    entities = converted
+            except Exception:
+                pass
+        
+        sent = False
+        import os
+        if media_path and os.path.exists(media_path):
+            try:
+                if media_type == 'photo':
+                    await message.reply_photo(media_path, caption=text, caption_entities=entities)
+                    sent = True
+                elif media_type == 'video':
+                    await message.reply_video(media_path, caption=text, caption_entities=entities)
+                    sent = True
+                elif media_type == 'document':
+                    await message.reply_document(media_path, caption=text, caption_entities=entities)
+                    sent = True
+                elif media_type == 'voice':
+                    await message.reply_voice(media_path, caption=text, caption_entities=entities)
+                    sent = True
+                elif media_type == 'sticker':
+                    await message.reply_sticker(media_path)
+                    if text:
+                        await message.reply_text(text, entities=entities)
+                    sent = True
+            except Exception as e:
+                logger.error(f"Failed to send AR media: {e}")
+                
+        if not sent and text:
+            await message.reply_text(text, entities=entities)
+            
+        AR_HISTORY[account_id][user_id] = time.time()
+        logger.info(f"Autoresponder fired for account #{account_id} to user {user_id}")
+    except Exception as e:
+        logger.error(f"Error in autoresponder_callback: {e}")
+
+class AccountSessionManager:
+    # ── Configurable limits ───────────────────────────────────────
+    MAX_ACTIVE_CLIENTS = int(os.environ.get('MAX_ACTIVE_CLIENTS', '5000'))    # max Pyrogram clients in memory
+    MAX_TASKS_PER_USER = int(os.environ.get('MAX_TASKS_PER_USER', '50'))     # concurrent tasks per user
+    MAX_GLOBAL_TASKS   = int(os.environ.get('MAX_GLOBAL_TASKS', '5000'))      # global concurrent task limit
+    CLIENT_IDLE_TTL    = int(os.environ.get('CLIENT_IDLE_TTL', '18000'))     # 30 min idle before eviction
+
+    def __init__(self, api_id: int, api_hash: str):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.active_clients: Dict[int, Client] = {}
+        self._client_last_used: Dict[int, float] = {}           # account_id -> last access timestamp
+        self._client_owner: Dict[int, int] = {}                 # account_id -> user_id
+        self.active_spam_tasks: Dict[int, asyncio.Task] = {}
+        self.active_spam_task_ids: Dict[int, int] = {}  # account_id -> task_id in DB
+        self.active_join_tasks: Dict[int, asyncio.Task] = {}
+        self.active_leave_tasks: Dict[int, asyncio.Task] = {}
+        self.active_parse_tasks: Dict[int, asyncio.Task] = {}
+        self.active_comment_tasks: Dict[int, asyncio.Task] = {}
+        self.active_comment_task_ids: Dict[int, int] = {}  # account_id -> task_id in DB
+        self.comment_listeners: Dict[int, Dict[str, int]] = {}
+        self.temp_auth_clients: Dict[int, Dict[str, Any]] = {}
+        self._client_locks: Dict[int, asyncio.Lock] = {}
+        self._global_lock = asyncio.Lock()
+        self._max_concurrent_tasks = self.MAX_GLOBAL_TASKS
+        self._running_tasks = 0
+        self._task_semaphore = asyncio.Semaphore(self._max_concurrent_tasks)
+        self._last_bot_message: Dict[int, float] = {}
+        self._bot_message_interval = 1.0
+        self._spam_progress: Dict[int, Dict] = {}  # account_id -> {success, errors, total, running}
+        self._user_task_counts: Dict[int, int] = {}  # user_id -> active task count
+        self._user_task_lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    def create_client(self, session_string: str, proxy_str: str = "", name: str = "session") -> Client:
+        proxy_dict = parse_proxy_string(proxy_str) if proxy_str else None
+        client = Client(
+            name=name,
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            session_string=session_string,
+            in_memory=True,
+            proxy=proxy_dict
+        )
+        client.add_handler(MessageHandler(autoresponder_callback, filters.private & ~filters.me))
+        return client
+
+    async def _safe_bot_message(self, bot, user_id: int, text: str):
+        now = time.time()
+        last = self._last_bot_message.get(user_id, 0)
+        if now - last < self._bot_message_interval:
+            return
+        self._last_bot_message[user_id] = now
+        try:
+            await bot.send_message(user_id, text)
+        except Exception:
+            pass
+
+    async def _run_limited(self, coro):
+        async with self._task_semaphore:
+            self._running_tasks += 1
+            try:
+                return await coro
+            finally:
+                self._running_tasks -= 1
+
+    async def run_limited(self, coro):
+        return await self._run_limited(coro)
+
+    # ── Per-user task quota enforcement ────────────────────────────
+    async def _acquire_user_quota(self, user_id: int) -> bool:
+        """Returns True if the user can start a new task, False if quota exceeded.
+        Must be called BEFORE creating the task."""
+        async with self._user_task_lock:
+            current = self._user_task_counts.get(user_id, 0)
+            if current >= self.MAX_TASKS_PER_USER:
+                return False
+            self._user_task_counts[user_id] = current + 1
+            return True
+
+    async def _release_user_quota(self, user_id: int):
+        """Called when a task finishes. Decrements the user's task count."""
+        async with self._user_task_lock:
+            current = self._user_task_counts.get(user_id, 0)
+            if current > 0:
+                self._user_task_counts[user_id] = current - 1
+
+    def _is_account_busy(self, account_id: int) -> bool:
+        """Check if an account has active tasks (spam, parse, comment, join, leave)."""
+        for task_dict in [self.active_spam_tasks, self.active_parse_tasks,
+                          self.active_comment_tasks, self.active_join_tasks,
+                          self.active_leave_tasks]:
+            task = task_dict.get(account_id)
+            if task and not task.done():
+                return True
+        return False
+
+    async def _evict_idle_clients(self):
+        """Evict Pyrogram clients that have been idle for longer than CLIENT_IDLE_TTL.
+        Never evicts clients with active tasks."""
+        now = time.time()
+        to_evict = []
+        for account_id, last_used in self._client_last_used.items():
+            if now - last_used < self.CLIENT_IDLE_TTL:
+                continue
+            if self._is_account_busy(account_id):
+                continue
+            if account_id in self.active_clients:
+                to_evict.append(account_id)
+
+        evicted = 0
+        for account_id in to_evict:
+            client = self.active_clients.pop(account_id, None)
+            self._client_last_used.pop(account_id, None)
+            self._client_owner.pop(account_id, None)
+            self._client_locks.pop(account_id, None)
+            if client:
+                try:
+                    await client.stop()
+                    evicted += 1
+                except Exception as e:
+                    logger.warning(f"Failed to stop idle client {account_id}: {e}")
+
+        if evicted:
+            logger.info(f"Evicted {evicted} idle clients (idle > {self.CLIENT_IDLE_TTL}s)")
+
+    async def _enforce_client_limit(self):
+        """If active clients exceed MAX_ACTIVE_CLIENTS, evict the oldest idle ones."""
+        if len(self.active_clients) <= self.MAX_ACTIVE_CLIENTS:
+            return
+        candidates = sorted(
+            self._client_last_used.items(),
+            key=lambda x: x[1]
+        )
+        for account_id, _ in candidates:
+            if len(self.active_clients) <= self.MAX_ACTIVE_CLIENTS:
+                break
+            if self._is_account_busy(account_id):
+                continue
+            client = self.active_clients.pop(account_id, None)
+            self._client_last_used.pop(account_id, None)
+            self._client_owner.pop(account_id, None)
+            self._client_locks.pop(account_id, None)
+            if client:
+                try:
+                    await client.stop()
+                    logger.info(f"Evicted client {account_id} to enforce limit ({len(self.active_clients)}/{self.MAX_ACTIVE_CLIENTS})")
+                except Exception as e:
+                    logger.warning(f"Failed to stop client {account_id}: {e}")
+
+    async def start_cleanup_loop(self):
+        """Background task that periodically cleans up idle clients and AR_HISTORY."""
+        while True:
+            try:
+                await asyncio.sleep(300)  # every 5 minutes
+                cleanup_ar_history()
+                await self._evict_idle_clients()
+                await self._enforce_client_limit()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Cleanup loop error: {e}")
+
+    async def graceful_shutdown(self):
+        """Stop all active Pyrogram clients and cancel background tasks."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+
+        # Cancel all active tasks
+        for task_dict in [self.active_spam_tasks, self.active_parse_tasks,
+                          self.active_comment_tasks, self.active_join_tasks,
+                          self.active_leave_tasks]:
+            for account_id, task in list(task_dict.items()):
+                if task and not task.done():
+                    task.cancel()
+                    logger.info(f"Cancelled task for account {account_id}")
+                task_dict.pop(account_id, None)
+
+        # Stop all clients
+        for account_id, client in list(self.active_clients.items()):
+            try:
+                await client.stop()
+                logger.info(f"Stopped client for account {account_id}")
+            except Exception as e:
+                logger.warning(f"Error stopping client {account_id}: {e}")
+        self.active_clients.clear()
+        self._client_last_used.clear()
+        self._client_owner.clear()
+        self._client_locks.clear()
+        self.active_spam_task_ids.clear()
+        self.active_comment_task_ids.clear()
+
+        # Disconnect temp auth clients
+        for user_id, auth_data in list(self.temp_auth_clients.items()):
+            client = auth_data.get("client")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+        self.temp_auth_clients.clear()
+
+        logger.info("AccountSessionManager graceful shutdown complete")
+
+    def _get_client_lock(self, account_id: int) -> asyncio.Lock:
+        if account_id not in self._client_locks:
+            self._client_locks[account_id] = asyncio.Lock()
+        return self._client_locks[account_id]
+
+    async def test_session_string(self, session_string: str, proxy_str: str = "") -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        try:
+            client = self.create_client(session_string, proxy_str, name="temp_test")
+            await client.start()
+            me = await client.get_me()
+            info = {
+                "id": me.id,
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username or "",
+                "phone": me.phone_number or ""
+            }
+            await client.stop()
+            return True, info, None
+        except Exception as e:
+            return False, None, str(e)
+
+    # ==================== INTERACTIVE PHONE AUTH ====================
+    async def start_phone_auth(self, user_id: int, phone: str, proxy_str: str = "") -> Tuple[bool, Optional[str], Optional[str]]:
+        """Sends verification code to Telegram phone."""
+        try:
+            proxy_dict = parse_proxy_string(proxy_str) if proxy_str else None
+            temp_client = Client(
+                name=f"auth_{user_id}_{int(time.time())}",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                in_memory=True,
+                proxy=proxy_dict
+            )
+            await temp_client.connect()
+            sent_code = await temp_client.send_code(phone)
+            self.temp_auth_clients[user_id] = {
+                "client": temp_client,
+                "phone": phone,
+                "phone_code_hash": sent_code.phone_code_hash,
+                "proxy": proxy_str
+            }
+            return True, sent_code.phone_code_hash, None
+        except Exception as e:
+            return False, None, str(e)
+
+    async def submit_phone_code(self, user_id: int, code: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], bool, Optional[str]]:
+        """
+        Submits SMS/Telegram code.
+        Returns: (success, session_string, user_info, is_2fa_needed, error_message)
+        """
+        auth_data = self.temp_auth_clients.get(user_id)
+        if not auth_data:
+            return False, None, None, False, "Сессия авторизации не найдена или истекла."
+
+        client: Client = auth_data["client"]
+        phone = auth_data["phone"]
+        phone_code_hash = auth_data["phone_code_hash"]
+
+        try:
+            signed_in = await client.sign_in(phone, phone_code_hash, code)
+            session_str = await client.export_session_string()
+            me = await client.get_me()
+            info = {
+                "id": me.id,
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username or "",
+                "phone": me.phone_number or phone
+            }
+            await client.disconnect()
+            del self.temp_auth_clients[user_id]
+            return True, session_str, info, False, None
+        except Exception as e:
+            err_str = str(e)
+            if "SESSION_PASSWORD_NEEDED" in err_str or "PASSWORD_HASH_INVALID" in err_str:
+                return False, None, None, True, "Требуется пароль двухфакторной аутентификации (2FA Cloud Password)"
+            return False, None, None, False, err_str
+
+    async def submit_2fa_password(self, user_id: int, password: str) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        auth_data = self.temp_auth_clients.get(user_id)
+        if not auth_data:
+            return False, None, None, "Сессия авторизации не найдена или истекла."
+
+        client: Client = auth_data["client"]
+        try:
+            await client.check_password(password)
+            session_str = await client.export_session_string()
+            me = await client.get_me()
+            info = {
+                "id": me.id,
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username or "",
+                "phone": me.phone_number or auth_data.get("phone", "")
+            }
+            await client.disconnect()
+            del self.temp_auth_clients[user_id]
+            return True, session_str, info, None
+        except Exception as e:
+            return False, None, None, str(e)
+
+    async def start_qr_login(self, user_id: int, proxy_str: str = ""):
+        try:
+            proxy_dict = parse_proxy_string(proxy_str) if proxy_str else None
+            temp_client = Client(
+                name=f"qr_{user_id}_{int(time.time())}",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                in_memory=True,
+                proxy=proxy_dict
+            )
+            await temp_client.connect()
+            from pyrogram.raw import functions
+            login_token = await temp_client.invoke(
+                functions.auth.ExportLoginToken(
+                    api_id=self.api_id,
+                    api_hash=self.api_hash,
+                    except_ids=[]
+                )
+            )
+            import base64
+            token_bytes = login_token.token
+            qr_url = "tg://login?token=" + base64.urlsafe_b64encode(token_bytes).decode('utf-8').rstrip('=')
+            self.temp_auth_clients[user_id] = {
+                "client": temp_client,
+                "proxy": proxy_str,
+                "qr_file_id": None,
+                "qr_text": qr_url,
+                "qr_bytes": None,
+                "login_token": login_token,
+                "qr_url": qr_url
+            }
+            try:
+                import qrcode
+                import io
+                img = qrcode.make(qr_url)
+                buf = io.BytesIO()
+                img.save(buf, format='PNG')
+                buf.seek(0)
+                self.temp_auth_clients[user_id]["qr_bytes"] = buf.getvalue()
+                logger.info(f"✅ QR-код сгенерирован для user_id={user_id} ({len(buf.getvalue())} bytes)")
+                return {"qr_file_id": None, "qr_text": qr_url, "qr_bytes": buf.getvalue()}
+            except Exception as img_err:
+                logger.error(f"❌ Ошибка генерации QR-кода: {type(img_err).__name__}: {img_err}")
+                return {"qr_file_id": None, "qr_text": qr_url, "qr_bytes": None}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def submit_qr_2fa_password(self, user_id: int, password: str):
+        auth_data = self.temp_auth_clients.get(user_id)
+        if not auth_data:
+            return False, None, None, "QR-сессия не найдена или истекла."
+        client: Client = auth_data["client"]
+        try:
+            from pyrogram.raw import functions
+            from pyrogram.raw import types as raw_types
+            from pyrogram.errors import SessionPasswordNeeded
+
+            try:
+                logger.info(f"QR 2FA: вызов check_password для user_id={user_id}")
+                await client.check_password(password)
+                logger.info(f"QR 2FA: check_password успешно для user_id={user_id}")
+            except SessionPasswordNeeded:
+                return False, None, None, "Неверный пароль 2FA."
+            except Exception as e:
+                return False, None, None, f"Ошибка проверки пароля: {e}"
+
+            login_token = auth_data.get("login_token")
+            if not login_token:
+                return False, None, None, "Токен не найден. Запустите вход заново."
+
+            try:
+                resp = await asyncio.wait_for(
+                    client.invoke(
+                        functions.auth.ImportLoginToken(token=login_token.token)
+                    ),
+                    timeout=15
+                )
+            except Exception as e:
+                return False, None, None, f"Ошибка импорта токена: {e}"
+
+            if isinstance(resp, raw_types.auth.LoginTokenMigrateTo):
+                try:
+                    resp = await client.invoke(
+                        functions.auth.ImportLoginToken(token=resp.token)
+                    )
+                except Exception as e:
+                    return False, None, None, f"Ошибка импорта токена (миграция): {e}"
+
+            if not isinstance(resp, raw_types.auth.LoginTokenSuccess):
+                return False, None, None, "Токен не был принят."
+
+            try:
+                me = await client.get_me()
+            except Exception as e:
+                return False, None, None, f"Ошибка получения данных пользователя: {e}"
+
+            session_str = await client.export_session_string()
+            info = {
+                "id": me.id,
+                "first_name": me.first_name or "",
+                "last_name": me.last_name or "",
+                "username": me.username or "",
+                "phone": me.phone_number or ""
+            }
+            await client.disconnect()
+            del self.temp_auth_clients[user_id]
+            return True, session_str, info, None
+        except Exception as e:
+            return False, None, None, str(e)
+
+    async def finish_qr_login_stream(self, user_id: int, proxy_str: str = "", bot=None):
+        """Генератор: возвращает (обновление_QR, is_final) или (результат, True)."""
+        auth_data = self.temp_auth_clients.get(user_id)
+        if not auth_data:
+            yield (False, None, None, "QR-сессия не найдена или истекла. Запустите вход заново."), True
+            return
+        client: Client = auth_data["client"]
+        try:
+            from pyrogram.raw import functions
+            from pyrogram.raw import types as raw_types
+            from pyrogram.errors import SessionPasswordNeeded, AuthTokenExpired, AuthTokenInvalid, AuthKeyUnregistered
+
+            deadline = time.time() + 180
+            last_token_bytes = auth_data.get("login_token").token if auth_data.get("login_token") else None
+            qr_update_count = 0
+            import_attempted = False
+            while time.time() < deadline:
+                if last_token_bytes and not import_attempted:
+                    try:
+                        logger.info(f"QR: пробуем ImportLoginToken для user_id={user_id}")
+                        resp = await asyncio.wait_for(
+                            client.invoke(
+                                functions.auth.ImportLoginToken(token=last_token_bytes)
+                            ),
+                            timeout=15
+                        )
+                        import_attempted = True
+                        if isinstance(resp, raw_types.auth.LoginTokenSuccess):
+                            try:
+                                me = await client.get_me()
+                            except Exception as e:
+                                yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
+                                return
+                            session_str = await client.export_session_string()
+                            info = {
+                                "id": me.id,
+                                "first_name": me.first_name or "",
+                                "last_name": me.last_name or "",
+                                "username": me.username or "",
+                                "phone": me.phone_number or ""
+                            }
+                            await client.disconnect()
+                            del self.temp_auth_clients[user_id]
+                            logger.info(f"✅ QR-вход успешно завершён для user_id={user_id}")
+                            yield (True, session_str, info, None), True
+                            return
+                        if isinstance(resp, raw_types.auth.LoginTokenMigrateTo):
+                            try:
+                                resp = await client.invoke(
+                                    functions.auth.ImportLoginToken(token=resp.token)
+                                )
+                            except Exception as e:
+                                yield (False, None, None, f"Ошибка импорта токена (миграция): {e}"), True
+                                return
+                            if isinstance(resp, raw_types.auth.LoginTokenSuccess):
+                                try:
+                                    me = await client.get_me()
+                                except Exception as e:
+                                    yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
+                                    return
+                                session_str = await client.export_session_string()
+                                info = {
+                                    "id": me.id,
+                                    "first_name": me.first_name or "",
+                                    "last_name": me.last_name or "",
+                                    "username": me.username or "",
+                                    "phone": me.phone_number or ""
+                                }
+                                await client.disconnect()
+                                del self.temp_auth_clients[user_id]
+                                logger.info(f"✅ QR-вход успешно завершён (миграция) для user_id={user_id}")
+                                yield (True, session_str, info, None), True
+                                return
+                    except SessionPasswordNeeded:
+                        logger.warning(f"QR: требуется пароль 2FA для user_id={user_id}")
+                        yield (None, None, None, "Требуется пароль 2FA (Cloud Password)"), True
+                        return
+                    except (AuthTokenExpired, AuthTokenInvalid, AuthKeyUnregistered) as e:
+                        logger.info(f"QR: токен ещё не принят ({type(e).__name__}), продолжаем опрос")
+                        import_attempted = False
+                    except Exception as e:
+                        logger.warning(f"QR: ImportLoginToken ошибка: {type(e).__name__}: {e}")
+                        import_attempted = False
+
+                try:
+                    resp = await asyncio.wait_for(
+                        client.invoke(
+                            functions.auth.ExportLoginToken(
+                                api_id=self.api_id,
+                                api_hash=self.api_hash,
+                                except_ids=[]
+                            )
+                        ),
+                        timeout=15
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"QR: таймаут ExportLoginToken для user_id={user_id}")
+                    await asyncio.sleep(3)
+                    continue
+                except (AuthTokenExpired, AuthTokenInvalid, AuthKeyUnregistered) as e:
+                    logger.info(f"QR: ExportLoginToken - токен ещё не принят ({type(e).__name__})")
+                    await asyncio.sleep(2)
+                    continue
+                except Exception as e:
+                    logger.warning(f"QR: ExportLoginToken ошибка: {type(e).__name__}: {e}")
+                    await asyncio.sleep(3)
+                    continue
+
+                if isinstance(resp, raw_types.auth.LoginTokenSuccess):
+                    try:
+                        me = await client.get_me()
+                    except Exception as e:
+                        yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
+                        return
+                    session_str = await client.export_session_string()
+                    info = {
+                        "id": me.id,
+                        "first_name": me.first_name or "",
+                        "last_name": me.last_name or "",
+                        "username": me.username or "",
+                        "phone": me.phone_number or ""
+                    }
+                    await client.disconnect()
+                    del self.temp_auth_clients[user_id]
+                    logger.info(f"✅ QR-вход успешно завершён для user_id={user_id}")
+                    yield (True, session_str, info, None), True
+                    return
+
+                if isinstance(resp, raw_types.auth.LoginTokenMigrateTo):
+                    logger.info(f"QR: миграция токена на DC{resp.dc_id} для user_id={user_id}")
+                    try:
+                        resp = await client.invoke(
+                            functions.auth.ImportLoginToken(token=resp.token)
+                        )
+                    except Exception as e:
+                        yield (False, None, None, f"Ошибка импорта токена (миграция): {e}"), True
+                        return
+                    if isinstance(resp, raw_types.auth.LoginTokenSuccess):
+                        try:
+                            me = await client.get_me()
+                        except Exception as e:
+                            yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
+                            return
+                        session_str = await client.export_session_string()
+                        info = {
+                            "id": me.id,
+                            "first_name": me.first_name or "",
+                            "last_name": me.last_name or "",
+                            "username": me.username or "",
+                            "phone": me.phone_number or ""
+                        }
+                        await client.disconnect()
+                        del self.temp_auth_clients[user_id]
+                        logger.info(f"✅ QR-вход успешно завершён (миграция) для user_id={user_id}")
+                        yield (True, session_str, info, None), True
+                        return
+                    await asyncio.sleep(2)
+                    continue
+
+                if isinstance(resp, raw_types.auth.LoginToken):
+                    current_bytes = resp.token
+                    if current_bytes != last_token_bytes or qr_update_count == 0:
+                        last_token_bytes = current_bytes
+                        qr_update_count += 1
+                        try:
+                            import qrcode
+                            import io
+                            import base64
+                            qr_url = "tg://login?token=" + base64.urlsafe_b64encode(resp.token).decode('utf-8').rstrip('=')
+                            img = qrcode.make(qr_url)
+                            buf = io.BytesIO()
+                            img.save(buf, format='PNG')
+                            buf.seek(0)
+                            self.temp_auth_clients[user_id]["qr_bytes"] = buf.getvalue()
+                            self.temp_auth_clients[user_id]["qr_text"] = qr_url
+                            self.temp_auth_clients[user_id]["login_token"] = resp
+                            self.temp_auth_clients[user_id]["qr_update_count"] = qr_update_count
+                            logger.info(f"🔄 QR-код обновлён #{qr_update_count} для user_id={user_id}")
+                            yield {
+                                "qr_bytes": buf.getvalue(),
+                                "qr_text": qr_url
+                            }, False
+                        except Exception as img_err:
+                            logger.error(f"❌ Ошибка генерации QR: {img_err}")
+                    await asyncio.sleep(2)
+                    continue
+
+                await asyncio.sleep(2)
+
+            yield (False, None, None, "Время ожидания сканирования QR-кода истекло. Попробуйте ещё раз."), True
+        except SessionPasswordNeeded:
+            yield (False, None, None, "Требуется пароль 2FA. Используйте phone-авторизацию."), True
+        except Exception as e:
+            yield (False, None, None, str(e)), True
+
+    def cancel_phone_auth(self, user_id: int):
+        auth_data = self.temp_auth_clients.pop(user_id, None)
+        if auth_data and "client" in auth_data:
+            try:
+                asyncio.create_task(auth_data["client"].disconnect())
+            except:
+                pass
+
+    # ==================== CLIENT MANAGEMENT ====================
+    async def change_account_bio(self, account_id: int, new_bio: str) -> Tuple[bool, str]:
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return False, err
+        try:
+            await client.update_profile(bio=new_bio)
+            return True, "BIO успешно изменено!"
+        except Exception as e:
+            logger.error(f"Error changing bio for acc {account_id}: {e}")
+            return False, str(e)
+
+    async def get_or_start_client(self, account_id: int, user_id: int = None) -> Tuple[Optional[Client], Optional[str]]:
+        async with self._get_client_lock(account_id):
+            # Update last-used timestamp
+            self._client_last_used[account_id] = time.time()
+            if user_id:
+                self._client_owner[account_id] = user_id
+            
+            if account_id in self.active_clients:
+                client = self.active_clients[account_id]
+                try:
+                    await client.get_me()
+                    return client, None
+                except Exception:
+                    try:
+                        await client.start()
+                        return client, None
+                    except Exception as start_err:
+                        err_str = str(start_err).lower()
+                        if "already" in err_str or "started" in err_str:
+                            return client, None
+                        self.active_clients.pop(account_id, None)
+
+            account = db.get_account(account_id)
+            if not account:
+                return None, "Аккаунт не найден в базе данных"
+
+            try:
+                client = self.create_client(
+                    session_string=account['session_string'],
+                    proxy_str=account.get('proxy', ''),
+                    name=f"acc_{account_id}"
+                )
+                await client.start()
+                self.active_clients[account_id] = client
+                # Enforce client limit after adding new client
+                await self._enforce_client_limit()
+                return client, None
+            except Exception as e:
+                err_str = str(e).lower()
+                if "already" in err_str or "started" in err_str:
+                    self.active_clients[account_id] = client
+                    # Enforce client limit after adding new client
+                    await self._enforce_client_limit()
+                    return client, None
+                db.update_account_status(account_id, 'error')
+                return None, f"Ошибка запуска сессии аккаунта: {e}"
+
+    async def get_last_10_pms(self, account_id: int):
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return None, err
+        
+        try:
+            pms = []
+            async for dialog in client.get_dialogs():
+                if dialog.chat.type == enums.ChatType.PRIVATE:
+                    if dialog.chat.is_bot or dialog.chat.is_verified or dialog.chat.is_support:
+                        continue
+                    pms.append({
+                        'chat_id': dialog.chat.id,
+                        'first_name': dialog.chat.first_name or "",
+                        'last_name': dialog.chat.last_name or "",
+                        'username': dialog.chat.username or "",
+                        'last_message': dialog.top_message.text or "Media/File",
+                        'date': dialog.top_message.date
+                    })
+                    if len(pms) >= 10:
+                        break
+            return pms, None
+        except Exception as e:
+            return None, str(e)
+
+    async def stop_client(self, account_id: int):
+        client = self.active_clients.pop(account_id, None)
+        if client:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+    async def sync_peer_cache(self, account_id: int, chat_ids: list = None):
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return False, err
+        try:
+            async for dialog in client.get_dialogs(limit=200):
+                try:
+                    chat = dialog.chat
+                    if chat and hasattr(chat, 'id'):
+                        await client.resolve_peer(chat.id)
+                except Exception:
+                    continue
+            if chat_ids:
+                for cid in chat_ids:
+                    try:
+                        await client.resolve_peer(cid)
+                    except Exception:
+                        continue
+            return True, "Кеш синхронизирован"
+        except Exception as e:
+            return False, str(e)
+
+    async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
+        logging.info(f"🤖 Generating AI comment | model={AI_MODEL} | prompt_len={len(prompt)} | post_len={len(post_text)}")
+        
+        messages = []
+        if post_text:
+            messages.append({"role": "system", "content": f"Сгенерируй короткий осмысленный комментарий к посту. Промт: {prompt}"})
+            messages.append({"role": "user", "content": post_text[:500]})
+        else:
+            messages.append({"role": "user", "content": prompt})
+
+        # 1. Groq API (бесплатный, быстрый, лимиты 30k tok/min)
+        if GROQ_API_KEY and not GROQ_API_KEY.startswith('ЗАМЕНИТЕ') and not GROQ_API_KEY.startswith('REPLACE'):
+            try:
+                import json as json_mod
+                
+                # Актуальные модели Groq на 2026-09
+                groq_models = ['llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it']
+                groq_model = AI_MODEL if AI_MODEL in groq_models else 'llama-3.1-70b-versatile'
+                
+                def _groq_request_urllib():
+                    import urllib.request
+                    req_data = {"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json_mod.dumps(req_data).encode('utf-8'),
+                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                        method='POST'
+                    )
+                    with urllib.request.urlopen(req, timeout=30.0) as resp:
+                        body = resp.read().decode('utf-8')
+                        if resp.status != 200:
+                            logging.error(f"❌ Groq HTTP {resp.status}: {body[:300]}")
+                            return None
+                        resp_data = json_mod.loads(body)
+                        return resp_data["choices"][0]["message"]["content"].strip()
+                
+                try:
+                    import httpx
+                    # httpx предпочтительнее (async нативно)
+                    async def _groq_request_httpx():
+                        async with httpx.AsyncClient(timeout=30.0) as client:
+                            response = await client.post(
+                                "https://api.groq.com/openai/v1/chat/completions",
+                                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                                json={"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
+                            )
+                            if response.status_code != 200:
+                                logging.error(f"❌ Groq HTTP {response.status_code}: {response.text[:300]}")
+                                return None
+                            response.raise_for_status()
+                            data = response.json()
+                            return data["choices"][0]["message"]["content"].strip()
+                    
+                    result = await _groq_request_httpx()
+                except ImportError:
+                    # httpx недоступен, используем urllib в потоке
+                    result = await asyncio.to_thread(_groq_request_urllib)
+                
+                if result:
+                    logging.info(f"🤖 Generated comment via Groq ({len(result)} chars): {result[:100]}...")
+                    return result
+            except Exception as e:
+                logging.error(f"❌ Groq API error: {type(e).__name__}: {e}")
+
+        # 2. Google Gemini API (бесплатный, 1500 RPM)
+        if GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai
+                genai.configure(api_key=GEMINI_API_KEY)
+                model_name = AI_MODEL if 'gemini' in AI_MODEL.lower() else 'gemini-1.5-flash'
+                model = genai.GenerativeModel(model_name)
+                full_prompt = "\n\n".join([m['content'] for m in messages])
+                response = await asyncio.to_thread(
+                    model.generate_content,
+                    full_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=150,
+                        temperature=0.7
+                    )
+                )
+                result = response.text.strip()
+                logging.info(f"🤖 Generated comment via Gemini ({len(result)} chars): {result[:100]}...")
+                return result
+            except Exception as e:
+                logging.error(f"❌ Gemini API error: {type(e).__name__}: {e}")
+
+        # 3. OpenRouter API (есть бесплатные модели)
+        if OPENROUTER_API_KEY:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://t.me/poster_bot",
+                            "X-Title": "Poster Bot"
+                        },
+                        json={
+                            "model": AI_MODEL,
+                            "messages": messages,
+                            "max_tokens": 150,
+                            "temperature": 0.7
+                        }
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    result = data["choices"][0]["message"]["content"].strip()
+                    logging.info(f"🤖 Generated comment via OpenRouter ({len(result)} chars): {result[:100]}...")
+                    return result
+            except Exception as e:
+                logging.error(f"❌ OpenRouter API error: {type(e).__name__}: {e}")
+
+        # 4. OpenAI API (если есть ключ)
+        if OPENAI_API_KEY and AI_MODEL.startswith('gpt'):
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=OPENAI_API_KEY)
+                response = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=AI_MODEL,
+                    messages=messages,
+                    max_tokens=150,
+                    temperature=0.7
+                )
+                result = response.choices[0].message.content.strip()
+                logging.info(f"🤖 Generated comment via OpenAI ({len(result)} chars): {result[:100]}...")
+                return result
+            except Exception as e:
+                logging.error(f"❌ OpenAI API error: {type(e).__name__}: {e}")
+
+        # 5. g4f fallback (бесплатно, но может быть нестабильным)
+        try:
+            from g4f.client import Client
+            client = Client(api_key=G4F_API_KEY) if G4F_API_KEY and not G4F_API_KEY.startswith('ЗАМЕНИТЕ') else Client()
+            logging.info(f"🤖 Trying g4f (free providers)")
+            # Новые модели g4f: gpt-4.1, deepseek-v3, gpt-4o
+            fallback_models = ['gpt-4.1', 'deepseek-v3', 'gpt-4o', 'gpt-4o-mini', 'llama-3.1-70b', 'qwen-2.5-72b']
+            for fallback_model in fallback_models:
+                try:
+                    logging.info(f"🔄 Trying g4f model: {fallback_model}")
+                    response = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        model=fallback_model,
+                        messages=messages,
+                        max_tokens=150
+                    )
+                    result = response.choices[0].message.content.strip()
+                    logging.info(f"🤖 Generated comment via g4f:{fallback_model} ({len(result)} chars): {result[:100]}...")
+                    return result
+                except Exception as fallback_e:
+                    logging.warning(f"⚠️ g4f {fallback_model} failed: {fallback_e}")
+        except Exception as e:
+            logging.error(f"❌ g4f failed: {type(e).__name__}: {e}")
+
+        logging.warning(f"⚠️ All AI providers failed or not configured. Add GROQ_API_KEY or GEMINI_API_KEY to config.ini")
+        return ""
+
+    async def start_neurocomment(self, account_id: int, bot, user_id: int):
+        logging.info(f"🟢 start_neurocomment called for account {account_id}")
+        if account_id in self.active_comment_tasks:
+            logging.warning(f"⚠️ Neurocomment already running for account {account_id}")
+            return False, "Нейрокомментинг уже запущен"
+        account = db.get_account(account_id)
+        if not account:
+            logging.error(f"❌ Account {account_id} not found")
+            return False, "Аккаунт не найден"
+        nc = db.get_neurocomment_settings(account_id)
+        logging.info(f"📊 Neurocomment settings: {nc}")
+        if not nc or not nc.get('enabled'):
+            logging.warning(f"⚠️ Neurocomment not enabled for account {account_id}")
+            return False, "Нейрокомментинг не включен в настройках"
+        mode = nc.get('mode', 'prompt')
+        target_channels = nc.get('target_channels', '')
+        if mode == 'prompt' and not nc.get('prompt'):
+            logging.warning(f"⚠️ Prompt not set for account {account_id}")
+            return False, "Промт не задан"
+        if mode == 'custom' and not nc.get('custom_comments'):
+            logging.warning(f"⚠️ Custom comments not set for account {account_id}")
+            return False, "Комментарии не заданы"
+        if mode == 'post_prompt' and not nc.get('post_prompt'):
+            logging.warning(f"⚠️ Post prompt not set for account {account_id}")
+            return False, "Промт для постов не задан"
+        if not target_channels:
+            logging.warning(f"⚠️ Target channels not set for account {account_id}")
+            return False, "Целевые каналы не заданы"
+        channels = [c.strip() for c in target_channels.split(',') if c.strip()]
+        if not channels:
+            logging.warning(f"⚠️ No valid channels for account {account_id}")
+            return False, "Целевые каналы не заданы"
+        if self._running_tasks >= self._max_concurrent_tasks:
+            return False, f"Достигнут глобальный лимит одновременных задач ({self._max_concurrent_tasks}). Попробуйте позже."
+        if not await self._acquire_user_quota(user_id):
+            return False, f"Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER}). Дождитесь завершения или отмените другие задачи."
+        logging.info(f"✅ Starting neurocomment for account {account_id} on channels: {channels}")
+        self.comment_listeners[account_id] = {}
+        task_id = db.register_task(user_id, account_id, 'neurocomment', 'starting')
+        self.active_comment_task_ids[account_id] = task_id
+        task = asyncio.create_task(self._run_limited(self._neurocomment_worker(account_id, bot, user_id, nc, task_id)))
+        self.active_comment_tasks[account_id] = task
+        return True, f"Нейрокомментинг запущен на {len(channels)} каналах"
+
+    async def stop_neurocomment(self, account_id: int, user_id: int = None):
+        # Note: quota is released in _neurocomment_worker's finally block
+        task = self.active_comment_tasks.pop(account_id, None)
+        task_id = self.active_comment_task_ids.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+        self.comment_listeners.pop(account_id, None)
+        if task_id:
+            db.cancel_task(task_id)
+
+    async def _neurocomment_worker(self, account_id: int, bot, user_id: int, nc: dict, task_id: int = None):
+        from pyrogram.raw import types as raw_types
+        from pyrogram import utils as pyrogram_utils
+        
+        # ⭐ ДОБАВЛЯЕМ ФУНКЦИЮ НОРМАЛИЗАЦИИ
+        def normalize_chat_id(chat_id):
+            """Приводит ID к единому формату (без префиксов)"""
+            try:
+                if isinstance(chat_id, str):
+                    if chat_id.startswith('-100'):
+                        return int(chat_id[4:])
+                    elif chat_id.startswith('-'):
+                        return int(chat_id[1:])
+                    else:
+                        return int(chat_id)
+                else:
+                    return int(chat_id)
+            except:
+                return chat_id
+        
+        account = db.get_account(account_id)
+        if not account:
+            logging.error(f"❌ Account {account_id} not found in worker")
+            return
+        
+        acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+        notifications_hidden = account.get('notifications_hidden', 0) == 1
+        
+        logging.info(f"🧠 Starting neurocomment worker for {acc_name} | user_id={user_id} | notifications_hidden={notifications_hidden}")
+        
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            logging.error(f"❌ [{acc_name}] Failed to start client: {err}")
+            if bot and not notifications_hidden:
+                await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось запустить сессию: {err}")
+            return
+        
+        logging.info(f"✅ [{acc_name}] Client started successfully")
+        if bot and not notifications_hidden:
+            await bot.send_message(user_id, f"🧠 [{acc_name}] Нейрокомментинг запущен! Проверяю каналы...")
+        
+        try:
+            target_channels = [c.strip() for c in nc.get('target_channels', '').split(',') if c.strip()]
+            logging.info(f"📋 [{acc_name}] Target channels from settings: {target_channels}")
+            
+            valid_channels = []
+            channel_cache = {}  # ⭐ КЕШ ДЛЯ ОБЪЕКТОВ КАНАЛОВ
+            
+            for channel in target_channels:
+                try:
+                    chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
+                    logging.info(f"🔍 [{acc_name}] Checking channel: {channel} (chat_id={chat_id})")
+                    chat = await client.get_chat(chat_id)
+                    valid_channels.append(channel)
+                    channel_cache[channel] = chat  # ⭐ СОХРАНЯЕМ В КЕШ
+                    logging.info(f"✅ [{acc_name}] Channel {channel} is accessible (id={chat.id}, title={getattr(chat, 'title', 'N/A')})")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен")
+                except Exception as e:
+                    logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Канал {channel} недоступен: {str(e)[:100]}")
+            
+            logging.info(f"📊 [{acc_name}] Channel validation complete: {len(valid_channels)}/{len(target_channels)} valid")
+            
+            if not valid_channels:
+                logging.warning(f"⚠️ [{acc_name}] No valid channels found, stopping worker")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Нет доступных каналов! Проверьте настройки.")
+                return
+            
+            loop_count = 0
+            mode = nc.get('mode', 'prompt')
+            prompt = nc.get('prompt', '')
+            custom_comments_raw = nc.get('custom_comments', '') or '[]'
+            custom_comments = json.loads(custom_comments_raw)
+            post_prompt = nc.get('post_prompt', '')
+            comment_delay = int(nc.get('comment_delay', 60) or 60)
+
+            # ⭐ ИНИЦИАЛИЗИРУЕМ last_seen ПОСЛЕДНИМИ СООБЩЕНИЯМИ ЧТОБЫ НЕ КОММЕНТИРОВАТЬ СТАРЫЕ ПОСТЫ ПРИ СТАРТЕ
+            for channel in valid_channels:
+                try:
+                    chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
+                    async for msg in client.get_chat_history(chat_id, limit=1):
+                        if msg:
+                            self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                            logging.info(f"🔧 [{acc_name}] Initialized last_seen for {channel} = {msg.id} (no comment on startup)")
+                except Exception as e:
+                    logging.warning(f"⚠️ [{acc_name}] Failed to initialize last_seen for {channel}: {e}")
+            
+            while True:
+                loop_count += 1
+                logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} start | channels={len(valid_channels)} | mode={mode} | delay={comment_delay}s")
+                
+                if not db.is_user_subscribed(user_id):
+                    logging.warning(f"⚠️ [{acc_name}] Subscription expired for user {user_id}, stopping")
+                    await self.stop_neurocomment(account_id)
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Подписка истекла! Нейрокомментинг остановлен.")
+                    break
+                
+                nc_chk = db.get_neurocomment_settings(account_id)
+                if not nc_chk or not nc_chk.get('enabled'):
+                    logging.info(f"🛑 [{acc_name}] Neurocomment disabled in settings, stopping")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"🛑 [{acc_name}] Нейрокомментинг выключен.")
+                    break
+                
+                mode = nc_chk.get('mode', 'prompt')
+                prompt = nc_chk.get('prompt', '')
+                custom_comments_raw = nc_chk.get('custom_comments', '') or '[]'
+                custom_comments = json.loads(custom_comments_raw)
+                post_prompt = nc_chk.get('post_prompt', '')
+                comment_delay = int(nc_chk.get('comment_delay', 60) or 60)
+                
+                logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} - checking {len(valid_channels)} channels | mode={mode}")
+                channel_posts_found = 0
+                
+                for channel in valid_channels:
+                    try:
+                        chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
+                        chat_obj = channel_cache.get(channel)  # ⭐ БЕРЁМ ИЗ КЕША
+                        
+                        if not chat_obj:
+                            try:
+                                chat_obj = await client.get_chat(chat_id)
+                                channel_cache[channel] = chat_obj
+                            except Exception as e:
+                                logging.warning(f"⚠️ [{acc_name}] Failed to get chat {channel}: {e}")
+                                continue
+                        
+                        logging.debug(f"📥 [{acc_name}] Fetching last message from {channel}")
+                        async for msg in client.get_chat_history(chat_id, limit=1):
+                            if not msg:
+                                logging.debug(f"📭 [{acc_name}] No messages in {channel}")
+                                continue
+                            
+                            post_text = msg.text or msg.caption or ''
+                            logging.debug(f"📩 [{acc_name}] Got message id={msg.id} date={msg.date} text_len={len(post_text)} in {channel}")
+                            
+                            if mode != 'custom' and not post_text:
+                                logging.debug(f"⏭️ [{acc_name}] Skipping empty post in {channel} (mode={mode})")
+                                continue
+                            
+                            post_age = time.time() - msg.date.timestamp()
+                            if post_age < comment_delay:
+                                logging.debug(f"⏳ [{acc_name}] Post too recent ({post_age:.0f}s < {comment_delay}s) in {channel}")
+                                continue
+                            
+                            last_seen = self.comment_listeners.get(account_id, {}).get(str(channel), 0)
+                            logging.debug(f"🔎 [{acc_name}] last_seen={last_seen} msg.id={msg.id} in {channel}")
+                            
+                            if msg.id <= last_seen:
+                                logging.debug(f"✅ [{acc_name}] Already commented on post {msg.id} in {channel}")
+                                continue
+                            
+                            logging.info(f"💬 [{acc_name}] Found new post in {channel}: {post_text[:100]}...")
+                            channel_posts_found += 1
+                            
+                            comment_text = ""
+                            if mode == 'prompt':
+                                logging.debug(f"🧠 [{acc_name}] Generating prompt-based comment for {channel}")
+                                comment_text = await self.generate_ai_comment(prompt, post_text)
+                                # Fallback: если AI не сработал, пробуем свои комментарии
+                                if not comment_text and custom_comments:
+                                    logging.info(f"🔄 [{acc_name}] AI failed, falling back to custom comments")
+                                    base_comment = random.choice(custom_comments)
+                                    variants = [v.strip() for v in base_comment.split('|') if v.strip()]
+                                    comment_text = random.choice(variants) if variants else base_comment
+                            elif mode == 'custom' and custom_comments:
+                                # Поддержка рандомизации через | (например: "вариант 1|вариант 2|вариант 3")
+                                base_comment = random.choice(custom_comments)
+                                variants = [v.strip() for v in base_comment.split('|') if v.strip()]
+                                comment_text = random.choice(variants) if variants else base_comment
+                                logging.debug(f"📝 [{acc_name}] Chosen custom comment ({len(comment_text)} chars)")
+                            elif mode == 'post_prompt':
+                                logging.debug(f"🧠 [{acc_name}] Generating post-prompt comment for {channel}")
+                                comment_text = await self.generate_ai_comment(post_prompt, post_text)
+                                # Fallback: если AI не сработал, пробуем свои комментарии
+                                if not comment_text and custom_comments:
+                                    logging.info(f"🔄 [{acc_name}] AI failed, falling back to custom comments")
+                                    base_comment = random.choice(custom_comments)
+                                    variants = [v.strip() for v in base_comment.split('|') if v.strip()]
+                                    comment_text = random.choice(variants) if variants else base_comment
+                            
+                            # ⭐ ВСЕГДА ОБНОВЛЯЕМ last_seen, ЧТОБЫ НЕ ЗАЦИКЛИВАТЬСЯ НА ОДНОМ ПОСТЕ
+                            self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                            
+                            if not comment_text:
+                                logging.warning(f"⚠️ [{acc_name}] Failed to generate comment for {channel} (no fallback)")
+                                if bot and not notifications_hidden:
+                                    await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось сгенерировать комментарий (нет fallback)")
+                                continue
+                            
+                            try:
+                                comment_sent = False
+                                discussion_chat_id = None
+                                chat_username = getattr(chat_obj, 'username', None)
+                                
+                                # ⭐ ПОИСК ЧАТА ОБСУЖДЕНИЙ
+                                try:
+                                    # 1. Pyrogram linked_chat property (возвращает Chat объект)
+                                    if hasattr(chat_obj, 'linked_chat') and chat_obj.linked_chat:
+                                        discussion_chat_id = chat_obj.linked_chat.id
+                                        logging.info(f"🔗 [{acc_name}] Found discussion chat via linked_chat: {discussion_chat_id}")
+                                    # 2. Прямые атрибуты
+                                    elif hasattr(chat_obj, 'linked_chat_id') and chat_obj.linked_chat_id:
+                                        discussion_chat_id = chat_obj.linked_chat_id
+                                    elif hasattr(chat_obj, 'discussion_chat_id') and chat_obj.discussion_chat_id:
+                                        discussion_chat_id = chat_obj.discussion_chat_id
+                                    
+                                    # 3. Если не нашли - через GetFullChannel
+                                    if not discussion_chat_id:
+                                        try:
+                                            from pyrogram.raw import functions as raw_functions
+                                            peer = await client.resolve_peer(chat_id)
+                                            channel_full = await client.invoke(
+                                                raw_functions.channels.GetFullChannel(channel=peer)
+                                            )
+                                            if hasattr(channel_full, 'full_chat'):
+                                                if hasattr(channel_full.full_chat, 'linked_chat_id'):
+                                                    discussion_chat_id = channel_full.full_chat.linked_chat_id
+                                        except Exception as e:
+                                            logging.debug(f"⚠️ [{acc_name}] GetFullChannel failed: {e}")
+                                except Exception as e:
+                                    logging.debug(f"⚠️ [{acc_name}] Failed to get discussion chat: {e}")
+                                
+                                if not discussion_chat_id:
+                                    logging.warning(f"⚠️ [{acc_name}] No discussion chat found for {channel}")
+                                    if bot and not notifications_hidden:
+                                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
+                                    continue
+                                
+                                # ⭐ ВСТУПАЕМ В ЧАТ ОБСУЖДЕНИЙ
+                                try:
+                                    await client.join_chat(discussion_chat_id)
+                                    logging.info(f"🔗 [{acc_name}] Joined discussion chat {discussion_chat_id}")
+                                except Exception as join_err:
+                                    logging.debug(f"⚠️ [{acc_name}] Already in discussion chat or join failed: {join_err}")
+                                
+                                # ⭐ КЛЮЧЕВОЙ МОМЕНТ: НОРМАЛИЗУЕМ ID КАНАЛА НА ИСХОДЕ ИЗ chat_obj.id (а не channel string)
+                                normalized_channel_id = normalize_chat_id(chat_obj.id)
+                                logging.debug(f"🔍 [{acc_name}] chat_obj.id={chat_obj.id}, normalized={normalized_channel_id}, channel={channel}, chat_id={chat_id}")
+                                
+                                # ⭐ ИЩЕМ ФОРВАРД ИЗ КАНАЛА
+                                try:
+                                    # Ищем форвард в обсуждениях - увеличиваем лимит до 200
+                                    fwd_count = 0
+                                    async for fwd in client.get_chat_history(discussion_chat_id, limit=200):
+                                        fwd_count += 1
+                                        is_fwd = getattr(fwd, 'forward_date', None)
+                                        fwd_chat = getattr(fwd, 'forward_from_chat', None)
+                                        fwd_msg_id = getattr(fwd, 'forward_from_message_id', None)
+                                        
+                                        if is_fwd:
+                                            # Метод 1: сравнение по chat_id из forward_from_chat
+                                            if fwd_chat:
+                                                fwd_chat_id_val = getattr(fwd_chat, 'id', None)
+                                                fwd_chat_username = getattr(fwd_chat, 'username', None)
+                                                logging.debug(f"🔍 [{acc_name}] Fwd msg_id={fwd.id} from_chat_id={fwd_chat_id_val} username={fwd_chat_username} fwd_from_msg_id={fwd_msg_id}")
+                                                
+                                                if fwd_chat_id_val is not None:
+                                                    normalized_fwd_id = normalize_chat_id(fwd_chat_id_val)
+                                                    if normalized_fwd_id == normalized_channel_id:
+                                                        logging.info(f"🔍 [{acc_name}] Found matching forward (by id): fwd.id={fwd.id}, channel_msg_id={msg.id}")
+                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        comment_sent = True
+                                                        logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd msg_id={fwd.id})")
+                                                        break
+                                                elif chat_username and fwd_chat_username and fwd_chat.username:
+                                                    if fwd_chat.username.lower() == chat_username.lower():
+                                                        logging.info(f"🔍 [{acc_name}] Found matching forward (by username): fwd.id={fwd.id}")
+                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        comment_sent = True
+                                                        logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by username)")
+                                                        break
+                                            
+                                            # Метод 2: сравнение по forward_from_message_id (совпадение с msg.id канала)
+                                            if not comment_sent and fwd_msg_id and hasattr(msg, 'id') and fwd_msg_id == msg.id:
+                                                logging.info(f"🔍 [{acc_name}] Found matching forward (by msg_id={msg.id}): fwd.id={fwd.id}")
+                                                await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                comment_sent = True
+                                                logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by msg_id)")
+                                                break
+                                    
+                                    logging.debug(f"🔍 [{acc_name}] Scanned {fwd_count} messages in discussion chat {discussion_chat_id}")
+                                except Exception as disc_err:
+                                    logging.warning(f"⚠️ [{acc_name}] Discussion chat error: {disc_err}")
+
+                                if not comment_sent:
+                                    logging.warning(f"⚠️ [{acc_name}] Forward from channel not found in discussion chat {discussion_chat_id} - SKIPPING (comment must be reply to forward)")
+                                
+                                if comment_sent:
+                                    self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                    if bot and not notifications_hidden:
+                                        await bot.send_message(user_id, f"✅ [{acc_name}] Прокомментирован пост в {channel}")
+                                
+                            except Exception as send_err:
+                                logging.error(f"❌ [{acc_name}] Failed to send comment to {channel}: {type(send_err).__name__}: {send_err}")
+                                if bot and not notifications_hidden:
+                                    await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка отправки в {channel}: {str(send_err)[:100]}")
+                    
+                    except Exception as e:
+                        logging.error(f"❌ [{acc_name}] Error processing channel {channel}: {type(e).__name__}: {e}")
+                        if bot and not notifications_hidden:
+                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка проверки канала {channel}: {str(e)[:100]}")
+                
+                logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} end | posts_found={channel_posts_found} | sleeping {comment_delay}s")
+                await asyncio.sleep(comment_delay)
+        
+        except asyncio.CancelledError:
+            logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
+        except Exception as e:
+            logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}")
+            if bot and not notifications_hidden:
+                try:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Критическая ошибка: {str(e)[:200]}")
+                except:
+                    pass
+        finally:
+            logging.info(f"🧠 [{acc_name}] Neurocomment worker stopped")
+            db.update_neurocomment_settings(account_id, enabled=0)
+            self.active_comment_tasks.pop(account_id, None)
+            self.comment_listeners.pop(account_id, None)
+            if task_id:
+                db.finish_task(task_id, status='finished')
+            self.active_comment_task_ids.pop(account_id, None)
+            await self._release_user_quota(user_id)
+
+    # ==================== CHAT LIST & SYNC ====================
+    async def fetch_and_sync_chats(self, account_id: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return [], err
+
+        from pyrogram.raw.functions.messages import GetDialogs
+        from pyrogram.raw.types import InputPeerEmpty, InputPeerChannel, InputPeerChat, InputPeerUser
+        from pyrogram.raw.types import Channel, Chat, ChannelForbidden, ChatForbidden, ChatEmpty
+        from pyrogram import utils
+
+        chats_map = {}
+
+        try:
+            # 1. MTProto raw GetDialogs with pagination (completely bypasses CHANNEL_PRIVATE errors in channels.GetMessages)
+            offset_date = 0
+            offset_id = 0
+            offset_peer = InputPeerEmpty()
+            limit = 100
+
+            for _ in range(25):  # Up to 2500 dialogs
+                try:
+                    res = await client.invoke(
+                        GetDialogs(
+                            offset_date=offset_date,
+                            offset_id=offset_id,
+                            offset_peer=offset_peer,
+                            limit=limit,
+                            hash=0
+                        )
+                    )
+                except Exception as chunk_err:
+                    print(f"⚠️ Chunk GetDialogs #{account_id}: {chunk_err}")
+                    break
+
+                if not hasattr(res, 'chats') or not res.chats:
+                    break
+
+                for ch in res.chats:
+                    if isinstance(ch, (ChannelForbidden, ChatForbidden, ChatEmpty)):
+                        continue
+                    if getattr(ch, 'left', False) or getattr(ch, 'deactivated', False) or getattr(ch, 'kicked', False):
+                        continue
+
+                    if isinstance(ch, Channel):
+                        full_id = str(utils.get_channel_id(ch.id))
+                        title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
+                        username = getattr(ch, 'username', None) or ""
+                        chats_map[full_id] = {
+                            'id': full_id,
+                            'title': title,
+                            'username': username,
+                            'chat_type': 'channel'
+                        }
+                    elif isinstance(ch, Chat):
+                        full_id = str(-ch.id)
+                        title = ch.title or f"Группа {ch.id}"
+                        chats_map[full_id] = {
+                            'id': full_id,
+                            'title': title,
+                            'username': "",
+                            'chat_type': 'group'
+                        }
+
+                # Detect private chats from dialogs
+                if hasattr(res, 'dialogs') and hasattr(res, 'users'):
+                    for dialog in res.dialogs:
+                        peer = dialog.peer
+                        if hasattr(peer, 'user_id'):
+                            user_id = peer.user_id
+                            user_obj = next((u for u in res.users if getattr(u, 'id', None) == user_id), None)
+                            if user_obj and not getattr(user_obj, 'bot', False):
+                                full_id = str(user_id)
+                                title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
+                                username = getattr(user_obj, 'username', None) or ""
+                                chats_map[full_id] = {
+                                    'id': full_id,
+                                    'title': title,
+                                    'username': username,
+                                    'chat_type': 'private'
+                                }
+
+                if not hasattr(res, 'dialogs') or not res.dialogs or len(res.dialogs) < limit:
+                    break
+
+                last_dialog = res.dialogs[-1]
+                last_msg_id = last_dialog.top_message
+                last_msg_date = 0
+                if hasattr(res, 'messages'):
+                    for m in res.messages:
+                        if getattr(m, 'id', None) == last_msg_id:
+                            last_msg_date = getattr(m, 'date', 0)
+                            break
+
+                peer = last_dialog.peer
+                if hasattr(peer, 'channel_id'):
+                    ch_obj = next((c for c in res.chats if getattr(c, 'id', None) == peer.channel_id), None)
+                    access_hash = getattr(ch_obj, 'access_hash', 0) if ch_obj else 0
+                    offset_peer = InputPeerChannel(channel_id=peer.channel_id, access_hash=access_hash)
+                elif hasattr(peer, 'chat_id'):
+                    offset_peer = InputPeerChat(chat_id=peer.chat_id)
+                elif hasattr(peer, 'user_id'):
+                    u_obj = next((u for u in getattr(res, 'users', []) if getattr(u, 'id', None) == peer.user_id), None)
+                    access_hash = getattr(u_obj, 'access_hash', 0) if u_obj else 0
+                    offset_peer = InputPeerUser(user_id=peer.user_id, access_hash=access_hash)
+                else:
+                    offset_peer = InputPeerEmpty()
+
+                offset_date = last_msg_date
+                offset_id = last_msg_id
+
+            # 2. Also check folder_id = 1 (Archived / Folders)
+            try:
+                res_arch = await client.invoke(
+                    GetDialogs(
+                        offset_date=0,
+                        offset_id=0,
+                        offset_peer=InputPeerEmpty(),
+                        limit=limit,
+                        hash=0,
+                        folder_id=1
+                    )
+                )
+                if hasattr(res_arch, 'chats'):
+                    for ch in res_arch.chats:
+                        if isinstance(ch, (ChannelForbidden, ChatForbidden, ChatEmpty)):
+                            continue
+                        if getattr(ch, 'left', False) or getattr(ch, 'deactivated', False):
+                            continue
+                        if isinstance(ch, Channel):
+                            full_id = str(utils.get_channel_id(ch.id))
+                            title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
+                            username = getattr(ch, 'username', None) or ""
+                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'channel'}
+                        elif isinstance(ch, Chat):
+                            full_id = str(-ch.id)
+                            title = ch.title or f"Группа {ch.id}"
+                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': "", 'chat_type': 'group'}
+                
+                if hasattr(res_arch, 'dialogs') and hasattr(res_arch, 'users'):
+                    for dialog in res_arch.dialogs:
+                        peer = dialog.peer
+                        if hasattr(peer, 'user_id'):
+                            user_id = peer.user_id
+                            user_obj = next((u for u in res_arch.users if getattr(u, 'id', None) == user_id), None)
+                            if user_obj and not getattr(user_obj, 'bot', False):
+                                full_id = str(user_id)
+                                title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
+                                username = getattr(user_obj, 'username', None) or ""
+                                chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'private'}
+            except Exception:
+                pass
+
+            chat_list = list(chats_map.values())
+            print(f"📋 Аккаунт #{account_id}: успешно получено {len(chat_list)} диалогов")
+            db.sync_account_chats(account_id, chat_list)
+            chats = db.get_account_chats(account_id)
+            return chats, None
+
+        except Exception as e:
+            print(f"❌ Ошибка fetch_and_sync_chats #{account_id}: {e}")
+            # If raw fails, fallback to standard get_dialogs with exception catching
+            try:
+                chat_list = []
+                async for dialog in client.get_dialogs():
+                    try:
+                        chat = dialog.chat
+                        chat_type = 'unknown'
+                        if chat.type == enums.ChatType.PRIVATE:
+                            chat_type = 'private'
+                        elif chat.type == enums.ChatType.BOT:
+                            chat_type = 'bot'
+                        elif chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.GROUP, enums.ChatType.CHANNEL]:
+                            chat_type = 'channel' if chat.type == enums.ChatType.CHANNEL else 'group'
+                        chat_list.append({
+                            'id': str(chat.id),
+                            'title': chat.title or str(chat.id),
+                            'username': chat.username or "",
+                            'chat_type': chat_type
+                        })
+                    except Exception:
+                        continue
+                db.sync_account_chats(account_id, chat_list)
+                chats = db.get_account_chats(account_id)
+                return chats, None
+            except Exception as fb_err:
+                return [], str(fb_err)
+
+
+
+    # ==================== JOIN CHATS (Batch & Chatlists/Folders) ====================
+    async def join_chatlist_invite(self, client: Client, link_or_slug: str) -> Tuple[bool, int, str]:
+        """Joins all chats in a Telegram Chatlist / Shared Folder link (e.g. t.me/addlist/slug)."""
+        slug = link_or_slug.strip()
+        if "addlist/" in slug:
+            slug = slug.split("addlist/")[-1]
+        if "tg://addlist?slug=" in slug:
+            slug = slug.split("slug=")[-1]
+        if "?" in slug:
+            slug = slug.split("?")[0]
+        if "&" in slug:
+            slug = slug.split("&")[0]
+        slug = slug.strip("/").strip()
+
+        from pyrogram.raw.functions.chatlists import CheckChatlistInvite, JoinChatlistInvite
+        from pyrogram.raw.types import InputPeerChannel, InputPeerChat, InputPeerUser
+        from pyrogram.raw.types.chatlists import ChatlistInvite, ChatlistInviteAlready
+
+        try:
+            check_res = await client.invoke(CheckChatlistInvite(slug=slug))
+
+            if isinstance(check_res, ChatlistInviteAlready):
+                if check_res.missing_peers:
+                    input_peers = []
+                    chats_map = {c.id: c for c in check_res.chats}
+                    for p in check_res.missing_peers:
+                        ch_id = getattr(p, 'channel_id', getattr(p, 'chat_id', getattr(p, 'user_id', None)))
+                        if ch_id and ch_id in chats_map:
+                            ch = chats_map[ch_id]
+                            if hasattr(ch, 'access_hash'):
+                                input_peers.append(InputPeerChannel(channel_id=ch.id, access_hash=ch.access_hash))
+                            else:
+                                input_peers.append(InputPeerChat(chat_id=ch.id))
+                    if input_peers:
+                        await client.invoke(JoinChatlistInvite(slug=slug, peers=input_peers))
+                        return True, len(input_peers), f"Успешно вступил в {len(input_peers)} новых чатов из папки"
+                return True, 0, "Аккаунт уже состоит во всех чатах этой папки"
+
+            elif isinstance(check_res, ChatlistInvite):
+                input_peers = []
+                chats_map = {c.id: c for c in check_res.chats}
+                for p in check_res.peers:
+                    ch_id = getattr(p, 'channel_id', getattr(p, 'chat_id', getattr(p, 'user_id', None)))
+                    if ch_id and ch_id in chats_map:
+                        ch = chats_map[ch_id]
+                        if hasattr(ch, 'access_hash'):
+                            input_peers.append(InputPeerChannel(channel_id=ch.id, access_hash=ch.access_hash))
+                        else:
+                            input_peers.append(InputPeerChat(chat_id=ch.id))
+
+                if not input_peers and check_res.chats:
+                    for ch in check_res.chats:
+                        if hasattr(ch, 'access_hash'):
+                            input_peers.append(InputPeerChannel(channel_id=ch.id, access_hash=ch.access_hash))
+                        else:
+                            input_peers.append(InputPeerChat(chat_id=ch.id))
+
+                if not input_peers:
+                    return False, 0, "Не найдены доступные чаты для вступления в папке"
+
+                await client.invoke(JoinChatlistInvite(slug=slug, peers=input_peers))
+                folder_title = getattr(check_res, 'title', 'Папка чатов')
+                return True, len(input_peers), f"Успешно вступил в {len(input_peers)} чатов из папки '{folder_title}'"
+            else:
+                return False, 0, "Неизвестный формат папки чатов"
+        except Exception as e:
+            return False, 0, str(e)
+
+    async def join_chats_batch(self, account_id: int, chat_links: List[str], bot, user_id: int):
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            if bot:
+                await bot.send_message(user_id, f"❌ Ошибка подключения аккаунта #{account_id}: {err}")
+            return
+
+        total = len(chat_links)
+        joined = 0
+        failed = 0
+        account = db.get_account(account_id)
+        acc_name = account.get('account_name') or f"ID {account_id}"
+
+        if bot:
+            await bot.send_message(user_id, f"🚀 [{acc_name}] Начинаю обработку {total} ссылок/папок чатов...")
+
+        for idx, link_raw in enumerate(chat_links, 1):
+            link = link_raw.strip()
+            if not link:
+                continue
+
+            try:
+                if "addlist" in link:
+                    # Telegram Chatlist / Shared Folder invite
+                    ok, count, msg = await self.join_chatlist_invite(client, link)
+                    if ok:
+                        joined += max(1, count)
+                        if bot:
+                            await bot.send_message(user_id, f"✅ [{acc_name}] {msg}")
+                    else:
+                        failed += 1
+                        if bot:
+                            await bot.send_message(user_id, f"❌ [{acc_name}] Ошибка папки ({link}): {msg}")
+                else:
+                    clean_link = link.replace("https://t.me/", "").replace("https://t.me/+", "+").strip()
+                    if clean_link.startswith('+'):
+                        # Private chat invite link - try multiple methods
+                        try:
+                            await client.join_chat(clean_link)
+                        except Exception:
+                            try:
+                                await client.join_chat_by_invite_link(clean_link)
+                            except Exception:
+                                await client.join_chat(link)
+                    else:
+                        await client.join_chat(clean_link)
+                    joined += 1
+                    if bot:
+                        await bot.send_message(user_id, f"✅ [{acc_name}] Успешно вступил: {clean_link}")
+            except Exception as e:
+                failed += 1
+                if bot:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось вступить ({link}): {str(e)[:100]}")
+
+            await asyncio.sleep(random.randint(5, 10))
+
+            if idx % 5 == 0 and idx < total:
+                if bot:
+                    await bot.send_message(user_id, f"⏳ [{acc_name}] Пауза 2 минуты между пачками...")
+                await asyncio.sleep(120)
+
+        # Sync chats after join
+        try:
+            await self.fetch_and_sync_chats(account_id)
+        except:
+            pass
+
+        if bot:
+            await bot.send_message(user_id, f"🏁 [{acc_name}] Вступление завершено!\n✅ Вступил: {joined}\n❌ Ошибок: {failed}")
+
+
+    # ==================== MASS LEAVE CHATS ====================
+    async def leave_chats_batch(self, account_id: int, chat_ids: List[str], bot, user_id: int):
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            if bot:
+                await bot.send_message(user_id, f"❌ Ошибка подключения аккаунта #{account_id}: {err}")
+            return
+
+        total = len(chat_ids)
+        left = 0
+        failed = 0
+        account = db.get_account(account_id)
+        acc_name = account.get('account_name') or f"ID {account_id}"
+
+        if bot:
+            await bot.send_message(user_id, f"🚪 [{acc_name}] Начинаю выход из {total} выбранных чатов...")
+
+        for idx, cid in enumerate(chat_ids, 1):
+            try:
+                chat_target = int(cid) if cid.startswith("-") or cid.isdigit() else cid
+                await client.leave_chat(chat_target)
+                db.remove_account_chat(account_id, cid)
+                left += 1
+            except Exception as e:
+                failed += 1
+                print(f"⚠️ Ошибка выхода из {cid}: {e}")
+
+            if idx % 10 == 0 and bot:
+                await bot.send_message(user_id, f"⏳ [{acc_name}] Вышел из {left}/{total} чатов...")
+
+            await asyncio.sleep(random.randint(2, 5))
+
+        if bot:
+            await bot.send_message(user_id, f"✅ [{acc_name}] Массовый выход завершён!\n🚪 Покинуто чатов: {left}\n❌ Ошибок: {failed}")
+
+    # ==================== PER-ACCOUNT SPAM ENGINE ====================
+    def is_account_spamming(self, account_id: int) -> bool:
+        task = self.active_spam_tasks.get(account_id)
+        return task is not None and not task.done()
+
+    async def start_account_spam(self, account_id: int, bot, user_id: int):
+        if self.is_account_spamming(account_id):
+            return True, "Рассылка уже запущена"
+        if not await self._acquire_user_quota(user_id):
+            return False, f"Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER}). Дождитесь завершения или отмените другие задачи."
+        if self._running_tasks >= self._max_concurrent_tasks:
+            await self._release_user_quota(user_id)
+            return False, f"Достигнут глобальный лимит одновременных задач ({self._max_concurrent_tasks}). Попробуйте позже."
+        db.set_account_spam_status(account_id, 1)
+        task_id = db.register_task(user_id, account_id, 'spam', 'starting')
+        self.active_spam_task_ids[account_id] = task_id
+        task = asyncio.create_task(self._run_limited(self._spam_worker(account_id, bot, user_id, task_id)))
+        self.active_spam_tasks[account_id] = task
+        return True, "Рассылка успешно запущена"
+
+    async def stop_account_spam(self, account_id: int, user_id: int = None):
+        # Note: quota is released in _spam_worker's finally block
+        db.set_account_spam_status(account_id, 0)
+        task = self.active_spam_tasks.pop(account_id, None)
+        task_id = self.active_spam_task_ids.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+        if task_id:
+            db.cancel_task(task_id)
+        return True
+
+    async def _spam_worker(self, account_id: int, bot, user_id: int, task_id: int = None):
+        account = db.get_account(account_id)
+        if not account:
+            return
+
+        acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+        notifications_hidden = account.get('notifications_hidden', 0) == 1
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            db.set_account_spam_status(account_id, 0)
+            if bot:
+                await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось запустить сессию: {err}")
+            return
+
+        cycle_count = 0
+        report_id = db.create_account_report(account_id, user_id, account.get('post_text', ''), account.get('post_photo', ''))
+        chats_added = set()
+        
+        if bot and not notifications_hidden:
+            await bot.send_message(user_id, f"🚀 [{acc_name}] Рассылка запущена!")
+
+        try:
+            while True:
+                # Re-check subscription & status
+                if not db.is_user_subscribed(user_id):
+                    db.set_account_spam_status(account_id, 0)
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Подписка истекла! Рассылка остановлена.")
+                    break
+
+                acc_data = db.get_account(account_id)
+                if not acc_data or acc_data.get('spam_status') != 1:
+                    break
+
+                post_text = acc_data.get('post_text', '')
+                post_photo = acc_data.get('post_photo', '')
+                post_entities_json = acc_data.get('post_entities')
+                post_parse_mode = acc_data.get('post_parse_mode', 'HTML')
+                timeout_minutes = max(1, acc_data.get('timeout', 5))
+
+                if not post_text:
+                    db.set_account_spam_status(account_id, 0)
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"❌ [{acc_name}] Текст поста не установлен! Настройте пост в меню.")
+                    break
+
+                # Get only enabled chats
+                spam_chats = db.get_account_chats(account_id, spam_only=True)
+                if not spam_chats:
+                    # Try syncing if empty
+                    spam_chats, _ = await self.fetch_and_sync_chats(account_id)
+                    spam_chats = [c for c in spam_chats if c.get('spam_enabled') == 1]
+
+                if not spam_chats:
+                    db.set_account_spam_status(account_id, 0)
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"❌ [{acc_name}] Нет выбранных чатов для рассылки!")
+                    break
+
+                cycle_count += 1
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"🔄 [{acc_name}] Цикл #{cycle_count} (Чатов: {len(spam_chats)})")
+
+                for idx, chat in enumerate(spam_chats, 1):
+                    # Check if stopped mid-cycle
+                    acc_chk = db.get_account(account_id)
+                    if not acc_chk or acc_chk.get('spam_status') != 1:
+                        return
+
+                    chat_id_val = int(chat['chat_id']) if (chat['chat_id'].startswith("-") or chat['chat_id'].isdigit()) else chat['chat_id']
+                    chat_title = chat.get('chat_title') or str(chat_id_val)
+                    addit = chat.get('additional_text') or ''
+                    
+                    full_text = f"{post_text}{addit}"
+
+                    # Stealth mention
+                    mention_msg = None
+                    try:
+                        me = await client.get_me()
+                        async for hist in client.get_chat_history(chat_id_val, limit=15):
+                            if hist.from_user and hist.from_user.id != me.id:
+                                mention_msg = hist
+                                break
+                    except Exception as e:
+                        pass
+
+                    entities = []
+                    if post_entities_json:
+                        converted = await convert_entities_to_pyrogram(post_entities_json, client)
+                        if converted:
+                            entities = converted
+                    
+                    # Spin text
+                    try:
+                        import re
+                        import random
+                        def spin(m):
+                            return random.choice(m.group(1).split('|'))
+                        post_text_before = post_text
+                        post_text = re.sub(r'\{([^}]+)\}', spin, post_text)
+                        spin_diff = len(post_text) - len(post_text_before)
+                        if spin_diff and entities:
+                            for ent in entities:
+                                ent.offset = max(0, ent.offset + spin_diff)
+                        full_text = f"{post_text}{addit}"
+                    except Exception as e:
+                        print(f"⚠️ Ошибка рандомизации текста: {e}")
+
+                    if mention_msg:
+                        try:
+                            hidden_mention = MessageEntity(
+                                type=enums.MessageEntityType.TEXT_MENTION,
+                                offset=0,
+                                length=1,
+                                user=mention_msg.from_user
+                            )
+                            full_text = "\u200b" + full_text
+                            for ent in entities:
+                                ent.offset += 1
+                            entities.insert(0, hidden_mention)
+                        except Exception as m_err:
+                            pass
+
+                    # Send post - только entities, без parse_mode
+                    try:
+                        if post_photo and os.path.exists(post_photo):
+                            await client.send_photo(
+                                chat_id_val,
+                                post_photo,
+                                caption=full_text,
+                                caption_entities=entities if entities else None
+                            )
+                        else:
+                            await client.send_message(
+                                chat_id_val,
+                                full_text,
+                                entities=entities if entities else None
+                            )
+                        print(f"✅ [{acc_name}] Отправлено в {chat_title}")
+                        if bot and not notifications_hidden:
+                            await bot.send_message(user_id, f"✅ [{acc_name}] Отправлено в {chat_title}")
+                        
+                        if chat_id_val not in chats_added:
+                            db.add_report_chat(report_id, str(chat_id_val), chat_title, sent=1)
+                            chats_added.add(chat_id_val)
+                        else:
+                            db.update_report_stats(report_id, sent_delta=1)
+                    except Exception as send_err:
+                        print(f"⚠️ [{acc_name}] Ошибка отправки в {chat_title}: {send_err}")
+                        if bot and not notifications_hidden:
+                            try:
+                                await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка в {chat_title}: {str(send_err)[:100]}")
+                            except:
+                                pass
+                        
+                        if chat_id_val not in chats_added:
+                            db.add_report_chat(report_id, str(chat_id_val), chat_title, error=str(send_err)[:100])
+                            chats_added.add(chat_id_val)
+                        else:
+                            db.update_report_stats(report_id, error_delta=1)
+
+                    delay = random.randint(120, 200)
+                    await asyncio.sleep(delay)
+
+                if bot:
+                    await bot.send_message(user_id, f"⏳ [{acc_name}] Цикл #{cycle_count} завершен. Пауза {timeout_minutes} мин...")
+                await asyncio.sleep(timeout_minutes * 60)
+
+        except asyncio.CancelledError:
+            print(f"🛑 Задача спама [{acc_name}] отменена")
+        except Exception as e:
+            print(f"❌ Критическая ошибка спама [{acc_name}]: {e}")
+            if bot:
+                try:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Ошибка рассылки: {e}")
+                except:
+                    pass
+        finally:
+            db.finish_report(report_id)
+            db.set_account_spam_status(account_id, 0)
+            if task_id:
+                db.finish_task(task_id, status='finished')
+            self.active_spam_task_ids.pop(account_id, None)
+            await self._release_user_quota(user_id)
+
+    async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int, limit: int = 10000, progress_callback=None):
+        account = db.get_account(account_id)
+        if not account:
+            return None, "Аккаунт не найден"
+
+        acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return None, f"Ошибка подключения: {err}"
+
+        users = []
+        seen_ids = set()
+        seen_usernames = set()
+        try:
+            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
+            
+            try:
+                chat = await client.get_chat(target)
+                chat_id_resolved = chat.id
+                logging.info(f"📥 [{acc_name}] parse_chat_users chat={chat_id_resolved} title={getattr(chat, 'title', chat_id)} limit={limit}")
+            except Exception as e:
+                logging.error(f"❌ [{acc_name}] parse_chat_users get_chat failed: {e}")
+                return None, f"Не удалось открыть чат: {e}"
+            
+            scanned = 0
+            skipped_bot = 0
+            skipped_self = 0
+            skipped_no_user = 0
+            skipped_no_username = 0
+            skipped_duplicate = 0
+            
+            fetch_limit = min(max(limit, 200), 10000)
+            offset = 0
+            batch = 100
+            
+            while len(users) < limit and offset < fetch_limit:
+                batch_size = min(batch, fetch_limit - offset)
+                logging.info(f"📥 [{acc_name}] parse_chat_users fetching batch offset={offset} batch={batch_size}")
+                async for msg in client.get_chat_history(chat_id_resolved, limit=batch_size, offset=offset):
+                    scanned += 1
+                    try:
+                        if not msg:
+                            skipped_no_user += 1
+                            continue
+                        
+                        username = None
+                        user_id_val = 0
+                        first_name = ''
+                        last_name = ''
+                        
+                        u = msg.from_user
+                        if u:
+                            if u.is_bot:
+                                skipped_bot += 1
+                                continue
+                            if getattr(u, 'is_self', False):
+                                skipped_self += 1
+                                continue
+                            user_id_val = u.id
+                            first_name = u.first_name or ''
+                            last_name = u.last_name or ''
+                            if u.username:
+                                username = u.username
+                        
+                        if not username:
+                            text = msg.text or msg.caption or ''
+                            if text:
+                                import re
+                                mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', text)
+                                if mentions:
+                                    username = mentions[0]
+                        
+                        if not username:
+                            skipped_no_username += 1
+                            continue
+                        
+                        username_lower = username.lower()
+                        if username_lower in seen_usernames:
+                            skipped_duplicate += 1
+                            continue
+                        if user_id_val and user_id_val in seen_ids:
+                            skipped_duplicate += 1
+                            continue
+                        
+                        seen_usernames.add(username_lower)
+                        if user_id_val:
+                            seen_ids.add(user_id_val)
+                        
+                        users.append({
+                            'id': user_id_val,
+                            'username': username,
+                            'first_name': first_name,
+                            'last_name': last_name,
+                            'phone': u.phone_number if u else ''
+                        })
+                        
+                        if progress_callback and len(users) % 20 == 0:
+                            try:
+                                await progress_callback(len(users))
+                            except:
+                                pass
+                    except Exception:
+                        continue
+                
+                if scanned >= fetch_limit:
+                    break
+                offset += batch_size
+                if offset >= fetch_limit:
+                    break
+            
+            logging.info(f"📊 [{acc_name}] parse_chat_users done: scanned={scanned} users={len(users)} skipped_bot={skipped_bot} skipped_self={skipped_self} skipped_no_user={skipped_no_user} skipped_no_username={skipped_no_username} skipped_duplicate={skipped_duplicate}")
+        except Exception as e:
+            logging.error(f"❌ [{acc_name}] parse_chat_users error: {e}")
+            return None, f"Ошибка парсинга: {e}"
+
+        if not users:
+            return [], "Нет пользователей в истории"
+
+        try:
+            db.clear_parsed_users(account_id, user_id)
+            db.save_parsed_users(account_id, user_id, users)
+        except Exception as save_err:
+            logging.error(f"❌ [{acc_name}] Failed to save parsed users: {save_err}")
+            return users, f"Найдено {len(users)} пользователей (ошибка сохранения: {save_err})"
+        
+        return users, f"Найдено {len(users)} пользователей"
+
+    async def parse_chat_users_background(self, account_id: int, chat_id: str, bot, user_id: int, progress_callback=None, limit: int = 10000):
+        task = asyncio.current_task()
+        self.active_parse_tasks[account_id] = task
+        try:
+            users, msg = await self.parse_chat_users(account_id, chat_id, bot, user_id, limit, progress_callback)
+            if users is None:
+                try:
+                    await bot.send_message(user_id, f"❌ Парсинг завершен с ошибкой: {msg}")
+                except:
+                    pass
+                return
+            try:
+                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Показать список", callback_data=f"parsed_users_page_{account_id}_0")],
+                    [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")],
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
+                ])
+                await bot.send_message(user_id, f"✅ Парсинг завершен! {msg}", reply_markup=markup)
+            except:
+                pass
+        except asyncio.CancelledError:
+            try:
+                await bot.send_message(user_id, "🛑 Парсинг отменен")
+            except:
+                pass
+        finally:
+            self.active_parse_tasks.pop(account_id, None)
+
+    def cancel_parse(self, account_id: int):
+        task = self.active_parse_tasks.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+            return True
+        return False
+
+    async def send_account_message(self, account_id: int, chat_id: str, text: str):
+        account = db.get_account(account_id)
+        if not account:
+            return False, "Аккаунт не найден"
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return False, f"Ошибка подключения: {err}"
+        try:
+            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
+            await client.send_message(target, text)
+            return True, "OK"
+        except Exception as e:
+            return False, str(e)
+
+    async def get_last_private_message(self, account_id: int, chat_id: str) -> str:
+        account = db.get_account(account_id)
+        if not account:
+            return ""
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return ""
+        try:
+            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
+            me = await client.get_me()
+            async for msg in client.get_chat_history(target, limit=20):
+                if (msg.text or msg.caption) and msg.from_user and msg.from_user.id != me.id:
+                    return msg.text or msg.caption
+            return ""
+        except Exception:
+            return ""
+
+    async def get_last_private_messages(self, account_id: int, chat_id: str, limit: int = 3) -> list:
+        account = db.get_account(account_id)
+        if not account:
+            print(f"DEBUG: Account {account_id} not found")
+            return []
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            print(f"DEBUG: Client not started for account {account_id}: {err}")
+            return []
+        
+        print(f"DEBUG: Fetching messages for account {account_id}, chat_id={chat_id}, limit={limit}")
+        
+        try:
+            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
+            print(f"DEBUG: Resolved target={target}, type={type(target)}")
+            
+            try:
+                chat = await client.get_chat(target)
+                print(f"DEBUG: Chat resolved: {chat.id}, type={chat.type}, title={chat.title}")
+            except Exception as chat_err:
+                print(f"DEBUG: Failed to resolve chat: {chat_err}")
+                return []
+            
+            messages = []
+            count = 0
+            me = await client.get_me()
+            async for msg in client.get_chat_history(chat.id, limit=50):
+                count += 1
+                text = msg.text or msg.caption or ''
+                if not text:
+                    text = '[медиа]'
+                messages.append({
+                    'text': text,
+                    'out': msg.from_user is not None and msg.from_user.id == me.id,
+                    'date': msg.date
+                })
+                print(f"DEBUG: Found message: out={msg.from_user is not None and msg.from_user.id == me.id}, text={text[:50]}")
+                if len(messages) >= limit:
+                    break
+            
+            print(f"DEBUG: Total messages scanned: {count}, returned: {len(messages)}")
+            return messages[:limit]
+        except Exception as e:
+            print(f"Error getting last private messages for {chat_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    async def get_private_chat_users(self, account_id: int, limit: int = 100):
+        account = db.get_account(account_id)
+        if not account:
+            return None, "Аккаунт не найден"
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return None, f"Ошибка подключения: {err}"
+        users = []
+        seen = set()
+        try:
+            async for dialog in client.get_dialogs(limit=limit):
+                if dialog.chat and dialog.chat.type == enums.ChatType.PRIVATE:
+                    if dialog.chat.id in seen:
+                        continue
+                    seen.add(dialog.chat.id)
+                    users.append({
+                        'id': dialog.chat.id,
+                        'username': dialog.chat.username or '',
+                        'first_name': dialog.chat.first_name or 'User',
+                        'last_name': dialog.chat.last_name or '',
+                        'phone': dialog.chat.phone_number or ''
+                    })
+        except Exception as e:
+            return None, f"Ошибка: {e}"
+        return users, f"Найдено {len(users)} пользователей"
+
+    async def invite_users(self, account_id: int, chat_id: str, users: list, bot, user_id: int, auto_join: bool = True):
+        logging.info(f"📥 invite_users START | account={account_id} chat={chat_id} users={len(users)} auto_join={auto_join} user_id={user_id}")
+        try:
+            account = db.get_account(account_id)
+            if not account:
+                logging.error(f"❌ Account {account_id} not found")
+                return
+            acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+            notifications_hidden = account.get('notifications_hidden', 0) == 1
+            logging.info(f"📥 [{acc_name}] Starting invite flow | chat={chat_id} users={len(users)} notifications_hidden={notifications_hidden}")
+            client, err = await self.get_or_start_client(account_id)
+            if not client:
+                logging.error(f"❌ [{acc_name}] Failed to start client: {err}")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось подключиться: {err}")
+                return
+            logging.info(f"✅ [{acc_name}] Client started")
+            chat_id_normalized = chat_id.strip()
+            if isinstance(chat_id_normalized, str):
+                if chat_id_normalized.startswith('@'):
+                    chat_id_normalized = chat_id_normalized[1:]
+                elif chat_id_normalized.lstrip('-').isdigit():
+                    chat_id_normalized = int(chat_id_normalized)
+                elif 't.me/' in chat_id_normalized:
+                    chat_id_normalized = chat_id_normalized.split('t.me/')[-1].strip('/')
+                    if chat_id_normalized.startswith('@'):
+                        chat_id_normalized = chat_id_normalized[1:]
+                    if chat_id_normalized.lstrip('-').isdigit():
+                        chat_id_normalized = int(chat_id_normalized)
+            logging.info(f"📥 [{acc_name}] chat_id_normalized={chat_id_normalized} (type={type(chat_id_normalized).__name__})")
+            try:
+                await self.sync_peer_cache(account_id, [chat_id_normalized])
+                logging.info(f"✅ [{acc_name}] Peer cache synced")
+            except Exception as e:
+                logging.warning(f"⚠️ [{acc_name}] sync_peer_cache failed: {type(e).__name__}: {e}")
+            chat_obj = None
+            try:
+                logging.info(f"🔍 [{acc_name}] Resolving chat: {chat_id_normalized}")
+                chat_obj = await asyncio.wait_for(
+                    client.get_chat(chat_id_normalized),
+                    timeout=5.0
+                )
+                logging.info(f"✅ [{acc_name}] Chat found: {chat_obj.title if hasattr(chat_obj, 'title') else chat_obj.id}")
+            except asyncio.TimeoutError:
+                logging.error(f"❌ [{acc_name}] Timeout getting chat {chat_id_normalized}")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Таймаут получения чата {chat_id_normalized}")
+                return
+            except Exception as e:
+                error_str = str(e).lower()
+                logging.error(f"❌ [{acc_name}] Error getting chat {chat_id_normalized}: {type(e).__name__}: {e}")
+                if any(keyword in error_str for keyword in ['not found', 'invalid', 'forbidden', 'access', 'private']):
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось открыть чат {chat_id_normalized}: {str(e)[:100]}")
+                    return
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка доступа к чату: {str(e)[:100]}")
+                return
+            if not chat_obj:
+                logging.error(f"❌ [{acc_name}] Chat object is None")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Чат {chat_id_normalized} не найден")
+                return
+            if auto_join:
+                try:
+                    logging.info(f"🔍 [{acc_name}] Checking membership in chat {chat_obj.id}")
+                    member = await asyncio.wait_for(
+                        client.get_chat_member(chat_obj.id, "me"),
+                        timeout=5.0
+                    )
+                    logging.info(f"📊 [{acc_name}] Membership status: {getattr(member, 'status', 'unknown')}")
+                    if getattr(member, 'status', '') in ['left', 'banned', 'restricted']:
+                        logging.info(f"🔗 [{acc_name}] Joining chat {chat_obj.id}")
+                        try:
+                            await asyncio.wait_for(
+                                client.join_chat(chat_obj.id),
+                                timeout=10.0
+                            )
+                            await asyncio.sleep(2)
+                            logging.info(f"✅ [{acc_name}] Joined chat successfully")
+                        except asyncio.TimeoutError:
+                            logging.warning(f"⚠️ [{acc_name}] Timeout joining chat")
+                            if bot and not notifications_hidden:
+                                await bot.send_message(user_id, f"⚠️ [{acc_name}] Таймаут вступления в чат")
+                        except Exception as join_err:
+                            logging.warning(f"⚠️ [{acc_name}] Failed to join chat: {type(join_err).__name__}: {join_err}")
+                            if bot and not notifications_hidden:
+                                await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось войти в чат: {str(join_err)[:100]}")
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ [{acc_name}] Timeout checking membership")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Таймаут проверки членства в чате")
+                except Exception as chat_err:
+                    logging.warning(f"⚠️ [{acc_name}] Failed to check membership: {type(chat_err).__name__}: {chat_err}")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось проверить членство в чате: {str(chat_err)[:100]}")
+            normalized = []
+            seen = set()
+            for user_entry in users:
+                try:
+                    peer = None
+                    if isinstance(user_entry, str):
+                        user_entry = user_entry.strip()
+                        if user_entry.startswith('@'):
+                            user_entry = user_entry[1:]
+                        if user_entry.lstrip('-').isdigit():
+                            peer = int(user_entry)
+                        else:
+                            peer = user_entry
+                    elif isinstance(user_entry, int):
+                        peer = user_entry
+                    if not peer or peer in seen:
+                        continue
+                    seen.add(peer)
+                    normalized.append(peer)
+                except Exception:
+                    continue
+            logging.info(f"📥 [{acc_name}] Normalized {len(normalized)} users from {len(users)} raw entries")
+            if not normalized:
+                logging.warning(f"⚠️ [{acc_name}] No valid users for invite")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет валидных пользователей для инвайта")
+                return
+            if bot and not notifications_hidden:
+                await bot.send_message(user_id, f"📥 [{acc_name}] Добавляю {len(normalized)} контактов...")
+            contacts = []
+            for peer in normalized:
+                try:
+                    logging.debug(f"📥 [{acc_name}] Resolving peer: {peer}")
+                    user = await asyncio.wait_for(
+                        client.get_users(peer),
+                        timeout=3.0
+                    )
+                    if hasattr(user, 'id'):
+                        user_id_val = user.id
+                        first_name = user.first_name or "User"
+                        last_name = user.last_name or ""
+                    elif isinstance(user, list) and user:
+                        user_id_val = user[0].id
+                        first_name = user[0].first_name or "User"
+                        last_name = user[0].last_name or ""
+                    else:
+                        logging.warning(f"⚠️ [{acc_name}] Unexpected user format for {peer}: {type(user)}")
+                        continue
+                    contacts.append((user_id_val, first_name, last_name))
+                    logging.debug(f"✅ [{acc_name}] Resolved {peer} -> id={user_id_val} name={first_name} {last_name}")
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ [{acc_name}] Timeout getting user {peer}")
+                    continue
+                except Exception as e:
+                    logging.warning(f"⚠️ [{acc_name}] Error getting user {peer}: {type(e).__name__}: {e}")
+                    continue
+            logging.info(f"📥 [{acc_name}] Got {len(contacts)} contacts from {len(normalized)} normalized peers")
+            added_contacts = []
+            for user_id_val, first_name, last_name in contacts:
+                try:
+                    logging.debug(f"📥 [{acc_name}] Adding contact: {user_id_val} ({first_name} {last_name})")
+                    await asyncio.wait_for(
+                        client.add_contact(user_id_val, first_name, last_name),
+                        timeout=3.0
+                    )
+                    added_contacts.append(user_id_val)
+                    logging.debug(f"✅ [{acc_name}] Added contact {user_id_val}")
+                    await asyncio.sleep(random.randint(1, 3))
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ [{acc_name}] Timeout adding contact {user_id_val}")
+                    continue
+                except Exception as e:
+                    logging.warning(f"⚠️ [{acc_name}] Error adding contact {user_id_val}: {type(e).__name__}: {e}")
+                    continue
+            logging.info(f"📥 [{acc_name}] Added {len(added_contacts)} contacts, starting invite")
+            if bot and not notifications_hidden:
+                await bot.send_message(user_id, f"📥 [{acc_name}] Добавлено контактов: {len(added_contacts)}. Начинаю инвайт...")
+            success = 0
+            errors = 0
+            try:
+                logging.debug(f"🔍 [{acc_name}] Pre-invite chat check: {chat_obj.id}")
+                chat_check = await asyncio.wait_for(
+                    client.get_chat(chat_obj.id),
+                    timeout=5.0
+                )
+                if not chat_check:
+                    logging.error(f"❌ [{acc_name}] Chat {chat_id_normalized} unavailable after check")
+                    if bot and not notifications_hidden:
+                        await bot.send_message(user_id, f"❌ [{acc_name}] Чат {chat_id_normalized} недоступен после проверки")
+                    return
+            except Exception as e:
+                logging.error(f"❌ [{acc_name}] Chat check failed: {type(e).__name__}: {e}")
+                if bot and not notifications_hidden:
+                    await bot.send_message(user_id, f"❌ [{acc_name}] Чат {chat_id_normalized} недоступен: {str(e)[:100]}")
+                return
+            logging.info(f"📥 [{acc_name}] Starting invite loop: {len(added_contacts)} contacts")
+            for user_id_val in added_contacts:
+                try:
+                    logging.info(f"📥 [{acc_name}] Inviting user {user_id_val} ({success+1}/{len(added_contacts)})")
+                    await asyncio.wait_for(
+                        client.add_chat_members(chat_id=chat_obj.id, user_ids=[user_id_val]),
+                        timeout=5.0
+                    )
+                    success += 1
+                    logging.info(f"✅ [{acc_name}] Invited user {user_id_val} ({success}/{len(added_contacts)})")
+                except asyncio.TimeoutError:
+                    errors += 1
+                    logging.warning(f"⚠️ [{acc_name}] Timeout adding {user_id_val}")
+                    if bot and not notifications_hidden:
+                        try:
+                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Таймаут добавления {user_id_val}")
+                        except:
+                            pass
+                except Exception as e:
+                    errors += 1
+                    error_str = str(e).lower()
+                    logging.error(f"❌ [{acc_name}] Error adding {user_id_val}: {type(e).__name__}: {e}")
+                    if any(kw in error_str for kw in ['flood', 'too many', 'wait', 'spam', 'restricted', 'banned']):
+                        logging.warning(f"🛑 [{acc_name}] Critical flood error, stopping invite")
+                        if bot and not notifications_hidden:
+                            await bot.send_message(user_id, f"🛑 [{acc_name}] Остановлен инвайт из-за ошибки: {str(e)[:100]}")
+                        break
+                    if bot and not notifications_hidden:
+                        try:
+                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось добавить {user_id_val}: {str(e)[:60]}")
+                        except:
+                            pass
+                await asyncio.sleep(random.randint(5, 10))
+            logging.info(f"📥 [{acc_name}] Invite loop complete: success={success} errors={errors}")
+            for user_id_val in added_contacts:
+                try:
+                    logging.debug(f"🗑 [{acc_name}] Deleting contact {user_id_val}")
+                    await asyncio.wait_for(
+                        client.delete_contacts(user_id_val),
+                        timeout=3.0
+                    )
+                    logging.debug(f"✅ [{acc_name}] Deleted contact {user_id_val}")
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ [{acc_name}] Timeout deleting contact {user_id_val}")
+                except Exception as e:
+                    logging.warning(f"⚠️ [{acc_name}] Error deleting contact {user_id_val}: {type(e).__name__}: {e}")
+                await asyncio.sleep(random.randint(1, 2))
+            msg = f"✅ [{acc_name}] Инвайт завершен: +{success} | ошибок {errors} | контактов удалено {len(added_contacts)}"
+            logging.info(msg)
+            if bot:
+                await bot.send_message(user_id, msg)
+            logging.info(f"📥 invite_users END | account={account_id} success={success} errors={errors}")
+        except Exception as e:
+            logging.error(f"❌ invite_users unhandled exception for account {account_id}: {type(e).__name__}: {e}", exc_info=True)
+
+    async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int, mode: str = 'post', custom_text: str = '', custom_entities: str = None):
+        account = db.get_account(account_id)
+        if not account:
+            return
+        
+        acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+        notifications_hidden = account.get('notifications_hidden', 0) == 1
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            if bot:
+                await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось подключиться: {err}")
+            return
+        
+        post_text = account.get('post_text', '') if mode == 'post' else custom_text
+        post_photo = account.get('post_photo', '') if mode == 'post' else ''
+        
+        if not post_text:
+            if bot:
+                await bot.send_message(user_id, f"❌ [{acc_name}] Текст поста не установлен!")
+            return
+        
+        entities = None
+        entities_json = None
+        if mode == 'post':
+            entities_json = account.get('post_entities')
+        else:
+            entities_json = custom_entities
+        if entities_json:
+            try:
+                converted = await convert_entities_to_pyrogram(entities_json, client)
+                if converted:
+                    entities = converted
+            except Exception as e:
+                logging.error(f"❌ [{acc_name}] Failed to convert entities: {e}")
+        
+        success = 0
+        errors = 0
+        
+        for target in targets:
+            try:
+                if isinstance(target, int):
+                    peer = target
+                elif isinstance(target, str):
+                    if target.startswith('@'):
+                        peer = target
+                    else:
+                        peer = f"@{target}"
+                else:
+                    continue
+                
+                text_to_send = post_text
+                if mode == 'custom' and '{rand}' in post_text:
+                    import string
+                    def rand_str(length=6):
+                        return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+                    text_to_send = post_text.replace('{rand}', rand_str())
+                
+                if post_photo and os.path.exists(post_photo) and mode == 'post':
+                    await client.send_photo(
+                        peer, 
+                        post_photo, 
+                        caption=text_to_send,
+                        caption_entities=entities if entities else None,
+                        parse_mode=None if entities else None
+                    )
+                else:
+                    await client.send_message(
+                        peer, 
+                        text_to_send,
+                        entities=entities if entities else None,
+                        parse_mode=None if entities else None
+                    )
+                success += 1
+                if bot and not notifications_hidden:
+                    try:
+                        await bot.send_message(user_id, f"✅ [{acc_name}] Отправлено: {peer}")
+                    except:
+                        pass
+            except Exception as e:
+                errors += 1
+                if bot and not notifications_hidden:
+                    try:
+                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка {peer}: {str(e)[:80]}")
+                    except:
+                        pass
+            await asyncio.sleep(random.randint(5, 15))
+        
+        if bot:
+            await bot.send_message(user_id, f"✅ [{acc_name}] Рассылка завершена: {success} отправлено, {errors} ошибок")
