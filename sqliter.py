@@ -842,6 +842,10 @@ class DBConnection(metaclass=_PoolBoundMeta):
         except sqlite3.OperationalError:
             pass
         for _ddl in (
+            # access_hash позволяет обращаться к каналу без get_chat:
+            # массовые get_chat при поиске каналов вызывали FloodWait
+            "ALTER TABLE account_chats ADD COLUMN access_hash TEXT DEFAULT ''",
+            "ALTER TABLE account_chats ADD COLUMN linked_chat_id TEXT DEFAULT ''",
             "ALTER TABLE accounts ADD COLUMN health TEXT DEFAULT 'ok'",
             "ALTER TABLE accounts ADD COLUMN health_reason TEXT DEFAULT ''",
             "ALTER TABLE accounts ADD COLUMN restricted_until INTEGER DEFAULT 0",
@@ -1211,7 +1215,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
 
     # ==================== ACCOUNT CHATS (Selective Spam & Settings) ====================
     UPSERT_CHAT_SQL = (
-        "INSERT INTO account_chats\n    (account_id, chat_id, chat_title, chat_username, chat_type,\n     spam_enabled, additional_text, timeout, synced_at)\nVALUES (?, ?, ?, ?, ?, 1, '', 5, ?)\nON CONFLICT(account_id, chat_id) DO UPDATE SET\n    chat_title = excluded.chat_title,\n    chat_username = excluded.chat_username,\n    chat_type = excluded.chat_type,\n    synced_at = excluded.synced_at"
+        "INSERT INTO account_chats\n    (account_id, chat_id, chat_title, chat_username, chat_type,\n     spam_enabled, additional_text, timeout, synced_at, access_hash)\nVALUES (?, ?, ?, ?, ?, 1, '', 5, ?, ?)\nON CONFLICT(account_id, chat_id) DO UPDATE SET\n    chat_title = excluded.chat_title,\n    chat_username = excluded.chat_username,\n    chat_type = excluded.chat_type,\n    synced_at = excluded.synced_at,\n    access_hash = CASE WHEN excluded.access_hash != '' THEN excluded.access_hash\n                       ELSE account_chats.access_hash END"
     )
 
     def sync_account_chats(self, account_id: int, chat_list: List[Dict[str, Any]]):
@@ -1232,6 +1236,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
                 ch.get('username', ''),
                 ch.get('chat_type', 'unknown'),
                 now - idx,
+                str(ch.get('access_hash') or ''),
             ))
         try:
             with self.transaction() as pooled:

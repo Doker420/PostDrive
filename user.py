@@ -89,6 +89,65 @@ config.read(config_path)
 # Максимальное ожидание FloodWait, которое имеет смысл пересидеть внутри задачи.
 MAX_FLOOD_WAIT = int(config.get('LIMITS', 'MAX_FLOOD_WAIT', fallback='1800'))
 
+# ── Патч диапазонов ID каналов в Pyrogram ────────────────────────
+# Pyrogram 2.0.106 считает валидными ID каналов только до -1002147483647
+# (32-битный предел). Telegram давно выдаёт ID вплоть до -1997852516352
+# (https://core.telegram.org/api/bots/ids), поэтому все новые супергруппы
+# и каналы (-1002.../-1003.../-1004...) падали с ValueError: Peer id invalid.
+# Из-за этого чат не резолвился, и рассылка/нейрокомментинг его пропускали.
+def _patch_pyrogram_peer_ranges():
+    from pyrogram import utils as _pu
+
+    # Официальные границы Bot API dialog ID
+    _MIN_CHANNEL_ID = -1997852516352
+    _MIN_CHAT_ID = -999999999999
+    _MAX_USER_ID = 0xFFFFFFFFFF   # 2^40 - 1
+
+    if getattr(_pu, '_postdrive_patched', False):
+        return
+
+    _pu.MIN_CHANNEL_ID = _MIN_CHANNEL_ID
+    _pu.MIN_CHAT_ID = _MIN_CHAT_ID
+    _pu.MAX_USER_ID = _MAX_USER_ID
+
+    def get_peer_type(peer_id: int) -> str:
+        if peer_id < 0:
+            if _MIN_CHAT_ID <= peer_id:
+                return "chat"
+            if _MIN_CHANNEL_ID <= peer_id < _pu.MAX_CHANNEL_ID:
+                return "channel"
+        elif 0 < peer_id <= _MAX_USER_ID:
+            return "user"
+        raise ValueError(f"Peer id invalid: {peer_id}")
+
+    _pu.get_peer_type = get_peer_type
+
+    # Те же функции импортированы по значению в другие модули Pyrogram —
+    # подменяем и там, иначе патч не подействует.
+    import sys
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith('pyrogram') or mod is None:
+            continue
+        if getattr(mod, 'get_peer_type', None) is not None:
+            try:
+                mod.get_peer_type = get_peer_type
+            except Exception:
+                pass
+        for const, val in (('MIN_CHANNEL_ID', _MIN_CHANNEL_ID),
+                           ('MIN_CHAT_ID', _MIN_CHAT_ID),
+                           ('MAX_USER_ID', _MAX_USER_ID)):
+            if getattr(mod, const, None) is not None:
+                try:
+                    setattr(mod, const, val)
+                except Exception:
+                    pass
+
+    _pu._postdrive_patched = True
+    logging.info("🔧 Pyrogram: диапазоны ID каналов расширены до -1997852516352")
+
+
+_patch_pyrogram_peer_ranges()
+
 _original_handle_updates = Client.handle_updates
 
 async def _safe_handle_updates(self, updates):
@@ -1358,6 +1417,19 @@ class AccountSessionManager:
             except (AccountBlockedError, TargetSkipError):
                 raise
 
+            except (ValueError, KeyError) as e:
+                # «Peer id invalid» / «ID not found»: чат не в локальном кэше
+                # пиров — обычная ситуация, а не сбой. Уровень INFO, чтобы
+                # не заливать лог ошибками при обходе сотен чатов.
+                txt = str(e)
+                if 'Peer id invalid' in txt or 'ID not found' in txt:
+                    logging.info(f"⏭ [acc {account_id}] {label}: пир неизвестен — пропуск")
+                    if raise_on_skip:
+                        raise TargetSkipError(txt) from e
+                    return None
+                logging.error(f"❌ [acc {account_id}] {label}: {type(e).__name__}: {txt[:200]}")
+                raise
+
             except Exception as e:
                 last_err = e
                 # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
@@ -2138,7 +2210,13 @@ class AccountSessionManager:
         return True, discussion_id, "OK"
 
     async def list_commentable_channels(self, account_id: int, refresh: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-        """Каналы аккаунта, у которых открыты комментарии (есть привязанный чат обсуждений)."""
+        """Каналы аккаунта, у которых открыты комментарии.
+
+        Раньше на каждый канал делался get_chat — при сотне каналов это сотня
+        запросов, Telegram отвечал FloodWait, и поиск растягивался на минуты.
+        Теперь каналы запрашиваются пачками по 100 через raw channels.GetChannels
+        (1 запрос вместо 100), а признак обсуждений берётся из флага has_link.
+        """
         client, err = await self.get_or_start_client(account_id)
         if not client:
             return [], f"Ошибка подключения: {err}"
@@ -2147,53 +2225,87 @@ class AccountSessionManager:
             await self.fetch_and_sync_chats(account_id)
 
         channels = db.get_account_chats(account_id, chat_types=('channel',))
-        result = []
+        if not channels:
+            return [], None
 
-        # Проверяем каналы небольшими пачками: последовательный обход при
-        # сотне каналов занимал минуты. Параллелизм намеренно низкий —
-        # Telegram отдаёт FloodWait за частые get_chat.
-        sem = asyncio.Semaphore(4)
+        from pyrogram.raw import functions as raw_functions
+        from pyrogram.raw import types as raw_types
 
-        async def _check(ch):
+        # 1. Собираем InputChannel из сохранённых access_hash — без сетевых вызовов
+        wanted = {}
+        need_resolve = []
+        for ch in channels:
             cid = ch['chat_id']
-            async with sem:
+            if not cid.lstrip('-').isdigit():
+                continue
+            raw_id = utils.get_channel_id(int(cid)) if int(cid) < 0 else int(cid)
+            ah = (ch.get('access_hash') or '').strip()
+            wanted[cid] = ch
+            if ah:
                 try:
-                    chat_ref = int(cid) if cid.lstrip('-').isdigit() else cid
-                    chat_obj = await self.tg_call(
-                        lambda: client.get_chat(chat_ref),
-                        account_id=account_id,
-                        description=f"get_chat {cid}",
-                        notify=False, max_retries=2
-                    )
-                    if chat_obj is None:
-                        return None
-                    discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
-                    if discussion_id:
-                        return {
-                            'chat_id': cid,
-                            'title': ch.get('chat_title') or cid,
-                            'username': ch.get('chat_username') or '',
-                            'discussion_id': discussion_id
-                        }
-                except AccountBlockedError:
-                    raise
-                except Exception as e:
-                    logging.debug(f"list_commentable_channels skip {cid}: {e}")
-                await asyncio.sleep(0.1)   # мягкий rate-limit
-                return None
+                    need_resolve.append((cid, raw_types.InputChannel(
+                        channel_id=abs(int(raw_id)), access_hash=int(ah))))
+                    continue
+                except (ValueError, TypeError):
+                    pass
+            need_resolve.append((cid, None))
+
+        result = []
+        CHUNK = 100
+
+        async def _fetch_chunk(pairs):
+            """Один GetChannels на пачку каналов."""
+            inputs, ids = [], []
+            for cid, inp in pairs:
+                if inp is None:
+                    # access_hash нет — пробуем через resolve_peer (из локального кэша)
+                    try:
+                        inp = await client.resolve_peer(int(cid))
+                    except Exception as e:
+                        logging.debug(f"resolve_peer {cid}: {type(e).__name__}: {e}")
+                        continue
+                inputs.append(inp)
+                ids.append(cid)
+            if not inputs:
+                return []
+            try:
+                res = await self.tg_call(
+                    lambda: client.invoke(raw_functions.channels.GetChannels(id=inputs)),
+                    account_id=account_id,
+                    description=f"GetChannels x{len(inputs)}",
+                    notify=False, max_retries=2
+                )
+            except AccountBlockedError:
+                raise
+            except Exception as e:
+                logging.warning(f"GetChannels chunk failed: {type(e).__name__}: {e}")
+                return []
+            return list(getattr(res, 'chats', []) or []) if res else []
 
         try:
-            found = await asyncio.gather(*(_check(ch) for ch in channels),
-                                         return_exceptions=True)
+            for i in range(0, len(need_resolve), CHUNK):
+                chunk = need_resolve[i:i + CHUNK]
+                for ch_obj in await _fetch_chunk(chunk):
+                    if not getattr(ch_obj, 'broadcast', False):
+                        continue          # супергруппы тут не нужны
+                    # has_link = к каналу привязан чат обсуждений
+                    if not getattr(ch_obj, 'has_link', False):
+                        continue
+                    cid = str(utils.get_channel_id(ch_obj.id))
+                    meta = wanted.get(cid) or {}
+                    result.append({
+                        'chat_id': cid,
+                        'title': getattr(ch_obj, 'title', None) or meta.get('chat_title') or cid,
+                        'username': getattr(ch_obj, 'username', None) or meta.get('chat_username') or '',
+                        # реальный id обсуждения выясняем лениво, при вступлении
+                        'discussion_id': None,
+                    })
+                await asyncio.sleep(0.3)   # мягкая пауза между пачками
         except AccountBlockedError as e:
             return [], str(e)
 
-        for item in found:
-            if isinstance(item, AccountBlockedError):
-                return [], str(item)
-            if isinstance(item, dict):
-                result.append(item)
         result.sort(key=lambda c: (c['title'] or '').lower())
+        logging.info(f"[acc {account_id}] каналов с комментариями: {len(result)} из {len(channels)}")
         return result, None
 
     # ==================== CHAT LIST & SYNC ====================
@@ -2250,7 +2362,11 @@ class AccountSessionManager:
                             'id': full_id,
                             'title': title,
                             'username': username,
-                            'chat_type': 'group' if is_group else 'channel'
+                            'chat_type': 'group' if is_group else 'channel',
+                            # access_hash — чтобы потом не дёргать get_chat на каждый канал
+                            'access_hash': getattr(ch, 'access_hash', '') or '',
+                            # has_link = у канала есть привязанный чат обсуждений
+                            'has_link': bool(getattr(ch, 'has_link', False)),
                         }
                     elif isinstance(ch, Chat):
                         full_id = str(-ch.id)
@@ -2332,7 +2448,9 @@ class AccountSessionManager:
                             title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
                             username = getattr(ch, 'username', None) or ""
                             is_group = bool(getattr(ch, 'megagroup', False) or getattr(ch, 'gigagroup', False))
-                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'group' if is_group else 'channel'}
+                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username,
+                                                  'chat_type': 'group' if is_group else 'channel',
+                                                  'access_hash': getattr(ch, 'access_hash', '') or ''}
                         elif isinstance(ch, Chat):
                             full_id = str(-ch.id)
                             title = ch.title or f"Группа {ch.id}"

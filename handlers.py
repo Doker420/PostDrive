@@ -3003,16 +3003,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         try:
             await callback.answer("⏳ Начинаю поиск...")
             total_channels = db.count_account_chats(account_id, chat_types=('channel',))
-            # ~0.2с на канал: проверка идёт пачками по 4 канала
-            eta = max(10, int(total_channels * 0.2))
+            # Каналы запрашиваются пачками по 100 (1 запрос на пачку)
+            eta = max(5, int((total_channels / 100 + 1) * 3))
             try:
                 await edit_message(
                     callback,
                     "🔍 <b>Ищу каналы с открытыми комментариями</b>\n\n"
                     f"Каналов для проверки: <b>{total_channels or '?'}</b>\n"
-                    f"Примерное время: <b>~{eta // 60} мин {eta % 60} сек</b>\n\n"
-                    "⚠️ <b>Не нажимайте кнопки</b> — Telegram ограничивает частоту\n"
-                    "запросов, поэтому каждый канал проверяется отдельно.\n\n"
+                    f"Примерное время: <b>~{eta} сек</b>\n\n"
+                    "⚠️ <b>Не нажимайте кнопки</b> до появления списка.\n\n"
                     "<i>Список появится автоматически.</i>",
                     reply_markup=None
                 )

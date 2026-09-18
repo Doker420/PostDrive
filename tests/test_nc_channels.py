@@ -42,8 +42,11 @@ results.append("потеря FSM-кэша обработана: OK")
 U = open(os.path.join(os.path.dirname(__file__), '..', 'user.py')).read()
 block = U[U.index('async def list_commentable_channels'):]
 block = block[:block.index('# ==================== CHAT LIST')]
-assert 'Semaphore' in block and 'gather' in block, "поиск каналов не распараллелен"
-results.append("поиск каналов идёт пачками (Semaphore + gather): OK")
+# Пакетный GetChannels (1 запрос на 100 каналов) вместо поштучных get_chat,
+# которые вызывали FloodWait
+assert 'GetChannels' in block, "поиск каналов не пакетный"
+assert 'client.get_chat(' not in block, "остались поштучные get_chat"
+results.append("поиск каналов пакетный (GetChannels), без get_chat: OK")
 
 # 7. Файл компилируется
 import ast
