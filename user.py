@@ -13,11 +13,81 @@ from pyrogram import Client, enums, filters
 from pyrogram import utils
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import MessageEntity
+
+# ── Telegram error taxonomy ───────────────────────────────────────
+# Имена классов различаются между версиями Pyrogram, поэтому импортируем
+# устойчиво: отсутствующие классы заменяются на заглушку, которая никогда
+# не поймается (важно, чтобы бот не падал на ImportError при обновлении).
+class _NeverRaised(Exception):
+    """Заглушка для отсутствующих в данной версии Pyrogram классов ошибок."""
+
+
+def _err(name: str):
+    try:
+        import pyrogram.errors as _pe
+        return getattr(_pe, name, _NeverRaised)
+    except Exception:
+        return _NeverRaised
+
+
+FloodWait = _err('FloodWait')
+SlowmodeWait = _err('SlowmodeWait')
+FloodPremiumWait = _err('FloodPremiumWait')
+PeerFlood = _err('PeerFlood')
+UserDeactivated = _err('UserDeactivated')
+UserDeactivatedBan = _err('UserDeactivatedBan')
+AuthKeyUnregistered = _err('AuthKeyUnregistered')
+AuthKeyDuplicated = _err('AuthKeyDuplicated')
+SessionRevoked = _err('SessionRevoked')
+SessionExpired = _err('SessionExpired')
+UserBannedInChannel = _err('UserBannedInChannel')
+ChatWriteForbidden = _err('ChatWriteForbidden')
+ChatAdminRequired = _err('ChatAdminRequired')
+UserBlocked = _err('UserBlocked')
+UserIsBlocked = _err('UserIsBlocked')
+ChannelPrivate = _err('ChannelPrivate')
+UsernameNotOccupied = _err('UsernameNotOccupied')
+InviteHashExpired = _err('InviteHashExpired')
+UserAlreadyParticipant = _err('UserAlreadyParticipant')
+UserPrivacyRestricted = _err('UserPrivacyRestricted')
+
+# Ждём и повторяем
+FLOOD_ERRORS = tuple({FloodWait, SlowmodeWait, FloodPremiumWait} - {_NeverRaised})
+# Аккаунт под спам-блоком: останавливаем задачи, но сессия жива
+SPAMBLOCK_ERRORS = tuple({PeerFlood, UserBannedInChannel} - {_NeverRaised})
+# Сессия мертва: нужен повторный вход
+DEAD_SESSION_ERRORS = tuple({
+    UserDeactivated, UserDeactivatedBan, AuthKeyUnregistered,
+    AuthKeyDuplicated, SessionRevoked, SessionExpired,
+} - {_NeverRaised})
+# Проблема конкретного чата, а не аккаунта: пропускаем цель, задачу продолжаем
+SKIP_TARGET_ERRORS = tuple({
+    ChatWriteForbidden, ChatAdminRequired, ChannelPrivate, UsernameNotOccupied,
+    InviteHashExpired, UserPrivacyRestricted, UserBlocked, UserIsBlocked,
+} - {_NeverRaised})
+
+
+class AccountBlockedError(Exception):
+    """Аккаунт нельзя использовать дальше (спам-блок или мёртвая сессия)."""
+
+    def __init__(self, message: str, kind: str = 'restricted'):
+        super().__init__(message)
+        self.kind = kind          # 'restricted' | 'banned'
+
+
+class TargetSkipError(Exception):
+    """Цель (чат/пользователь) недоступна — пропускаем её, задача продолжается."""
+
+
+
 from sqliter import DBConnection, get_db_sync
 
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 config.read(config_path)
+
+# Максимальное ожидание FloodWait, которое имеет смысл пересидеть внутри задачи.
+MAX_FLOOD_WAIT = int(config.get('LIMITS', 'MAX_FLOOD_WAIT', fallback='1800'))
 
 _original_handle_updates = Client.handle_updates
 
@@ -1166,6 +1236,144 @@ class AccountSessionManager:
         result = result.replace('**', '').replace('__', '')
         return result.strip()
 
+    # ==================== TELEGRAM CALL GUARD (FloodWait & bans) ====================
+    async def tg_call(self, factory, *, account_id: int = None, bot=None, user_id: int = None,
+                      description: str = '', max_retries: int = 3,
+                      notify: bool = True, raise_on_skip: bool = False):
+        """Выполняет вызов Telegram API с обработкой FloodWait и банов.
+
+        factory — функция без аргументов, возвращающая корутину. Именно функция,
+        а не готовая корутина: при повторе нужно создать вызов заново
+        (корутину нельзя переиспользовать после await).
+
+        Поведение:
+          • FloodWait/SlowmodeWait  — ждём указанное время (+джиттер) и повторяем;
+            если ждать дольше MAX_FLOOD_WAIT — ставим аккаунт на паузу и прерываем задачу;
+          • PeerFlood / бан в канале — AccountBlockedError(kind='restricted'), задача встаёт;
+          • мёртвая сессия          — AccountBlockedError(kind='banned');
+          • проблема конкретного чата — TargetSkipError (или None, если raise_on_skip=False).
+
+        Возвращает результат вызова либо None, если цель пропущена.
+        """
+        label = description or 'telegram call'
+        last_err = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = await factory()
+                # Успешный вызов после флуда — снимаем пометку кулдауна
+                if account_id and attempt > 1:
+                    try:
+                        db.clear_account_health(account_id)
+                    except Exception:
+                        pass
+                return result
+
+            except asyncio.CancelledError:
+                raise
+
+            except FLOOD_ERRORS as e:
+                wait = int(getattr(e, 'value', None) or getattr(e, 'x', None) or 60)
+                last_err = e
+                if account_id:
+                    try:
+                        db.record_flood_wait(account_id, wait)
+                    except Exception:
+                        pass
+
+                if wait > MAX_FLOOD_WAIT:
+                    msg = (f"FloodWait {wait} сек. ({wait // 60} мин.) — это дольше лимита "
+                           f"{MAX_FLOOD_WAIT} сек., задача остановлена.")
+                    logging.error(f"🛑 [acc {account_id}] {label}: {msg}")
+                    if notify and bot and user_id:
+                        await self._safe_bot_message(
+                            bot, user_id,
+                            f"🛑 Аккаунт #{account_id} получил длительное ограничение Telegram "
+                            f"({wait // 60} мин.).\n\nЗадача остановлена. Дайте аккаунту отдохнуть "
+                            f"и увеличьте интервалы между сообщениями."
+                        )
+                    raise AccountBlockedError(msg, kind='restricted')
+
+                sleep_for = wait + random.uniform(1.0, 3.0)
+                logging.warning(
+                    f"⏳ [acc {account_id}] {label}: FloodWait {wait}s "
+                    f"(попытка {attempt}/{max_retries}), жду {sleep_for:.0f}s"
+                )
+                if notify and bot and user_id and wait >= 60:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"⏳ Telegram просит подождать {wait} сек. (аккаунт #{account_id}). "
+                        f"Задача продолжится автоматически."
+                    )
+                await asyncio.sleep(sleep_for)
+                continue
+
+            except SPAMBLOCK_ERRORS as e:
+                msg = f"{type(e).__name__}: аккаунт ограничен Telegram за спам"
+                logging.error(f"🚫 [acc {account_id}] {label}: {msg}")
+                if account_id:
+                    try:
+                        db.set_account_health(account_id, db.HEALTH_RESTRICTED, msg)
+                    except Exception:
+                        pass
+                if notify and bot and user_id:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"🚫 <b>Аккаунт #{account_id} получил спам-блок Telegram.</b>\n\n"
+                        f"Все задачи по нему остановлены, чтобы не усугубить ограничение.\n\n"
+                        f"Что делать:\n"
+                        f"• не запускайте рассылки на этом аккаунте 24–48 часов;\n"
+                        f"• напишите @SpamBot и запросите снятие ограничения;\n"
+                        f"• увеличьте задержки и используйте разный текст (спинтакс)."
+                    )
+                raise AccountBlockedError(msg, kind='restricted')
+
+            except DEAD_SESSION_ERRORS as e:
+                msg = f"{type(e).__name__}: сессия недействительна"
+                logging.error(f"💀 [acc {account_id}] {label}: {msg}")
+                if account_id:
+                    try:
+                        db.set_account_health(account_id, db.HEALTH_BANNED, msg)
+                        db.update_account_status(account_id, 'banned')
+                    except Exception:
+                        pass
+                if notify and bot and user_id:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"💀 <b>Аккаунт #{account_id} недоступен.</b>\n\n"
+                        f"Причина: {type(e).__name__}. Сессия отозвана или аккаунт заблокирован "
+                        f"Telegram — требуется переподключение."
+                    )
+                raise AccountBlockedError(msg, kind='banned')
+
+            except SKIP_TARGET_ERRORS as e:
+                logging.info(f"⏭ [acc {account_id}] {label}: {type(e).__name__} — цель пропущена")
+                if raise_on_skip:
+                    raise TargetSkipError(f"{type(e).__name__}") from e
+                return None
+
+            except (AccountBlockedError, TargetSkipError):
+                raise
+
+            except Exception as e:
+                last_err = e
+                # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
+                transient = isinstance(e, (asyncio.TimeoutError, ConnectionError, OSError))
+                if transient and attempt < max_retries:
+                    backoff = min(30, 2 ** attempt) + random.uniform(0, 1.5)
+                    logging.warning(
+                        f"🔁 [acc {account_id}] {label}: {type(e).__name__}: {str(e)[:120]} — "
+                        f"повтор через {backoff:.1f}s ({attempt}/{max_retries})"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logging.error(f"❌ [acc {account_id}] {label}: {type(e).__name__}: {str(e)[:200]}")
+                raise
+
+        if last_err:
+            raise last_err
+        return None
+
     async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
         """Генерирует комментарий. Перебирает провайдеров, пока кто-то не ответит."""
         messages = self.build_comment_messages(prompt, post_text)
@@ -1377,6 +1585,10 @@ class AccountSessionManager:
         if not account:
             logging.error(f"❌ Account {account_id} not found")
             return False, "Аккаунт не найден"
+        usable, reason = db.is_account_usable(account_id)
+        if not usable:
+            logging.warning(f"⛔ Account {account_id} unusable: {reason}")
+            return False, reason
         nc = db.get_neurocomment_settings(account_id)
         logging.info(f"📊 Neurocomment settings: {nc}")
         if not nc or not nc.get('enabled'):
@@ -1681,14 +1893,26 @@ class AccountSessionManager:
                                                     normalized_fwd_id = normalize_chat_id(fwd_chat_id_val)
                                                     if normalized_fwd_id == normalized_channel_id:
                                                         logging.info(f"🔍 [{acc_name}] Found matching forward (by id): fwd.id={fwd.id}, channel_msg_id={msg.id}")
-                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                         comment_sent = True
                                                         logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd msg_id={fwd.id})")
                                                         break
                                                 elif chat_username and fwd_chat_username and fwd_chat.username:
                                                     if fwd_chat.username.lower() == chat_username.lower():
                                                         logging.info(f"🔍 [{acc_name}] Found matching forward (by username): fwd.id={fwd.id}")
-                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                         comment_sent = True
                                                         logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by username)")
                                                         break
@@ -1696,7 +1920,13 @@ class AccountSessionManager:
                                             # Метод 2: сравнение по forward_from_message_id (совпадение с msg.id канала)
                                             if not comment_sent and fwd_msg_id and hasattr(msg, 'id') and fwd_msg_id == msg.id:
                                                 logging.info(f"🔍 [{acc_name}] Found matching forward (by msg_id={msg.id}): fwd.id={fwd.id}")
-                                                await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                 comment_sent = True
                                                 logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by msg_id)")
                                                 break
@@ -1728,6 +1958,8 @@ class AccountSessionManager:
         
         except asyncio.CancelledError:
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
+        except AccountBlockedError as e:
+            logging.error(f"🚫 [{acc_name}] Нейрокомментинг остановлен: {e}")
         except Exception as e:
             logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}")
             if bot and not notifications_hidden:
@@ -1796,7 +2028,15 @@ class AccountSessionManager:
             # Не состоим в канале / не резолвится — пробуем вступить
             logging.info(f"🔐 [acc {account_id}] No access to {channel} ({type(e).__name__}), trying to join")
             try:
-                chat_obj = await client.join_chat(chat_ref)
+                chat_obj = await self.tg_call(
+                    lambda: client.join_chat(chat_ref),
+                    account_id=account_id, description=f"join {channel}",
+                    notify=False, max_retries=2
+                )
+                if chat_obj is None:
+                    return False, None, f"Канал {channel} недоступен для вступления"
+            except AccountBlockedError as join_err:
+                return False, None, str(join_err)
             except Exception as join_err:
                 return False, None, f"Не удалось вступить в {channel}: {str(join_err)[:120]}"
 
@@ -1813,7 +2053,11 @@ class AccountSessionManager:
             return False, None, f"У канала {channel} нет открытых комментариев"
 
         try:
-            await client.join_chat(discussion_id)
+            await self.tg_call(
+                lambda: client.join_chat(discussion_id),
+                account_id=account_id, description=f"join discussion {discussion_id}",
+                notify=False, max_retries=2
+            )
             logging.info(f"✅ [acc {account_id}] Joined discussion chat {discussion_id} of {channel}")
         except Exception as e:
             # USER_ALREADY_PARTICIPANT и подобное — не ошибка
@@ -2228,6 +2472,9 @@ class AccountSessionManager:
     async def start_account_spam(self, account_id: int, bot, user_id: int):
         if self.is_account_spamming(account_id):
             return True, "Рассылка уже запущена"
+        usable, reason = db.is_account_usable(account_id)
+        if not usable:
+            return False, reason
         if not await self._acquire_user_quota(user_id):
             return False, f"Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER}). Дождитесь завершения или отмените другие задачи."
         if self._running_tasks >= self._max_concurrent_tasks:
@@ -2331,11 +2578,22 @@ class AccountSessionManager:
                     mention_msg = None
                     try:
                         me = await client.get_me()
-                        async for hist in client.get_chat_history(chat_id_val, limit=15):
-                            if hist.from_user and hist.from_user.id != me.id:
-                                mention_msg = hist
-                                break
-                    except Exception as e:
+
+                        async def _scan_history():
+                            async for hist in client.get_chat_history(chat_id_val, limit=15):
+                                if hist.from_user and hist.from_user.id != me.id:
+                                    return hist
+                            return None
+
+                        mention_msg = await self.tg_call(
+                            _scan_history,
+                            account_id=account_id, bot=bot, user_id=user_id,
+                            description=f"get_chat_history {chat_title}",
+                            notify=False, max_retries=2
+                        )
+                    except AccountBlockedError:
+                        raise
+                    except Exception:
                         pass
 
                     entities = []
@@ -2378,18 +2636,39 @@ class AccountSessionManager:
                     # Send post - только entities, без parse_mode
                     try:
                         if post_photo and os.path.exists(post_photo):
-                            await client.send_photo(
-                                chat_id_val,
-                                post_photo,
-                                caption=full_text,
-                                caption_entities=entities if entities else None
+                            _sent = await self.tg_call(
+                                lambda: client.send_photo(
+                                    chat_id_val,
+                                    post_photo,
+                                    caption=full_text,
+                                    caption_entities=entities if entities else None
+                                ),
+                                account_id=account_id, bot=bot, user_id=user_id,
+                                description=f"send_photo -> {chat_title}",
+                                notify=not notifications_hidden
                             )
                         else:
-                            await client.send_message(
-                                chat_id_val,
-                                full_text,
-                                entities=entities if entities else None
+                            _sent = await self.tg_call(
+                                lambda: client.send_message(
+                                    chat_id_val,
+                                    full_text,
+                                    entities=entities if entities else None
+                                ),
+                                account_id=account_id, bot=bot, user_id=user_id,
+                                description=f"send_message -> {chat_title}",
+                                notify=not notifications_hidden
                             )
+                        if _sent is None:
+                            # Чат недоступен для записи — фиксируем и идём дальше
+                            print(f"⏭ [{acc_name}] Пропущен {chat_title} (нет доступа на запись)")
+                            if chat_id_val not in chats_added:
+                                db.add_report_chat(report_id, str(chat_id_val), chat_title,
+                                                   error='Нет доступа на запись')
+                                chats_added.add(chat_id_val)
+                            else:
+                                db.update_report_stats(report_id, error_delta=1)
+                            await asyncio.sleep(random.randint(5, 12))
+                            continue
                         print(f"✅ [{acc_name}] Отправлено в {chat_title}")
                         if bot and not notifications_hidden:
                             await bot.send_message(user_id, f"✅ [{acc_name}] Отправлено в {chat_title}")
@@ -2422,6 +2701,10 @@ class AccountSessionManager:
 
         except asyncio.CancelledError:
             print(f"🛑 Задача спама [{acc_name}] отменена")
+        except AccountBlockedError as e:
+            # Аккаунт ограничен/забанен — пользователь уже уведомлён в tg_call
+            print(f"🚫 Рассылка [{acc_name}] остановлена: {e}")
+            db.set_account_spam_status(account_id, 0)
         except Exception as e:
             print(f"❌ Критическая ошибка спама [{acc_name}]: {e}")
             if bot:
@@ -2932,12 +3215,20 @@ class AccountSessionManager:
             for user_id_val in added_contacts:
                 try:
                     logging.info(f"📥 [{acc_name}] Inviting user {user_id_val} ({success+1}/{len(added_contacts)})")
-                    await asyncio.wait_for(
-                        client.add_chat_members(chat_id=chat_obj.id, user_ids=[user_id_val]),
-                        timeout=5.0
+                    await self.tg_call(
+                        lambda: asyncio.wait_for(
+                            client.add_chat_members(chat_id=chat_obj.id, user_ids=[user_id_val]),
+                            timeout=5.0
+                        ),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f"invite {user_id_val}",
+                        notify=not notifications_hidden
                     )
                     success += 1
                     logging.info(f"✅ [{acc_name}] Invited user {user_id_val} ({success}/{len(added_contacts)})")
+                except AccountBlockedError as e:
+                    logging.warning(f"🛑 [{acc_name}] Инвайт остановлен: {e}")
+                    break
                 except asyncio.TimeoutError:
                     errors += 1
                     logging.warning(f"⚠️ [{acc_name}] Timeout adding {user_id_val}")

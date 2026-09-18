@@ -1765,16 +1765,27 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         accounts = db.get_user_accounts(user_id)
         buttons = []
+        warned = 0
         for acc in accounts:
             spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
             status_icon = "🟢" if acc['status'] == 'active' else "🔴"
+            health = (acc.get('health') or 'ok')
+            if health == 'cooldown':
+                status_icon, spam_icon, warned = "⏳", "Пауза (FloodWait)", warned + 1
+            elif health == 'restricted':
+                status_icon, spam_icon, warned = "⚠️", "Ограничен Telegram", warned + 1
+            elif health == 'banned':
+                status_icon, spam_icon, warned = "🚫", "Сессия недействительна", warned + 1
             name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
             phone = f"({acc['phone']})" if acc.get('phone') else ""
             buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} | {spam_icon}", callback_data=f"manage_acc_{acc['id']}")])
 
         buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await send_photo(message, 'acc.jpg', f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})", markup)
+        _title = f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})"
+        if warned:
+            _title += f"\n\n⚠️ Требуют внимания: {warned}. Откройте аккаунт, чтобы увидеть причину."
+        await send_photo(message, 'acc.jpg', _title, markup)
 
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
@@ -2242,6 +2253,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"acc_del_{account_id}")],
             [InlineKeyboardButton(text="◀️ Назад к аккаунтам", callback_data="back_to_accounts")]
         ]
+        if (account.get('health') or 'ok') != 'ok':
+            buttons.insert(1, [InlineKeyboardButton(
+                text="♻️ Сбросить статус ограничения",
+                callback_data=f"acc_health_reset_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
@@ -2261,6 +2276,33 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Медиа:</b> {has_photo}"
         )
 
+        # ── Здоровье аккаунта (FloodWait / ограничения) ──
+        health = account.get('health') or 'ok'
+        if health != 'ok':
+            reason = account.get('health_reason') or ''
+            until = account.get('restricted_until') or 0
+            if health == 'cooldown':
+                left = max(0, int(until - time.time()))
+                text += (f"\n\n⏳ <b>Пауза из-за FloodWait</b>\n"
+                         f"Telegram просит подождать. Осталось: <b>{left // 60} мин {left % 60} сек</b>.\n"
+                         f"<i>Рассылка продолжится автоматически.</i>")
+            elif health == 'restricted':
+                text += (f"\n\n⚠️ <b>Аккаунт ограничен Telegram</b>\n"
+                         f"{reason[:200]}\n\n"
+                         f"Что делать:\n"
+                         f"1. Напишите @SpamBot и запросите снятие ограничения\n"
+                         f"2. Дайте аккаунту отдохнуть 24–48 часов\n"
+                         f"3. Увеличьте интервал рассылки и уменьшите число чатов")
+            elif health == 'banned':
+                text += (f"\n\n🚫 <b>Сессия недействительна</b>\n"
+                         f"{reason[:200]}\n\n"
+                         f"Аккаунт нужно подключить заново (удалите и добавьте снова).")
+
+        fc = account.get('flood_count') or 0
+        if fc:
+            fs = account.get('flood_total_seconds') or 0
+            text += f"\n\n📉 <b>Лимиты Telegram:</b> {fc} раз, суммарно {fs // 60} мин ожидания"
+
         if isinstance(message_or_callback, CallbackQuery):
             try:
                 await edit_message(message_or_callback, text, markup)
@@ -2268,6 +2310,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 pass
         else:
             await message_or_callback.answer(text, reply_markup=markup)
+
+    @dp.callback_query(F.data.startswith('acc_health_reset_'))
+    async def acc_health_reset_callback(callback: CallbackQuery):
+        account_id = int(callback.data.rsplit('_', 1)[1])
+        account = db.get_account(account_id)
+        if not account or account['user_id'] != callback.from_user.id:
+            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            return
+        db.clear_account_health(account_id)
+        if account.get('status') == 'banned':
+            db.update_account_status(account_id, 'active')
+        await callback.answer(
+            "♻️ Статус сброшен. Если ограничение ещё действует, Telegram выдаст его снова.",
+            show_alert=True
+        )
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('manage_acc_'))
     async def manage_acc_callback(callback: CallbackQuery, state: FSMContext):

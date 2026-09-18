@@ -842,6 +842,12 @@ class DBConnection(metaclass=_PoolBoundMeta):
         except sqlite3.OperationalError:
             pass
         for _ddl in (
+            "ALTER TABLE accounts ADD COLUMN health TEXT DEFAULT 'ok'",
+            "ALTER TABLE accounts ADD COLUMN health_reason TEXT DEFAULT ''",
+            "ALTER TABLE accounts ADD COLUMN restricted_until INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN flood_count INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN flood_total_seconds INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN last_flood_at INTEGER DEFAULT 0",
             "ALTER TABLE tariffs ADD COLUMN code TEXT DEFAULT ''",
             "ALTER TABLE tariffs ADD COLUMN max_accounts INTEGER DEFAULT 1",
             "ALTER TABLE tariffs ADD COLUMN ai_comments_per_day INTEGER DEFAULT 20",
@@ -1820,6 +1826,80 @@ class DBConnection(metaclass=_PoolBoundMeta):
             self.close()
         except Exception:
             pass
+
+    # ==================== ACCOUNT HEALTH (FloodWait / bans) ====================
+    # ok         — аккаунт работает штатно
+    # cooldown   — активный FloodWait, ждём истечения restricted_until
+    # restricted — PeerFlood / спам-блок, задачи остановлены до решения владельца
+    # banned     — аккаунт удалён/забанен Telegram, требуется переподключение
+    HEALTH_OK = 'ok'
+    HEALTH_COOLDOWN = 'cooldown'
+    HEALTH_RESTRICTED = 'restricted'
+    HEALTH_BANNED = 'banned'
+
+    def set_account_health(self, account_id: int, health: str, reason: str = '',
+                           restricted_until: int = 0):
+        self.c.execute(
+            'UPDATE accounts SET health = ?, health_reason = ?, restricted_until = ? WHERE id = ?',
+            (health, (reason or '')[:300], int(restricted_until or 0), account_id)
+        )
+        self.conn_ctx.commit()
+
+    def clear_account_health(self, account_id: int):
+        self.c.execute(
+            "UPDATE accounts SET health = 'ok', health_reason = '', restricted_until = 0 WHERE id = ?",
+            (account_id,)
+        )
+        self.conn_ctx.commit()
+
+    def record_flood_wait(self, account_id: int, seconds: int):
+        """Фиксирует FloodWait: статистика + окно ожидания."""
+        now = int(time.time())
+        until = now + int(seconds)
+        self.c.execute(
+            'UPDATE accounts SET health = ?, health_reason = ?, restricted_until = ?, '
+            'flood_count = COALESCE(flood_count, 0) + 1, '
+            'flood_total_seconds = COALESCE(flood_total_seconds, 0) + ?, '
+            'last_flood_at = ? WHERE id = ?',
+            (self.HEALTH_COOLDOWN, f'FloodWait {int(seconds)}s', until, int(seconds), now, account_id)
+        )
+        self.conn_ctx.commit()
+
+    def get_account_health(self, account_id: int) -> Dict[str, Any]:
+        self.c.execute(
+            'SELECT health, health_reason, restricted_until, flood_count, '
+            'flood_total_seconds, last_flood_at FROM accounts WHERE id = ?',
+            (account_id,)
+        )
+        row = self._dict_fetchone()
+        if not row:
+            return {'health': self.HEALTH_OK, 'health_reason': '', 'restricted_until': 0,
+                    'flood_count': 0, 'flood_total_seconds': 0, 'last_flood_at': 0}
+        now = int(time.time())
+        # Кулдаун истёк — считаем аккаунт снова здоровым
+        if row.get('health') == self.HEALTH_COOLDOWN and int(row.get('restricted_until') or 0) <= now:
+            self.clear_account_health(account_id)
+            row['health'] = self.HEALTH_OK
+            row['health_reason'] = ''
+            row['restricted_until'] = 0
+        return row
+
+    def is_account_usable(self, account_id: int) -> Tuple[bool, str]:
+        """Можно ли сейчас запускать задачи на аккаунте."""
+        h = self.get_account_health(account_id)
+        state = h.get('health') or self.HEALTH_OK
+        if state == self.HEALTH_OK:
+            return True, ''
+        if state == self.HEALTH_COOLDOWN:
+            left = max(0, int(h.get('restricted_until') or 0) - int(time.time()))
+            if left <= 0:
+                return True, ''
+            return False, f'Аккаунт на паузе после FloodWait, осталось {left} сек.'
+        if state == self.HEALTH_RESTRICTED:
+            return False, f"Аккаунт ограничен Telegram: {h.get('health_reason') or 'спам-блок'}"
+        if state == self.HEALTH_BANNED:
+            return False, f"Аккаунт заблокирован: {h.get('health_reason') or 'требуется переподключение'}"
+        return True, ''
 
     # ==================== TASK REGISTRY (persistence & recovery) ====================
     def register_task(self, user_id: int, account_id: int, task_type: str, progress: str = '') -> int:
