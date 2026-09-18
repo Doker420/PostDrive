@@ -8,6 +8,8 @@ import threading
 import contextlib
 import contextvars
 import functools
+
+import dbconfig
 from typing import List, Dict, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,93 @@ class _PoolBoundMeta(type):
         return super().__new__(mcls, name, bases, ns)
 
 
+class _PgCursorAdapter:
+    """Курсор PostgreSQL с поведением sqlite3.Cursor.
+
+    Транслирует SQL-диалект и приводит строки к dict-совместимому виду,
+    чтобы существующий код (_dict_fetchone/_dict_fetchall, row[0], row['col'])
+    работал без изменений.
+    """
+    __slots__ = ('_cur',)
+
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=()):
+        if dbconfig.is_pragma(sql):
+            return self            # PRAGMA не существует в PostgreSQL
+        self._cur.execute(dbconfig.translate(sql), tuple(params) if params else None)
+        return self
+
+    def executemany(self, sql, seq):
+        self._cur.executemany(dbconfig.translate(sql), [tuple(p) for p in seq])
+        return self
+
+    @staticmethod
+    def _wrap(row):
+        return _PgRow(row) if row is not None else None
+
+    def fetchone(self):
+        try:
+            return self._wrap(self._cur.fetchone())
+        except Exception:
+            return None
+
+    def fetchall(self):
+        try:
+            return [_PgRow(r) for r in self._cur.fetchall()]
+        except Exception:
+            return []
+
+    def __getattr__(self, item):
+        return getattr(self._cur, item)
+
+
+class _PgRow(dict):
+    """dict с доступом по индексу: row[0] и row['col'] одновременно."""
+    __slots__ = ()
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return dict.__getitem__(self, key)
+
+    def keys(self):
+        return dict.keys(self)
+
+
+class _PgConnectionAdapter:
+    """Соединение PostgreSQL с API sqlite3.Connection."""
+    __slots__ = ('_conn',)
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _PgCursorAdapter(self._conn.cursor())
+
+    def execute(self, sql, params=()):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql, seq):
+        cur = self.cursor()
+        cur.executemany(sql, seq)
+        return cur
+
+    @property
+    def in_transaction(self):
+        try:
+            import psycopg2.extensions as ext
+            return self._conn.get_transaction_status() != ext.TRANSACTION_STATUS_IDLE
+        except Exception:
+            return False
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
 class _PooledConnection:
     """Обёртка над sqlite3.Connection, которая возвращает себя в пул при release()."""
     __slots__ = ('raw', 'cursor', 'pool', 'depth')
@@ -118,10 +207,10 @@ class DBConnection(metaclass=_PoolBoundMeta):
     """
 
     # Сколько одновременных соединений держать. Читатели в WAL не блокируют друг друга.
-    POOL_SIZE = int(os.environ.get('DB_POOL_SIZE', '12'))
+    POOL_SIZE = dbconfig.DB_POOL_SIZE
 
-    def __init__(self, db_path: str = 'database.db', pool_size: Optional[int] = None):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None, pool_size: Optional[int] = None):
+        self.db_path = db_path or dbconfig.DB_PATH
         self.pool_size = pool_size or self.POOL_SIZE
 
         self._pool: "queue.LifoQueue[_PooledConnection]" = queue.LifoQueue()
@@ -153,7 +242,9 @@ class DBConnection(metaclass=_PoolBoundMeta):
         logger.info(f"DB pool initialised: size={self.pool_size} path={self.db_path}")
 
     # ── Connection factory ────────────────────────────────────────
-    def _new_raw_conn(self) -> sqlite3.Connection:
+    def _new_raw_conn(self):
+        if dbconfig.IS_POSTGRES:
+            return self._new_pg_conn()
         conn = sqlite3.connect(
             self.db_path,
             check_same_thread=False,
@@ -163,7 +254,24 @@ class DBConnection(metaclass=_PoolBoundMeta):
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _apply_pragmas(self, conn: sqlite3.Connection, verbose: bool = True):
+    def _new_pg_conn(self):
+        """Соединение с PostgreSQL, совместимое по API с sqlite3.Connection."""
+        try:
+            import psycopg2
+            import psycopg2.extras
+        except ImportError:
+            raise RuntimeError(
+                "ENGINE=postgres требует psycopg2: pip install psycopg2-binary"
+            )
+        conn = psycopg2.connect(dbconfig.DB_DSN, cursor_factory=psycopg2.extras.RealDictCursor)
+        conn.autocommit = True
+        return _PgConnectionAdapter(conn)
+
+    def _apply_pragmas(self, conn, verbose: bool = True):
+        if dbconfig.IS_POSTGRES:
+            if verbose:
+                logger.info(f"PostgreSQL backend: {dbconfig.describe()}")
+            return
         """Apply performance and safety pragmas. WAL mode allows concurrent reads while writing."""
         c = conn.cursor()
         c.execute('PRAGMA journal_mode=WAL')
@@ -353,7 +461,29 @@ class DBConnection(metaclass=_PoolBoundMeta):
             duration_days INTEGER NOT NULL,
             price_usd REAL NOT NULL,
             description TEXT,
-            is_active INTEGER DEFAULT 1
+            is_active INTEGER DEFAULT 1,
+            code TEXT DEFAULT '',
+            max_accounts INTEGER DEFAULT 1,
+            ai_comments_per_day INTEGER DEFAULT 20,
+            sort_order INTEGER DEFAULT 0
+        )''')
+
+        # Персональные надбавки к лимитам (докупленные слоты и AI-пакеты)
+        self.c.execute('''CREATE TABLE IF NOT EXISTS user_entitlements (
+            user_id INTEGER PRIMARY KEY,
+            tariff_code TEXT DEFAULT '',
+            extra_accounts INTEGER DEFAULT 0,
+            extra_ai_until INTEGER DEFAULT 0,
+            extra_ai_per_day INTEGER DEFAULT 0,
+            updated_at INTEGER DEFAULT 0
+        )''')
+
+        # Посуточный учёт расхода AI-комментариев
+        self.c.execute('''CREATE TABLE IF NOT EXISTS ai_usage (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            used INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, day)
         )''')
 
         # CryptoBot Invoices
@@ -711,25 +841,174 @@ class DBConnection(metaclass=_PoolBoundMeta):
             c.execute('ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
         except sqlite3.OperationalError:
             pass
+        for _ddl in (
+            "ALTER TABLE tariffs ADD COLUMN code TEXT DEFAULT ''",
+            "ALTER TABLE tariffs ADD COLUMN max_accounts INTEGER DEFAULT 1",
+            "ALTER TABLE tariffs ADD COLUMN ai_comments_per_day INTEGER DEFAULT 20",
+            "ALTER TABLE tariffs ADD COLUMN sort_order INTEGER DEFAULT 0",
+        ):
+            try:
+                c.execute(_ddl)
+            except Exception:
+                pass
         self.conn_ctx.commit()
         c.close()
 
+    # Тарифная сетка: (code, название, дней, $, описание, макс. аккаунтов, AI/сутки, порядок)
+    DEFAULT_TARIFFS = [
+        ('trial',      'Trial — 3 дня',      3,    0.0,  'Бесплатный пробный доступ',            1,   20,  10),
+        ('starter',    'Starter',            30,   19.0, 'Для соло-арбитражника',                3,   200, 20),
+        ('pro',        'Pro',                30,   49.0, 'Для небольшой команды',                15,  1500, 30),
+        ('team',       'Team',               30,   129.0,'Для агентства',                        50,  6000, 40),
+        ('enterprise', 'Enterprise',         30,   299.0,'Сетки, white label — лимиты по договору', 150, 20000, 50),
+        ('starter_y',  'Starter — год (-20%)',  365, 182.0, 'Годовая подписка Starter со скидкой 20%', 3,  200, 21),
+        ('pro_y',      'Pro — год (-20%)',      365, 470.0, 'Годовая подписка Pro со скидкой 20%',     15, 1500, 31),
+        ('team_y',     'Team — год (-20%)',     365, 1238.0,'Годовая подписка Team со скидкой 20%',    50, 6000, 41),
+    ]
+
+    # Докупаемые пакеты сверх тарифа
+    ADDON_ACCOUNT_SLOT_USD = 3.0     # +1 аккаунт / мес
+    ADDON_AI_PACK_USD = 5.0          # +1000 AI-комментариев
+    ADDON_AI_PACK_SIZE = 1000
+    ADDON_WARMUP_USD = 7.0           # прогрев одного аккаунта
+
     def seed_default_tariffs(self):
+        """Создаёт/обновляет тарифную сетку с лимитами (идемпотентно по code)."""
         c = self._cursor()
-        c.execute('SELECT COUNT(*) FROM tariffs')
-        if c.fetchone()[0] == 0:
-            default_tariffs = [
-                ("3 дня (Тест)", 3, 3.0, "Пробный доступ на 3 дня"),
-                ("1 месяц", 30, 15.0, "Полный доступ на 30 дней"),
-                ("3 месяца (Скидка)", 90, 35.0, "Полный доступ на 90 дней со скидкой"),
-                ("Навсегда", 3650, 99.0, "Безлимитный пожизненный доступ")
-            ]
-            c.executemany(
-                'INSERT INTO tariffs (name, duration_days, price_usd, description) VALUES (?, ?, ?, ?)',
-                default_tariffs
-            )
-            self.conn_ctx.commit()
+        for code, name, days, price, desc, max_acc, ai_day, order in self.DEFAULT_TARIFFS:
+            c.execute('SELECT id FROM tariffs WHERE code = ?', (code,))
+            row = c.fetchone()
+            if row:
+                c.execute(
+                    'UPDATE tariffs SET name = ?, duration_days = ?, price_usd = ?, description = ?, '
+                    'max_accounts = ?, ai_comments_per_day = ?, sort_order = ? WHERE code = ?',
+                    (name, days, price, desc, max_acc, ai_day, order, code)
+                )
+            else:
+                c.execute(
+                    'INSERT INTO tariffs (code, name, duration_days, price_usd, description, '
+                    'is_active, max_accounts, ai_comments_per_day, sort_order) '
+                    'VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)',
+                    (code, name, days, price, desc, max_acc, ai_day, order)
+                )
+        # Снимаем с продажи легаси-тарифы без кода (в т.ч. "Навсегда")
+        c.execute("UPDATE tariffs SET is_active = 0 WHERE code IS NULL OR code = ''")
+        self.conn_ctx.commit()
         c.close()
+
+    # ==================== QUOTAS & ENTITLEMENTS ====================
+    def get_tariff_by_code(self, code: str) -> Optional[Dict[str, Any]]:
+        self.c.execute('SELECT * FROM tariffs WHERE code = ?', (code,))
+        return self._dict_fetchone()
+
+    def get_user_entitlements(self, user_id: int) -> Dict[str, Any]:
+        self.c.execute('SELECT * FROM user_entitlements WHERE user_id = ?', (user_id,))
+        row = self._dict_fetchone()
+        if not row:
+            return {'user_id': user_id, 'tariff_code': '', 'extra_accounts': 0,
+                    'extra_ai_until': 0, 'extra_ai_per_day': 0}
+        return row
+
+    def set_user_tariff(self, user_id: int, tariff_code: str):
+        now = int(time.time())
+        self.c.execute(
+            'INSERT INTO user_entitlements (user_id, tariff_code, updated_at) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id) DO UPDATE SET tariff_code = excluded.tariff_code, '
+            'updated_at = excluded.updated_at',
+            (user_id, tariff_code, now)
+        )
+        self.conn_ctx.commit()
+
+    def add_extra_account_slots(self, user_id: int, count: int):
+        now = int(time.time())
+        self.c.execute(
+            'INSERT INTO user_entitlements (user_id, extra_accounts, updated_at) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id) DO UPDATE SET extra_accounts = user_entitlements.extra_accounts + ?, '
+            'updated_at = ?',
+            (user_id, int(count), now, int(count), now)
+        )
+        self.conn_ctx.commit()
+
+    def add_ai_pack(self, user_id: int, per_day: int, days: int = 30):
+        """Докупленный AI-пакет: поднимает дневной лимит на срок days."""
+        now = int(time.time())
+        until = now + days * 86400
+        self.c.execute(
+            'INSERT INTO user_entitlements (user_id, extra_ai_per_day, extra_ai_until, updated_at) '
+            'VALUES (?, ?, ?, ?) '
+            'ON CONFLICT(user_id) DO UPDATE SET '
+            'extra_ai_per_day = user_entitlements.extra_ai_per_day + ?, '
+            'extra_ai_until = MAX(user_entitlements.extra_ai_until, ?), updated_at = ?',
+            (user_id, int(per_day), until, now, int(per_day), until, now)
+        )
+        self.conn_ctx.commit()
+
+    def get_user_limits(self, user_id: int, admin_id: int = 0) -> Dict[str, Any]:
+        """Итоговые лимиты пользователя: тариф + докупленные надбавки."""
+        if admin_id and user_id == admin_id:
+            return {'tariff_code': 'admin', 'tariff_name': 'Администратор',
+                    'max_accounts': 10 ** 6, 'ai_per_day': 10 ** 6, 'unlimited': True}
+
+        ent = self.get_user_entitlements(user_id)
+        tariff = self.get_tariff_by_code(ent.get('tariff_code') or '') if ent.get('tariff_code') else None
+        if not tariff:
+            # нет явного тарифа — если подписка активна, считаем Starter, иначе Trial
+            fallback_code = 'starter' if self.is_user_subscribed(user_id, admin_id) else 'trial'
+            tariff = self.get_tariff_by_code(fallback_code) or {}
+
+        max_accounts = int(tariff.get('max_accounts', 1) or 1) + int(ent.get('extra_accounts', 0) or 0)
+        ai_per_day = int(tariff.get('ai_comments_per_day', 20) or 20)
+        if int(ent.get('extra_ai_until', 0) or 0) > int(time.time()):
+            ai_per_day += int(ent.get('extra_ai_per_day', 0) or 0)
+
+        return {
+            'tariff_code': tariff.get('code', 'trial'),
+            'tariff_name': tariff.get('name', 'Trial'),
+            'max_accounts': max_accounts,
+            'ai_per_day': ai_per_day,
+            'unlimited': False,
+        }
+
+    def count_user_accounts(self, user_id: int) -> int:
+        self.c.execute('SELECT COUNT(*) FROM accounts WHERE user_id = ?', (user_id,))
+        return self.c.fetchone()[0]
+
+    def can_add_account(self, user_id: int, admin_id: int = 0) -> Tuple[bool, str, Dict[str, Any]]:
+        limits = self.get_user_limits(user_id, admin_id)
+        current = self.count_user_accounts(user_id)
+        if current >= limits['max_accounts']:
+            return False, (
+                f"Достигнут лимит аккаунтов для тарифа «{limits['tariff_name']}»: "
+                f"{current}/{limits['max_accounts']}."
+            ), limits
+        return True, '', limits
+
+    # ── AI daily usage ────────────────────────────────────────────
+    @staticmethod
+    def _today_key() -> str:
+        return time.strftime('%Y-%m-%d', time.gmtime())
+
+    def get_ai_usage_today(self, user_id: int) -> int:
+        self.c.execute('SELECT used FROM ai_usage WHERE user_id = ? AND day = ?',
+                       (user_id, self._today_key()))
+        row = self.c.fetchone()
+        return int(row[0]) if row else 0
+
+    def consume_ai_quota(self, user_id: int, admin_id: int = 0, amount: int = 1) -> Tuple[bool, int, int]:
+        """Пытается списать amount AI-генераций. Возвращает (можно, использовано, лимит)."""
+        limits = self.get_user_limits(user_id, admin_id)
+        limit = limits['ai_per_day']
+        day = self._today_key()
+        used = self.get_ai_usage_today(user_id)
+        if used + amount > limit:
+            return False, used, limit
+        self.c.execute(
+            'INSERT INTO ai_usage (user_id, day, used) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id, day) DO UPDATE SET used = ai_usage.used + ?',
+            (user_id, day, amount, amount)
+        )
+        self.conn_ctx.commit()
+        return True, used + amount, limit
 
     # ==================== USERS & SUBSCRIPTION ====================
     def get_or_create_user(self, user_id: int, username: str = "", first_name: str = "", last_name: str = "", admin_id: int = 0) -> Dict[str, Any]:

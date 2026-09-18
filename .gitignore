@@ -22,3 +22,6 @@ img/
 
 # Local sessions
 sessions_export.txt
+# Tests scratch
+_smoke.py
+bot_debug.log

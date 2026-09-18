@@ -10,6 +10,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
+import dbconfig
 from sqliter import DBConnection, get_db_sync
 from user import AccountSessionManager
 from handlers import register_all_handlers
@@ -58,12 +59,36 @@ dp = Dispatcher(storage=_fsm_storage)
 db = get_db_sync()
 account_manager = AccountSessionManager(API_ID, API_HASH)
 
+# ── Payments / legal / miniapp ────────────────────────────────────
+def _cfg(section, key, fallback=''):
+    try:
+        return config.get(section, key, fallback=fallback).strip()
+    except Exception:
+        return fallback
+
+def _flag(value: str, default: bool = False) -> bool:
+    if not value:
+        return default
+    return value.lower() in ('1', 'true', 'yes', 'on')
+
+STARS_ENABLED = _flag(os.environ.get('STARS_ENABLED', _cfg('PAYMENTS', 'STARS_ENABLED', 'true')), True)
+STARS_PER_USD = int(os.environ.get('STARS_PER_USD', _cfg('PAYMENTS', 'STARS_PER_USD', '50')))
+MINIAPP_ENABLED = _flag(os.environ.get('MINIAPP_ENABLED', _cfg('PAYMENTS', 'MINIAPP_ENABLED', 'false')))
+MINIAPP_URL = os.environ.get('MINIAPP_URL', _cfg('PAYMENTS', 'MINIAPP_URL', ''))
+
 bot_config = {
     'ADMIN': ADMIN,
     'CRYPTO_BOT_TOKEN': CRYPTO_BOT_TOKEN,
     'TESTNET': TESTNET,
     'account_manager': account_manager,
-    'USERNAME': USERNAME
+    'USERNAME': USERNAME,
+    'STARS_ENABLED': STARS_ENABLED,
+    'STARS_PER_USD': STARS_PER_USD,
+    'MINIAPP_ENABLED': MINIAPP_ENABLED,
+    'MINIAPP_URL': MINIAPP_URL,
+    'TERMS_URL': os.environ.get('TERMS_URL', _cfg('LEGAL', 'TERMS_URL', '')),
+    'PRIVACY_URL': os.environ.get('PRIVACY_URL', _cfg('LEGAL', 'PRIVACY_URL', '')),
+    'SUPPORT': os.environ.get('SUPPORT_CONTACT', _cfg('LEGAL', 'SUPPORT', '@support')),
 }
 
 register_all_handlers(dp, bot, bot_config)
@@ -114,6 +139,7 @@ async def main():
     print("=" * 60)
     print("🤖 Autoposter Multi-Account Bot v5.0")
     print("=" * 60)
+    print(f"🗄  DB: {dbconfig.describe()}")
     print(f"📊 Limits: max_clients={account_manager.MAX_ACTIVE_CLIENTS} "
           f"max_tasks_per_user={account_manager.MAX_TASKS_PER_USER} "
           f"max_global_tasks={account_manager.MAX_GLOBAL_TASKS}")

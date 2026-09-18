@@ -368,6 +368,50 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     TESTNET = config.get('TESTNET', False)
     account_manager = config.get('account_manager')
     USERNAME = config.get('USERNAME', 'bot')
+    STARS_ENABLED = config.get('STARS_ENABLED', True)
+    STARS_PER_USD = int(config.get('STARS_PER_USD', 50))
+    MINIAPP_ENABLED = config.get('MINIAPP_ENABLED', False)
+    MINIAPP_URL = config.get('MINIAPP_URL', '')
+    TERMS_URL = config.get('TERMS_URL', '')
+    PRIVACY_URL = config.get('PRIVACY_URL', '')
+    SUPPORT_CONTACT = config.get('SUPPORT', '@support')
+
+    DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'documents')
+
+    def _load_doc(filename: str, limit: int = 3500) -> str:
+        """Читает документ из documents/ и готовит его к отправке в Telegram."""
+        path = os.path.join(DOCS_DIR, filename)
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                raw = fh.read()
+        except Exception as e:
+            logger.error(f"Не удалось прочитать {filename}: {e}")
+            return ""
+        import re as _re
+        text = raw
+        text = _re.sub(r'^#{1,6}\s*(.+)$', r'<b>\1</b>', text, flags=_re.MULTILINE)
+        text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        text = _re.sub(r'_(.+?)_', r'<i>\1</i>', text)
+        text = _re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+        text = _re.sub(r'<(https?://[^>]+)>', r'\1', text)
+        text = _re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    def _doc_pages(text: str, size: int = 3500) -> list:
+        """Разбивает длинный документ на страницы по границам абзацев."""
+        if not text:
+            return ["Документ недоступен."]
+        pages, current = [], ""
+        for para in text.split('\n\n'):
+            candidate = (current + '\n\n' + para) if current else para
+            if len(candidate) > size and current:
+                pages.append(current)
+                current = para
+            else:
+                current = candidate
+        if current:
+            pages.append(current)
+        return pages or ["Документ недоступен."]
 
     CHATS_PER_PAGE = 8
     user_selected_leave_chats: Dict[int, set] = {}
@@ -497,11 +541,42 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             "• Массовый выход из выбранных чатов\n"
             "• Защита от флуда и поддержка форматирования с медиа"
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions_start_0")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
-        ])
+        text += f"\n\n💬 <b>Поддержка:</b> {SUPPORT_CONTACT}"
+        rows = [[InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions_start_0")]]
+        if TERMS_URL:
+            rows.append([InlineKeyboardButton(text="📄 Пользовательское соглашение", url=TERMS_URL)])
+        else:
+            rows.append([InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="legal_terms_0")])
+        rows.append([InlineKeyboardButton(text="📋 Правила использования", callback_data="legal_rules_0")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
         await send_photo(message, 'info.jpg', text, markup)
+
+    @dp.callback_query(F.data.startswith('legal_'))
+    async def legal_doc_callback(callback: CallbackQuery):
+        # legal_{terms|rules}_{page}
+        parts = callback.data.split('_')
+        doc = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        filename = 'TERMS.md' if doc == 'terms' else 'RULES.md'
+        title = "📄 Пользовательское соглашение" if doc == 'terms' else "📋 Правила использования"
+
+        pages = _doc_pages(_load_doc(filename))
+        page = max(0, min(page, len(pages) - 1))
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"legal_{doc}_{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{len(pages)}", callback_data="noop"))
+        if page < len(pages) - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"legal_{doc}_{page+1}"))
+        rows = [nav]
+        other = 'rules' if doc == 'terms' else 'terms'
+        other_label = "📋 Правила использования" if doc == 'terms' else "📄 Пользовательское соглашение"
+        rows.append([InlineKeyboardButton(text=other_label, callback_data=f"legal_{other}_0")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
+
+        await edit_message(callback, f"{title}\n\n{pages[page]}", InlineKeyboardMarkup(inline_keyboard=rows))
 
     INSTRUCTIONS = [
         (
@@ -1295,35 +1370,285 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ Не удалось отправить!")
 
     # ==================== SUBSCRIPTION & CRYPTOBOT ====================
-    @dp.message(F.text == '💳 Подписка')
-    async def subscription_menu(message: Message, state: FSMContext):
-        await state.clear()
-        user_id = message.from_user.id
+    TARIFF_ICONS = {'trial': '🎁', 'starter': '🚀', 'pro': '💼', 'team': '🏢',
+                    'enterprise': '🏆', 'starter_y': '🚀', 'pro_y': '💼', 'team_y': '🏢'}
+
+    def _usd_to_stars(amount_usd: float) -> int:
+        return max(1, int(round(amount_usd * STARS_PER_USD)))
+
+    async def render_subscription(target, user_id: int):
         user = db.get_user(user_id)
         is_admin = (user_id == ADMIN) or (user and user.get('is_admin') == 1)
         is_sub = db.is_user_subscribed(user_id, ADMIN)
+        limits = db.get_user_limits(user_id, ADMIN)
+        used_accounts = db.count_user_accounts(user_id)
+        ai_used = db.get_ai_usage_today(user_id)
 
         status_str = "🟢 Активна" if is_sub else "🔴 Не активна"
         sub_until = format_date(user.get('subscription_until', 0)) if (user and not is_admin) else "Бессрочно (Администратор)"
 
-        tariffs = db.get_tariffs(active_only=True)
-        buttons = []
-        for t in tariffs:
-            buttons.append([InlineKeyboardButton(
-                text=f"🛒 {t['name']} — ${t['price_usd']:.2f} (USDT)",
-                callback_data=f"buy_tariff_{t['id']}"
-            )])
-        buttons.append([InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")])
-
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         text = (
-            f"💳 <b>Управление подпиской</b>\n\n"
+            f"💳 <b>Подписка и тарифы</b>\n\n"
             f"• <b>Статус:</b> {status_str}\n"
-            f"• <b>Действует до:</b> {sub_until}\n\n"
-            f"<b>Доступные тарифные планы:</b>\n"
-            f"<i>Выберите тариф для быстрой оплаты через CryptoBot:</i>"
+            f"• <b>Действует до:</b> {sub_until}\n"
+            f"• <b>Тариф:</b> {limits['tariff_name']}\n\n"
+            f"<b>📊 Ваши лимиты</b>\n"
+            f"• Аккаунтов: <b>{used_accounts}/{limits['max_accounts']}</b>\n"
+            f"• AI-комментариев сегодня: <b>{ai_used}/{limits['ai_per_day']}</b>\n\n"
+            f"<i>Лимиты обновляются ежедневно в 00:00 UTC.</i>"
         )
-        await send_photo(message, 'sub.jpg', text, markup)
+
+        rows = []
+        if MINIAPP_ENABLED and MINIAPP_URL:
+            from aiogram.types import WebAppInfo
+            rows.append([InlineKeyboardButton(
+                text="🛒 Открыть магазин тарифов",
+                web_app=WebAppInfo(url=f"{MINIAPP_URL}?uid={user_id}")
+            )])
+        rows.append([InlineKeyboardButton(text="📦 Тарифные планы", callback_data="show_tariffs")])
+        rows.append([InlineKeyboardButton(text="➕ Докупить слоты / AI", callback_data="show_addons")])
+        rows.append([InlineKeyboardButton(text="💡 Как пополнить баланс", callback_data="howto_pay")])
+        rows.append([InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")])
+
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        if isinstance(target, CallbackQuery):
+            await edit_message(target, text, markup)
+        else:
+            await send_photo(target, 'sub.jpg', text, markup)
+
+    @dp.message(F.text == '💳 Подписка')
+    async def subscription_menu(message: Message, state: FSMContext):
+        await state.clear()
+        await render_subscription(message, message.from_user.id)
+
+    @dp.callback_query(F.data == "back_to_subscription")
+    async def back_to_subscription_callback(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await render_subscription(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data == "show_tariffs")
+    async def show_tariffs_callback(callback: CallbackQuery):
+        tariffs = db.get_tariffs(active_only=True)
+        tariffs = sorted(tariffs, key=lambda t: (t.get('sort_order') or 0, t.get('price_usd') or 0))
+        rows, lines = [], []
+        for t in tariffs:
+            icon = TARIFF_ICONS.get(t.get('code', ''), '📦')
+            period = "год" if (t.get('duration_days') or 0) >= 365 else f"{t.get('duration_days')} дн."
+            lines.append(
+                f"{icon} <b>{t['name']}</b> — ${t['price_usd']:.0f} / {period}\n"
+                f"    Аккаунтов: {t.get('max_accounts', 1)} · AI/сутки: {t.get('ai_comments_per_day', 0)}"
+            )
+            rows.append([InlineKeyboardButton(
+                text=f"{icon} {t['name']} — ${t['price_usd']:.0f}",
+                callback_data=f"tariff_info_{t['id']}"
+            )])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")])
+        await edit_message(
+            callback,
+            "📦 <b>Тарифные планы</b>\n\n" + "\n\n".join(lines) +
+            "\n\n<i>Выберите тариф, чтобы перейти к оплате.</i>",
+            InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+
+    @dp.callback_query(F.data.startswith('tariff_info_'))
+    async def tariff_info_callback(callback: CallbackQuery):
+        tariff_id = int(callback.data.split('_')[2])
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await callback.answer("❌ Тариф не найден", show_alert=True)
+            return
+        price = float(t['price_usd'])
+        icon = TARIFF_ICONS.get(t.get('code', ''), '📦')
+        period = "1 год" if (t.get('duration_days') or 0) >= 365 else f"{t.get('duration_days')} дней"
+
+        text = (
+            f"{icon} <b>{t['name']}</b>\n\n"
+            f"{t.get('description') or ''}\n\n"
+            f"• <b>Цена:</b> ${price:.2f}\n"
+            f"• <b>Период:</b> {period}\n"
+            f"• <b>Аккаунтов:</b> {t.get('max_accounts', 1)}\n"
+            f"• <b>AI-комментариев в сутки:</b> {t.get('ai_comments_per_day', 0)}\n\n"
+            f"<b>Выберите способ оплаты:</b>"
+        )
+        rows = []
+        if price > 0:
+            rows.append([InlineKeyboardButton(text=f"💎 CryptoBot — ${price:.2f} USDT",
+                                              callback_data=f"buy_tariff_{tariff_id}")])
+            if STARS_ENABLED:
+                rows.append([InlineKeyboardButton(text=f"⭐ Telegram Stars — {_usd_to_stars(price)} ⭐",
+                                                  callback_data=f"buy_stars_{tariff_id}")])
+        else:
+            rows.append([InlineKeyboardButton(text="🎁 Активировать бесплатно",
+                                              callback_data=f"activate_trial_{tariff_id}")])
+        rows.append([InlineKeyboardButton(text="💡 Как пополнить", callback_data="howto_pay")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_tariffs")])
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('activate_trial_'))
+    async def activate_trial_callback(callback: CallbackQuery):
+        tariff_id = int(callback.data.split('_')[2])
+        user_id = callback.from_user.id
+        t = db.get_tariff(tariff_id)
+        if not t or float(t['price_usd']) > 0:
+            await callback.answer("❌ Недоступно", show_alert=True)
+            return
+        ent = db.get_user_entitlements(user_id)
+        if ent.get('tariff_code'):
+            await callback.answer("🎁 Пробный период уже активировался ранее.", show_alert=True)
+            return
+        db.add_subscription_days(user_id, int(t['duration_days']))
+        db.set_user_tariff(user_id, t.get('code') or 'trial')
+        await callback.answer("🎉 Пробный доступ активирован!", show_alert=True)
+        await render_subscription(callback, user_id)
+
+    @dp.callback_query(F.data == "show_addons")
+    async def show_addons_callback(callback: CallbackQuery):
+        text = (
+            "➕ <b>Дополнительные пакеты</b>\n\n"
+            f"🔹 <b>Слот аккаунта</b> — ${db.ADDON_ACCOUNT_SLOT_USD:.0f}/мес\n"
+            "   +1 аккаунт сверх лимита тарифа\n\n"
+            f"🔹 <b>AI-пакет</b> — ${db.ADDON_AI_PACK_USD:.0f}\n"
+            f"   +{db.ADDON_AI_PACK_SIZE} комментариев в сутки на 30 дней\n\n"
+            f"🔥 <b>Прогрев аккаунта</b> — ${db.ADDON_WARMUP_USD:.0f} за аккаунт\n"
+            "   Автоматический warmup новой сессии: имитация живой активности,\n"
+            "   постепенный выход на рабочую нагрузку. Снижает риск блокировки.\n\n"
+            "<i>Для покупки выберите пакет — оплата через CryptoBot или Stars.</i>"
+        )
+        rows = [
+            [InlineKeyboardButton(text=f"🔹 +1 слот аккаунта — ${db.ADDON_ACCOUNT_SLOT_USD:.0f}",
+                                  callback_data="addon_slot")],
+            [InlineKeyboardButton(text=f"🔹 AI-пакет {db.ADDON_AI_PACK_SIZE} — ${db.ADDON_AI_PACK_USD:.0f}",
+                                  callback_data="addon_ai")],
+            [InlineKeyboardButton(text=f"🔥 Прогрев аккаунта — ${db.ADDON_WARMUP_USD:.0f}",
+                                  callback_data="addon_warmup")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")]
+        ]
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('addon_'))
+    async def addon_callback(callback: CallbackQuery):
+        kind = callback.data.split('_', 1)[1]
+        if kind == 'warmup':
+            await callback.answer(
+                "🔥 Прогрев аккаунтов скоро будет доступен. "
+                f"Напишите в поддержку {SUPPORT_CONTACT} для ручного подключения.",
+                show_alert=True
+            )
+            return
+        await callback.answer(
+            f"Для покупки пакета напишите в поддержку {SUPPORT_CONTACT}. "
+            "Автооплата пакетов появится в ближайшем обновлении.",
+            show_alert=True
+        )
+
+    @dp.callback_query(F.data == "howto_pay")
+    async def howto_pay_callback(callback: CallbackQuery):
+        text = (
+            "💡 <b>Как оплатить подписку</b>\n\n"
+            "<b>Способ 1. Telegram Stars</b> ⭐ <i>(быстро, прямо в Telegram)</i>\n"
+            "1. Выберите тариф и нажмите «⭐ Telegram Stars».\n"
+            "2. Подтвердите оплату во всплывающем окне Telegram.\n"
+            "3. Подписка активируется <b>мгновенно</b>.\n"
+            "Звёзды пополняются в Telegram: <b>Настройки → Мои звёзды → Пополнить</b> "
+            "(картой или через Apple/Google Pay).\n\n"
+            "<b>Способ 2. Криптовалюта через @CryptoBot</b> 💎\n"
+            "1. Откройте @CryptoBot и пополните баланс USDT:\n"
+            "   • «Кошелёк» → «Пополнить» → выберите USDT;\n"
+            "   • переведите средства с биржи (Binance, Bybit, OKX) или другого кошелька;\n"
+            "   • сеть TRC-20 обычно дешевле по комиссии.\n"
+            "2. Вернитесь сюда, выберите тариф и нажмите «💎 CryptoBot».\n"
+            "3. Оплатите счёт и нажмите «Проверить оплату».\n\n"
+            "<b>Способ 3. Промокод</b> 🎁\n"
+            "Если у вас есть промокод — нажмите «🎁 Ввести промокод».\n\n"
+            f"❓ Возникли сложности? Напишите в поддержку: {SUPPORT_CONTACT}"
+        )
+        rows = [[InlineKeyboardButton(text="📦 К тарифам", callback_data="show_tariffs")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")]]
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('buy_stars_'))
+    async def buy_stars_callback(callback: CallbackQuery):
+        """Оплата через Telegram Stars (XTR) — нативный инвойс Telegram."""
+        if not STARS_ENABLED:
+            await callback.answer("⭐ Оплата звёздами отключена", show_alert=True)
+            return
+        tariff_id = int(callback.data.split('_')[2])
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await callback.answer("❌ Тариф не найден", show_alert=True)
+            return
+        stars = _usd_to_stars(float(t['price_usd']))
+        from aiogram.types import LabeledPrice
+        try:
+            await bot.send_invoice(
+                chat_id=callback.from_user.id,
+                title=f"Подписка {t['name']}",
+                description=(
+                    f"{t.get('description') or 'Доступ к PostDrive'}. "
+                    f"Аккаунтов: {t.get('max_accounts', 1)}, AI/сутки: {t.get('ai_comments_per_day', 0)}."
+                ),
+                payload=f"tariff:{tariff_id}",
+                currency="XTR",                       # Telegram Stars
+                prices=[LabeledPrice(label=t['name'], amount=stars)],
+                provider_token="",                    # для XTR токен не нужен
+                start_parameter="postdrive-sub"
+            )
+            await callback.answer("⭐ Счёт отправлен")
+        except Exception as e:
+            logger.error(f"Stars invoice failed: {e}")
+            await callback.answer(f"❌ Не удалось создать счёт: {str(e)[:150]}", show_alert=True)
+
+    @dp.pre_checkout_query()
+    async def stars_pre_checkout(pre_checkout_query):
+        """Telegram требует ответить на pre_checkout в течение 10 секунд."""
+        try:
+            await pre_checkout_query.answer(ok=True)
+        except Exception as e:
+            logger.error(f"pre_checkout failed: {e}")
+
+    @dp.message(F.successful_payment)
+    async def stars_successful_payment(message: Message):
+        """Звёзды оплачены — начисляем подписку и партнёрскую комиссию."""
+        sp = message.successful_payment
+        user_id = message.from_user.id
+        payload = sp.invoice_payload or ''
+        if not payload.startswith('tariff:'):
+            return
+        try:
+            tariff_id = int(payload.split(':')[1])
+        except (IndexError, ValueError):
+            return
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await message.answer("⚠️ Платёж получен, но тариф не найден. Напишите в поддержку.")
+            return
+
+        db.add_subscription_days(user_id, int(t['duration_days']))
+        if t.get('code'):
+            db.set_user_tariff(user_id, t['code'])
+
+        # Партнёрская комиссия: 30% с первого платежа
+        try:
+            partner = db.get_partner_by_referral_user(user_id)
+            if partner:
+                commission = float(t['price_usd']) * 0.30
+                db.add_partner_earning(partner['user_id'], commission,
+                                       f"Комиссия 30% (Stars) от реферала {user_id}")
+                await bot.send_message(
+                    partner['user_id'],
+                    f"💰 <b>Партнёрское вознаграждение!</b>\n\nНачислено: <b>${commission:.2f}</b>"
+                )
+        except Exception as e:
+            logger.error(f"partner commission (stars) failed: {e}")
+
+        user = db.get_user(user_id)
+        await message.answer(
+            f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+            f"Тариф: <b>{t['name']}</b>\n"
+            f"Списано: <b>{sp.total_amount} ⭐</b>\n"
+            f"Подписка активна до: <b>{format_date(user.get('subscription_until', 0))}</b>",
+            reply_markup=main_menu_keyboard(user_id, admin_id=ADMIN)
+        )
 
     @dp.callback_query(F.data == "enter_promo")
     async def enter_promo_callback(callback: CallbackQuery, state: FSMContext):
@@ -1457,6 +1782,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not db.is_user_subscribed(user_id, ADMIN):
             await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
             return
+        allowed, reason, limits = db.can_add_account(user_id, ADMIN)
+        if not allowed:
+            await callback.answer(
+                f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
+                show_alert=True
+            )
+            return
         await state.set_state(AddAccountStates.WAITING_PROXY)
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="➡️ Пропустить (без прокси)", callback_data="skip_proxy")],
@@ -1535,6 +1867,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1552,6 +1889,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Неверный пароль: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1574,6 +1916,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or "User"
         phone = info.get('phone', '')
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1630,6 +1977,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                         await state.clear()
                         return
                     acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
+                    _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+                    if not _allowed:
+                        await status_msg.edit_text(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+                        await state.clear()
+                        return
                     db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
                     await state.clear()
                     await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен через QR!")
@@ -1662,6 +2014,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подложен через QR!")
@@ -1695,6 +2052,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
             await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            return
+        allowed, reason, limits = db.can_add_account(user_id, ADMIN)
+        if not allowed:
+            await callback.answer(
+                f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
+                show_alert=True
+            )
             return
         await state.set_state(AddAccountStates.WAITING_PROXY)
         markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -1774,6 +2138,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1791,6 +2160,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Неверный пароль: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1813,6 +2187,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or "User"
         phone = info.get('phone', '')
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -2329,6 +2708,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         ])
         await edit_message(callback, text, markup)
 
+    NC_PROMPT_HELP = (
+        "Опишите <b>тематику и что должен сделать комментарий</b>. Это не текст комментария, "
+        "а указание для нейросети — она учтёт его как требование и напишет живой текст по посту.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <code>Тематика: крипта. Дополнительно призыв глянуть профиль или био!</code>\n"
+        "• <code>Пиши по теме поста, в конце ненавязчиво позови в личку</code>\n"
+        "• <code>Коротко согласись с автором и намекни, что подробности у меня в профиле</code>\n"
+        "• <code>Задай уточняющий вопрос по теме поста</code>\n\n"
+        "💡 Можно добавлять любые свои указания — они попадут в блок требований к нейросети."
+    )
+
     @dp.callback_query(F.data.startswith('nc_mode_prompt_'))
     async def nc_mode_prompt_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[3])
@@ -2336,25 +2726,88 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.set_state(NeuroCommentStates.WAITING_PROMPT)
         nc = db.get_neurocomment_settings(account_id)
         current = nc.get('prompt', '') if nc else ''
+        buttons = []
+        if current:
+            buttons.append([InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_prompt")])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"nc_acc_{account_id}")])
         await edit_message(callback,
             f"✏️ <b>Режим: По промту</b>\n\n"
-            f"Текущий промт: {current[:100] or 'Не задан'}\n\n"
-            f"Введите промт для генерации комментария:",
-            reply_markup=cancel_inline_keyboard()
+            f"<b>Текущий промт:</b>\n<code>{(current[:300] or 'Не задан')}</code>\n\n"
+            f"{NC_PROMPT_HELP}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
 
     @dp.message(NeuroCommentStates.WAITING_PROMPT)
     async def process_nc_prompt(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('nc_account_id')
-        prompt = message.text.strip()
+        prompt = (message.text or '').strip()
+        if not prompt:
+            await message.answer("❌ Промт не может быть пустым!")
+            return
         nc = db.get_neurocomment_settings(account_id)
         if not nc:
             db.create_neurocomment_settings(account_id, message.from_user.id, mode='prompt', prompt=prompt)
         else:
             db.update_neurocomment_settings(account_id, mode='prompt', prompt=prompt)
         await state.clear()
-        await message.answer("✅ Промт для нейрокомментинга сохранён!", reply_markup=main_menu_keyboard(message.from_user.id))
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_prompt")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data=f"nc_acc_{account_id}")]
+        ])
+        await message.answer(
+            "✅ Промт сохранён!\n\nНажмите «Тест генерации», чтобы проверить, "
+            "как нейросеть выполнит ваши указания.",
+            reply_markup=markup
+        )
+
+    @dp.callback_query(F.data.startswith('nctest_'))
+    async def nc_test_generation_callback(callback: CallbackQuery):
+        """Прогоняет промт через AI на демо-посте, чтобы пользователь увидел результат до запуска."""
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        which = parts[2] if len(parts) > 2 else 'prompt'
+        nc = db.get_neurocomment_settings(account_id)
+        if not nc:
+            await callback.answer("❌ Сначала задайте промт!", show_alert=True)
+            return
+        instruction = nc.get('post_prompt' if which == 'post_prompt' else 'prompt', '') or ''
+        if not instruction.strip():
+            await callback.answer("❌ Промт пуст!", show_alert=True)
+            return
+
+        await callback.answer("⏳ Генерирую...")
+        demo_post = (
+            "Сегодня рынок снова удивил: основные активы прибавили около 5% за сутки. "
+            "Аналитики спорят, коррекция это или начало нового тренда."
+        )
+        try:
+            result = await account_manager.generate_ai_comment(instruction, demo_post)
+        except Exception as e:
+            result = ""
+            logger.error(f"nc test generation failed: {e}")
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"nctest_{account_id}_{which}")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data=f"nc_acc_{account_id}")]
+        ])
+        if result:
+            text = (
+                f"🧪 <b>Тест генерации</b>\n\n"
+                f"<b>Ваш промт:</b>\n<code>{instruction[:200]}</code>\n\n"
+                f"<b>Демо-пост:</b>\n<i>{demo_post[:150]}</i>\n\n"
+                f"<b>Результат:</b>\n{result}"
+            )
+        else:
+            text = (
+                f"⚠️ <b>Не удалось сгенерировать комментарий</b>\n\n"
+                f"Ни один AI-провайдер не ответил. Проверьте:\n"
+                f"• указан ли <code>GROQ_API_KEY</code> в config.ini (бесплатно, самый надёжный вариант);\n"
+                f"• доступен ли интернет с сервера;\n"
+                f"• бесплатный g4f часто лежит — на него нельзя полагаться в проде.\n\n"
+                f"Подробности — в <code>bot_debug.log</code>."
+            )
+        await edit_message(callback, text, markup)
 
     @dp.callback_query(F.data.startswith('nc_mode_custom_'))
     async def nc_mode_custom_callback(callback: CallbackQuery, state: FSMContext):
@@ -2395,11 +2848,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.set_state(NeuroCommentStates.WAITING_POST_PROMPT)
         nc = db.get_neurocomment_settings(account_id)
         current = nc.get('post_prompt', '') if nc else ''
+        buttons = []
+        if current:
+            buttons.append([InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_post_prompt")])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"nc_acc_{account_id}")])
         await edit_message(callback,
             f"📰 <b>Режим: Промт нового поста</b>\n\n"
-            f"Текущий промт: {current[:100] or 'Не задан'}\n\n"
-            f"Введите промт для генерации комментария на основе текста нового поста:",
-            reply_markup=cancel_inline_keyboard()
+            f"<b>Текущий промт:</b>\n<code>{(current[:300] or 'Не задан')}</code>\n\n"
+            f"{NC_PROMPT_HELP}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
 
     @dp.message(NeuroCommentStates.WAITING_POST_PROMPT)

@@ -36,13 +36,52 @@ async def _safe_handle_updates(self, updates):
         raise
 
 Client.handle_updates = _safe_handle_updates
-AI_MODEL = config.get('AI', 'MODEL', fallback='llama-3.1-70b-versatile').strip()
+AI_MODEL = config.get('AI', 'MODEL', fallback='openai/gpt-oss-20b').strip()
+
+# Актуальные модели Groq (проверено по console.groq.com/docs/deprecations).
+# ВАЖНО: llama-3.1-70b-versatile / llama-3.3-70b-versatile / llama-3.1-8b-instant /
+# mixtral-8x7b-32768 / gemma2-9b-it ОТКЛЮЧЕНЫ Groq и возвращают model_decommissioned.
+GROQ_MODELS = [
+    'openai/gpt-oss-20b',      # быстрый и дешёвый, дефолт для коротких комментариев
+    'openai/gpt-oss-120b',     # умнее, чуть медленнее
+    'qwen/qwen3.6-27b',
+]
+# Карта автозамены снятых с обслуживания моделей
+GROQ_DECOMMISSIONED = {
+    'llama-3.1-70b-versatile': 'openai/gpt-oss-120b',
+    'llama-3.3-70b-versatile': 'openai/gpt-oss-120b',
+    'llama-3.1-8b-instant': 'openai/gpt-oss-20b',
+    'mixtral-8x7b-32768': 'openai/gpt-oss-120b',
+    'gemma2-9b-it': 'openai/gpt-oss-20b',
+    'qwen/qwen3-32b': 'openai/gpt-oss-120b',
+    'meta-llama/llama-4-scout-17b-16e-instruct': 'openai/gpt-oss-120b',
+}
 OPENAI_API_KEY = config.get('AI', 'OPENAI_API_KEY', fallback='').strip()
 ANTHROPIC_API_KEY = config.get('AI', 'ANTHROPIC_API_KEY', fallback='').strip()
 GEMINI_API_KEY = config.get('AI', 'GEMINI_API_KEY', fallback='').strip()
 G4F_API_KEY = config.get('AI', 'G4F_API_KEY', fallback='').strip()
 GROQ_API_KEY = config.get('AI', 'GROQ_API_KEY', fallback='').strip()
 OPENROUTER_API_KEY = config.get('AI', 'OPENROUTER_API_KEY', fallback='').strip()
+
+# ── g4f (бесплатный фолбэк без ключей) ───────────────────────────
+G4F_ENABLED = config.get('AI', 'G4F_ENABLED', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
+G4F_TIMEOUT = int(config.get('AI', 'G4F_TIMEOUT', fallback='45'))
+# Явные провайдеры перебираются первыми: они не требуют манифеста с g4f.dev,
+# из-за недоступности которого g4f 8.x падает целиком.
+G4F_PROVIDERS = [p.strip() for p in config.get(
+    'AI', 'G4F_PROVIDERS',
+    fallback='PollinationsAI,Blackbox,DDG,ChatGptEs,Free2GPT,Liaobots,Yqcloud'
+).split(',') if p.strip()]
+G4F_MODELS = [m.strip() for m in config.get(
+    'AI', 'G4F_MODELS',
+    fallback='gpt-4o-mini,gpt-4o,llama-3.3-70b,deepseek-v3'
+).split(',') if m.strip()]
+
+
+class _ModelGoneError(RuntimeError):
+    """Модель снята с обслуживания провайдером (нужно взять следующую из списка)."""
+    pass
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1069,163 +1108,264 @@ class AccountSessionManager:
         except Exception as e:
             return False, str(e)
 
-    async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
-        logging.info(f"🤖 Generating AI comment | model={AI_MODEL} | prompt_len={len(prompt)} | post_len={len(post_text)}")
-        
-        messages = []
-        if post_text:
-            messages.append({"role": "system", "content": f"Сгенерируй короткий осмысленный комментарий к посту. Промт: {prompt}"})
-            messages.append({"role": "user", "content": post_text[:500]})
+    # Шаблон системного промта. {instruction} — то, что пользователь пишет в настройках
+    # (например: "дополнительно призыв глянуть профиль или био").
+    AI_SYSTEM_TEMPLATE = (
+        "Ты — живой человек, читающий Telegram-канал, а не бот. "
+        "Напиши ОДИН короткий комментарий (1-2 предложения) к посту ниже на языке поста.\n"
+        "Правила:\n"
+        "- пиши естественно и по теме поста, как обычный подписчик;\n"
+        "- без приветствий, без кавычек, без хештегов, без markdown;\n"
+        "- не пересказывай пост и не повторяй его дословно;\n"
+        "- не упоминай, что ты ИИ, и не объясняй свой ответ;\n"
+        "- в ответе только текст комментария.\n"
+        "{instruction_block}"
+    )
+
+    @staticmethod
+    def build_comment_messages(instruction: str, post_text: str = "") -> list:
+        """Собирает messages для LLM.
+
+        instruction — пожелание пользователя (тематика + доп. указания, например
+        призыв заглянуть в профиль). Оно идёт ОТДЕЛЬНЫМ блоком требований, а не
+        просто подклеивается к тексту, поэтому модель выполняет его как инструкцию,
+        а не считает частью поста.
+        """
+        instruction = (instruction or '').strip()
+        if instruction:
+            instruction_block = (
+                "\nДополнительные требования от заказчика (обязательно учти их в комментарии):\n"
+                f"{instruction}\n"
+            )
         else:
-            messages.append({"role": "user", "content": prompt})
+            instruction_block = ""
 
-        # 1. Groq API (бесплатный, быстрый, лимиты 30k tok/min)
-        if GROQ_API_KEY and not GROQ_API_KEY.startswith('ЗАМЕНИТЕ') and not GROQ_API_KEY.startswith('REPLACE'):
-            try:
-                import json as json_mod
-                
-                # Актуальные модели Groq на 2026-09
-                groq_models = ['llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it']
-                groq_model = AI_MODEL if AI_MODEL in groq_models else 'llama-3.1-70b-versatile'
-                
-                def _groq_request_urllib():
-                    import urllib.request
-                    req_data = {"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
-                    req = urllib.request.Request(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        data=json_mod.dumps(req_data).encode('utf-8'),
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                        method='POST'
-                    )
-                    with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        body = resp.read().decode('utf-8')
-                        if resp.status != 200:
-                            logging.error(f"❌ Groq HTTP {resp.status}: {body[:300]}")
-                            return None
-                        resp_data = json_mod.loads(body)
-                        return resp_data["choices"][0]["message"]["content"].strip()
-                
+        system = AccountSessionManager.AI_SYSTEM_TEMPLATE.format(instruction_block=instruction_block)
+        messages = [{"role": "system", "content": system}]
+        if post_text:
+            messages.append({"role": "user", "content": f"Текст поста:\n{post_text[:1500]}"})
+        else:
+            messages.append({"role": "user", "content": "Напиши комментарий по требованиям выше."})
+        return messages
+
+    @staticmethod
+    def _clean_ai_output(text: str) -> str:
+        """Убирает типовой мусор LLM: кавычки-обёртки, префиксы, markdown, лишние строки."""
+        if not text:
+            return ""
+        result = text.strip()
+        # срезаем reasoning-блоки некоторых моделей
+        if '</think>' in result:
+            result = result.split('</think>')[-1].strip()
+        # первая непустая строка-абзац (модель иногда даёт варианты списком)
+        for prefix in ('Комментарий:', 'Ответ:', 'Comment:', 'Answer:'):
+            if result.lower().startswith(prefix.lower()):
+                result = result[len(prefix):].strip()
+        if len(result) > 1 and result[0] in '"\u00ab\u201c\'' and result[-1] in '"\u00bb\u201d\'':
+            result = result[1:-1].strip()
+        result = result.replace('**', '').replace('__', '')
+        return result.strip()
+
+    async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
+        """Генерирует комментарий. Перебирает провайдеров, пока кто-то не ответит."""
+        messages = self.build_comment_messages(prompt, post_text)
+        logging.info(f"🤖 AI comment | model={AI_MODEL} | instruction_len={len(prompt or '')} | post_len={len(post_text)}")
+
+        errors = []
+
+        # ── 1. Groq (быстрый, щедрый бесплатный лимит) ───────────────
+        if GROQ_API_KEY and not GROQ_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
+            # Подменяем снятые с обслуживания модели на актуальные
+            requested = GROQ_DECOMMISSIONED.get(AI_MODEL, AI_MODEL)
+            if AI_MODEL in GROQ_DECOMMISSIONED:
+                logging.warning(
+                    f"⚠️ Модель Groq '{AI_MODEL}' снята с обслуживания, использую '{requested}'. "
+                    f"Обновите MODEL в config.ini."
+                )
+            candidates = [requested] + [m for m in GROQ_MODELS if m != requested]
+            for groq_model in candidates[:3]:
                 try:
-                    import httpx
-                    # httpx предпочтительнее (async нативно)
-                    async def _groq_request_httpx():
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            response = await client.post(
-                                "https://api.groq.com/openai/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                                json={"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
-                            )
-                            if response.status_code != 200:
-                                logging.error(f"❌ Groq HTTP {response.status_code}: {response.text[:300]}")
-                                return None
-                            response.raise_for_status()
-                            data = response.json()
-                            return data["choices"][0]["message"]["content"].strip()
-                    
-                    result = await _groq_request_httpx()
-                except ImportError:
-                    # httpx недоступен, используем urllib в потоке
-                    result = await asyncio.to_thread(_groq_request_urllib)
-                
-                if result:
-                    logging.info(f"🤖 Generated comment via Groq ({len(result)} chars): {result[:100]}...")
-                    return result
-            except Exception as e:
-                logging.error(f"❌ Groq API error: {type(e).__name__}: {e}")
+                    result = await self._groq_chat(groq_model, messages)
+                    if result:
+                        cleaned = self._clean_ai_output(result)
+                        if cleaned:
+                            logging.info(f"🤖 Groq:{groq_model} → {cleaned[:80]}")
+                            return cleaned
+                except _ModelGoneError as e:
+                    logging.warning(f"⚠️ Groq модель {groq_model} недоступна: {e}; пробую следующую")
+                    errors.append(f"groq:{groq_model}")
+                    continue
+                except Exception as e:
+                    logging.error(f"❌ Groq {groq_model}: {type(e).__name__}: {str(e)[:200]}")
+                    errors.append(f"groq:{groq_model}")
+                    break
 
-        # 2. Google Gemini API (бесплатный, 1500 RPM)
-        if GEMINI_API_KEY:
+        # ── 2. Google Gemini ─────────────────────────────────────────
+        if GEMINI_API_KEY and not GEMINI_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=GEMINI_API_KEY)
-                model_name = AI_MODEL if 'gemini' in AI_MODEL.lower() else 'gemini-1.5-flash'
+                model_name = AI_MODEL if 'gemini' in AI_MODEL.lower() else 'gemini-2.0-flash'
                 model = genai.GenerativeModel(model_name)
                 full_prompt = "\n\n".join([m['content'] for m in messages])
                 response = await asyncio.to_thread(
                     model.generate_content,
                     full_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=150,
-                        temperature=0.7
-                    )
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=200, temperature=0.8)
                 )
-                result = response.text.strip()
-                logging.info(f"🤖 Generated comment via Gemini ({len(result)} chars): {result[:100]}...")
-                return result
+                cleaned = self._clean_ai_output(response.text)
+                if cleaned:
+                    logging.info(f"🤖 Gemini → {cleaned[:80]}")
+                    return cleaned
             except Exception as e:
-                logging.error(f"❌ Gemini API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ Gemini: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('gemini')
 
-        # 3. OpenRouter API (есть бесплатные модели)
-        if OPENROUTER_API_KEY:
+        # ── 3. OpenRouter ────────────────────────────────────────────
+        if OPENROUTER_API_KEY and not OPENROUTER_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
                 import httpx
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    response = await http_client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={
                             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                             "Content-Type": "application/json",
                             "HTTP-Referer": "https://t.me/poster_bot",
-                            "X-Title": "Poster Bot"
+                            "X-Title": "PostDrive"
                         },
-                        json={
-                            "model": AI_MODEL,
-                            "messages": messages,
-                            "max_tokens": 150,
-                            "temperature": 0.7
-                        }
+                        json={"model": AI_MODEL, "messages": messages, "max_tokens": 200, "temperature": 0.8}
                     )
                     response.raise_for_status()
                     data = response.json()
-                    result = data["choices"][0]["message"]["content"].strip()
-                    logging.info(f"🤖 Generated comment via OpenRouter ({len(result)} chars): {result[:100]}...")
-                    return result
+                    cleaned = self._clean_ai_output(data["choices"][0]["message"]["content"])
+                    if cleaned:
+                        logging.info(f"🤖 OpenRouter → {cleaned[:80]}")
+                        return cleaned
             except Exception as e:
-                logging.error(f"❌ OpenRouter API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ OpenRouter: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('openrouter')
 
-        # 4. OpenAI API (если есть ключ)
-        if OPENAI_API_KEY and AI_MODEL.startswith('gpt'):
+        # ── 4. OpenAI ────────────────────────────────────────────────
+        if OPENAI_API_KEY and not OPENAI_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
-                from openai import OpenAI
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                response = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    model=AI_MODEL,
-                    messages=messages,
-                    max_tokens=150,
-                    temperature=0.7
+                from openai import AsyncOpenAI
+                oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
+                model_name = AI_MODEL if AI_MODEL.startswith('gpt') else 'gpt-4o-mini'
+                response = await oai.chat.completions.create(
+                    model=model_name, messages=messages, max_tokens=200, temperature=0.8
                 )
-                result = response.choices[0].message.content.strip()
-                logging.info(f"🤖 Generated comment via OpenAI ({len(result)} chars): {result[:100]}...")
-                return result
+                cleaned = self._clean_ai_output(response.choices[0].message.content)
+                if cleaned:
+                    logging.info(f"🤖 OpenAI → {cleaned[:80]}")
+                    return cleaned
             except Exception as e:
-                logging.error(f"❌ OpenAI API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ OpenAI: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('openai')
 
-        # 5. g4f fallback (бесплатно, но может быть нестабильным)
+        # ── 5. g4f (бесплатно, без ключей, но нестабильно) ───────────
+        if G4F_ENABLED:
+            cleaned = await self._g4f_chat(messages)
+            if cleaned:
+                return cleaned
+            errors.append('g4f')
+
+        logging.warning(
+            f"⚠️ Все AI-провайдеры недоступны ({', '.join(errors) or 'нет провайдеров'}). "
+            f"Добавьте GROQ_API_KEY в config.ini — это бесплатно и надёжнее g4f."
+        )
+        return ""
+
+    async def _groq_chat(self, model: str, messages: list) -> Optional[str]:
+        """Один запрос к Groq. Бросает _ModelGoneError, если модель снята с обслуживания."""
+        import json as json_mod
+        payload = {"model": model, "messages": messages, "max_tokens": 200, "temperature": 0.8}
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
         try:
-            from g4f.client import Client
-            client = Client(api_key=G4F_API_KEY) if G4F_API_KEY and not G4F_API_KEY.startswith('ЗАМЕНИТЕ') else Client()
-            logging.info(f"🤖 Trying g4f (free providers)")
-            # Новые модели g4f: gpt-4.1, deepseek-v3, gpt-4o
-            fallback_models = ['gpt-4.1', 'deepseek-v3', 'gpt-4o', 'gpt-4o-mini', 'llama-3.1-70b', 'qwen-2.5-72b']
-            for fallback_model in fallback_models:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                resp = await http_client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    return resp.json()["choices"][0]["message"]["content"]
+                body = resp.text[:300]
+                if resp.status_code in (400, 404) and ('decommission' in body or 'does not exist' in body):
+                    raise _ModelGoneError(body)
+                if resp.status_code == 429:
+                    raise RuntimeError(f"rate limit: {body}")
+                raise RuntimeError(f"HTTP {resp.status_code}: {body}")
+        except ImportError:
+            def _urllib_request():
+                import urllib.request, urllib.error
+                req = urllib.request.Request(
+                    url, data=json_mod.dumps(payload).encode('utf-8'), headers=headers, method='POST'
+                )
                 try:
-                    logging.info(f"🔄 Trying g4f model: {fallback_model}")
-                    response = await asyncio.to_thread(
-                        client.chat.completions.create,
-                        model=fallback_model,
-                        messages=messages,
-                        max_tokens=150
-                    )
-                    result = response.choices[0].message.content.strip()
-                    logging.info(f"🤖 Generated comment via g4f:{fallback_model} ({len(result)} chars): {result[:100]}...")
-                    return result
-                except Exception as fallback_e:
-                    logging.warning(f"⚠️ g4f {fallback_model} failed: {fallback_e}")
-        except Exception as e:
-            logging.error(f"❌ g4f failed: {type(e).__name__}: {e}")
+                    with urllib.request.urlopen(req, timeout=30.0) as r:
+                        return json_mod.loads(r.read().decode('utf-8'))["choices"][0]["message"]["content"]
+                except urllib.error.HTTPError as he:
+                    body = he.read().decode('utf-8', 'ignore')[:300]
+                    if he.code in (400, 404) and ('decommission' in body or 'does not exist' in body):
+                        raise _ModelGoneError(body)
+                    raise RuntimeError(f"HTTP {he.code}: {body}")
+            return await asyncio.to_thread(_urllib_request)
 
-        logging.warning(f"⚠️ All AI providers failed or not configured. Add GROQ_API_KEY or GEMINI_API_KEY to config.ini")
+    async def _g4f_chat(self, messages: list) -> str:
+        """g4f-фолбэк.
+
+        В g4f 8.x клиент при первом вызове тянет список провайдеров с g4f.dev.
+        Если сети до него нет (или домен лежит), падает вся генерация — поэтому
+        работаем через прямой перебор провайдеров и жёсткий таймаут.
+        """
+        try:
+            import g4f
+            from g4f.client import Client as G4FClient
+        except ImportError:
+            logging.warning("⚠️ g4f не установлен (pip install -U g4f)")
+            return ""
+
+        try:
+            g4f.debug.logging = False
+            g4f.check_version = False   # не ходить в сеть за версией
+        except Exception:
+            pass
+
+        def _sync_call(provider, model):
+            kwargs = {"model": model, "messages": messages, "max_tokens": 200}
+            client = G4FClient(provider=provider) if provider else G4FClient()
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content
+
+        attempts = []
+        # Сначала явные провайдеры (не требуют манифеста с g4f.dev), потом авто-режим
+        for prov_name in G4F_PROVIDERS:
+            try:
+                import g4f.Provider as G4FProviders
+                provider = getattr(G4FProviders, prov_name, None)
+            except Exception:
+                provider = None
+            if provider is None:
+                continue
+            attempts.append((provider, prov_name))
+        attempts.append((None, 'auto'))
+
+        for provider, label in attempts:
+            for model in G4F_MODELS:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(_sync_call, provider, model),
+                        timeout=G4F_TIMEOUT
+                    )
+                    cleaned = self._clean_ai_output(result)
+                    if cleaned:
+                        logging.info(f"🤖 g4f:{label}/{model} → {cleaned[:80]}")
+                        return cleaned
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ g4f {label}/{model}: таймаут {G4F_TIMEOUT}s")
+                except Exception as e:
+                    logging.warning(f"⚠️ g4f {label}/{model}: {type(e).__name__}: {str(e)[:120]}")
+        logging.error("❌ g4f: все провайдеры недоступны")
         return ""
 
     async def start_neurocomment(self, account_id: int, bot, user_id: int):
@@ -1450,6 +1590,21 @@ class AccountSessionManager:
                             logging.info(f"💬 [{acc_name}] Found new post in {channel}: {post_text[:100]}...")
                             channel_posts_found += 1
                             
+                            # ── Проверка дневной квоты AI (только для AI-режимов) ──
+                            if mode in ('prompt', 'post_prompt'):
+                                ok_quota, used_q, limit_q = db.consume_ai_quota(user_id, amount=1)
+                                if not ok_quota:
+                                    logging.warning(f"🚫 [{acc_name}] AI-квота исчерпана: {used_q}/{limit_q}")
+                                    self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                    if bot and not notifications_hidden:
+                                        await bot.send_message(
+                                            user_id,
+                                            f"🚫 [{acc_name}] Дневной лимит AI-комментариев исчерпан "
+                                            f"({used_q}/{limit_q}).\n\nПовысьте тариф или докупите AI-пакет "
+                                            f"в разделе «💳 Подписка»."
+                                        )
+                                    continue
+
                             comment_text = ""
                             if mode == 'prompt':
                                 logging.debug(f"🧠 [{acc_name}] Generating prompt-based comment for {channel}")

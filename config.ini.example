@@ -1,0 +1,80 @@
+# ── Autoposter Bot Configuration ──────────────────────────────
+# Copy this file to config.ini and fill in your values.
+# Environment variables override config.ini values (recommended for production).
+#
+# Env vars: BOT_TOKEN, BOT_ADMIN, BOT_USERNAME, USER_API_ID, USER_API_HASH,
+#           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, WEBHOOK_DOMAIN, WEBHOOK_PORT,
+#           WEBHOOK_PATH, REDIS_URL
+# Scaling:  MAX_ACTIVE_CLIENTS, MAX_TASKS_PER_USER, MAX_GLOBAL_TASKS, CLIENT_IDLE_TTL
+
+[BOT]
+TOKEN = ВАШ_ТОКЕН_БОТА
+ADMIN = ВАШ_TELEGRAM_ID
+USERNAME = @username_вашего_бота
+DIR = ''
+
+
+MAX_ACTIVE_CLIENTS = 500
+MAX_TASKS_PER_USER = 50
+CLIENT_IDLE_TTL = 1800s
+MAX_GLOBAL_TASKS = 500
+
+
+[USER]
+
+API_ID = ВАШ_API_ID
+API_HASH = ВАШ_API_HASH
+
+[CRYPTOBOT]
+TOKEN = ВАШ_ТОКЕН_КРИПТОБОТА
+TESTNET = False
+
+[WEBHOOK]
+DOMAIN =ВАШ_ДОМЕН
+PORT = 8011
+PATH = /api
+
+[DATABASE]
+; ENGINE: sqlite (по умолчанию) или postgres
+; Переключение на PostgreSQL: ENGINE = postgres и заполнить DSN.
+; Требуется: pip install psycopg2-binary
+ENGINE = sqlite
+PATH = database.db
+DSN = postgresql://postdrive:password@localhost:5432/postdrive
+POOL_SIZE = 12
+
+[AI]
+; Актуальные модели Groq: openai/gpt-oss-20b, openai/gpt-oss-120b, qwen/qwen3.6-27b
+; ВНИМАНИЕ: llama-3.x модели Groq ОТКЛЮЧИЛ 16.08.2026 — не используйте их.
+MODEL = openai/gpt-oss-20b
+OPENAI_API_KEY = 
+ANTHROPIC_API_KEY = 
+GEMINI_API_KEY = 
+G4F_API_KEY = 
+GROQ_API_KEY =
+OPENROUTER_API_KEY =
+
+; ── Бесплатный фолбэк g4f ────────────────────────────────────────
+; g4f работает без ключей, но регулярно недоступен: провайдеры отваливаются,
+; а сам пакет в версии 8.x тянет список провайдеров с g4f.dev.
+; Для продакшена используйте GROQ_API_KEY (бесплатный и стабильный).
+G4F_ENABLED = true
+G4F_TIMEOUT = 45
+G4F_PROVIDERS = PollinationsAI,Blackbox,DDG,ChatGptEs,Free2GPT,Liaobots,Yqcloud
+G4F_MODELS = gpt-4o-mini,gpt-4o,llama-3.3-70b,deepseek-v3
+
+[PAYMENTS]
+; Telegram Stars (нативная оплата в Telegram, без KYC).
+; Курс для пересчёта $ в звёзды; уточняйте актуальный у @BotFather.
+STARS_ENABLED = true
+STARS_PER_USD = 50
+; Мини-апп с тарифами и оплатой (подробнее — documents/MINIAPP.md)
+MINIAPP_ENABLED = false
+MINIAPP_URL =
+
+[LEGAL]
+; Ссылки на полные версии документов (если размещены на сайте).
+; Если пусто — бот покажет встроенные тексты из documents/.
+TERMS_URL =
+PRIVACY_URL =
+SUPPORT = @support
