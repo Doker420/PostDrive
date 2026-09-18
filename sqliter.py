@@ -368,6 +368,8 @@ class DBConnection(object):
         # ── Performance indexes ────────────────────────────────────
         c.execute('CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_account_chats_account_id ON account_chats(account_id)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_account_chats_type ON account_chats(account_id, chat_type)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_account_chats_spam ON account_chats(account_id, spam_enabled)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_parsed_users_account ON parsed_users(account_id, user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_user ON running_tasks(user_id)')
@@ -680,36 +682,94 @@ class DBConnection(object):
         return self.c.rowcount > 0
 
     # ==================== ACCOUNT CHATS (Selective Spam & Settings) ====================
+    UPSERT_CHAT_SQL = (
+        "INSERT INTO account_chats\n    (account_id, chat_id, chat_title, chat_username, chat_type,\n     spam_enabled, additional_text, timeout, synced_at)\nVALUES (?, ?, ?, ?, ?, 1, '', 5, ?)\nON CONFLICT(account_id, chat_id) DO UPDATE SET\n    chat_title = excluded.chat_title,\n    chat_username = excluded.chat_username,\n    chat_type = excluded.chat_type,\n    synced_at = excluded.synced_at"
+    )
+
     def sync_account_chats(self, account_id: int, chat_list: List[Dict[str, Any]]):
-        """Adds or updates chats discovered for an account without resetting custom settings."""
+        """Adds or updates chats discovered for an account without resetting custom settings.
+
+        Один batch-upsert в одной транзакции вместо N отдельных SELECT/UPDATE —
+        критично при тысячах диалогов на аккаунт.
+        """
+        if not chat_list:
+            return
         now = int(time.time())
+        rows = []
         for idx, ch in enumerate(chat_list):
-            chat_id = str(ch.get('id'))
-            title = ch.get('title', '')
-            username = ch.get('username', '')
-            chat_type = ch.get('chat_type', 'unknown')
-            synced_at = now - idx
-            self.c.execute('SELECT id FROM account_chats WHERE account_id = ? AND chat_id = ?', (account_id, chat_id))
-            row = self.c.fetchone()
-            if row:
-                self.c.execute(
-                    'UPDATE account_chats SET chat_title = ?, chat_username = ?, chat_type = ?, synced_at = ? WHERE account_id = ? AND chat_id = ?',
-                    (title, username, chat_type, synced_at, account_id, chat_id)
-                )
-            else:
-                self.c.execute(
-                    'INSERT INTO account_chats (account_id, chat_id, chat_title, chat_username, chat_type, spam_enabled, additional_text, timeout, synced_at) VALUES (?, ?, ?, ?, ?, 1, "", 5, ?)',
-                    (account_id, chat_id, title, username, chat_type, synced_at)
-                )
-        self.conn.commit()
+            rows.append((
+                account_id,
+                str(ch.get('id')),
+                ch.get('title', ''),
+                ch.get('username', ''),
+                ch.get('chat_type', 'unknown'),
+                now - idx,
+            ))
+        try:
+            self.conn.execute('BEGIN')
+            self.conn.executemany(self.UPSERT_CHAT_SQL, rows)
+            self.conn.commit()
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"sync_account_chats failed for account {account_id}: {e}")
+            raise
 
 
-    def get_account_chats(self, account_id: int, spam_only: bool = False) -> List[Dict[str, Any]]:
+    # Типы чатов, пригодные для постинга по чатам (только группы/супергруппы)
+    GROUP_CHAT_TYPES = ('group', 'supergroup')
+
+    def get_account_chats(self, account_id: int, spam_only: bool = False,
+                          chat_types: Optional[Tuple[str, ...]] = None) -> List[Dict[str, Any]]:
+        """Возвращает чаты аккаунта.
+
+        chat_types — кортеж допустимых типов ('group', 'channel', 'private', 'bot').
+        Для постинга/парсинга используйте chat_types=DBConnection.GROUP_CHAT_TYPES.
+        """
+        sql = 'SELECT * FROM account_chats WHERE account_id = ?'
+        params: List[Any] = [account_id]
         if spam_only:
-            self.c.execute('SELECT * FROM account_chats WHERE account_id = ? AND spam_enabled = 1 ORDER BY chat_title ASC', (account_id,))
-        else:
-            self.c.execute('SELECT * FROM account_chats WHERE account_id = ? ORDER BY chat_title ASC', (account_id,))
+            sql += ' AND spam_enabled = 1'
+        if chat_types:
+            sql += ' AND chat_type IN (%s)' % ','.join('?' * len(chat_types))
+            params.extend(chat_types)
+        sql += ' ORDER BY chat_title ASC'
+        self.c.execute(sql, params)
         return self._dict_fetchall()
+
+    def get_account_chats_paginated(self, account_id: int, page: int = 0, per_page: int = 8,
+                                    chat_types: Optional[Tuple[str, ...]] = None,
+                                    spam_only: bool = False) -> Tuple[List[Dict[str, Any]], int]:
+        """Пагинация на уровне SQL — не тянем тысячи строк в память ради одной страницы."""
+        where = 'WHERE account_id = ?'
+        params: List[Any] = [account_id]
+        if spam_only:
+            where += ' AND spam_enabled = 1'
+        if chat_types:
+            where += ' AND chat_type IN (%s)' % ','.join('?' * len(chat_types))
+            params.extend(chat_types)
+        self.c.execute(f'SELECT COUNT(*) FROM account_chats {where}', params)
+        total = self.c.fetchone()[0]
+        offset = max(0, page) * per_page
+        self.c.execute(
+            f'SELECT * FROM account_chats {where} ORDER BY chat_title ASC LIMIT ? OFFSET ?',
+            params + [per_page, offset]
+        )
+        return self._dict_fetchall(), total
+
+    def count_account_chats(self, account_id: int, chat_types: Optional[Tuple[str, ...]] = None,
+                            spam_only: bool = False) -> int:
+        sql = 'SELECT COUNT(*) FROM account_chats WHERE account_id = ?'
+        params: List[Any] = [account_id]
+        if spam_only:
+            sql += ' AND spam_enabled = 1'
+        if chat_types:
+            sql += ' AND chat_type IN (%s)' % ','.join('?' * len(chat_types))
+            params.extend(chat_types)
+        self.c.execute(sql, params)
+        return self.c.fetchone()[0]
 
     def get_account_chat(self, account_id: int, chat_id: str) -> Optional[Dict[str, Any]]:
         self.c.execute('SELECT * FROM account_chats WHERE account_id = ? AND chat_id = ?', (account_id, str(chat_id)))
@@ -747,8 +807,14 @@ class DBConnection(object):
         self.conn.commit()
         return new_state
 
-    def set_all_chats_spam(self, account_id: int, enabled: int):
-        self.c.execute('UPDATE account_chats SET spam_enabled = ? WHERE account_id = ?', (int(enabled), account_id))
+    def set_all_chats_spam(self, account_id: int, enabled: int,
+                           chat_types: Optional[Tuple[str, ...]] = None):
+        sql = 'UPDATE account_chats SET spam_enabled = ? WHERE account_id = ?'
+        params: List[Any] = [int(enabled), account_id]
+        if chat_types:
+            sql += ' AND chat_type IN (%s)' % ','.join('?' * len(chat_types))
+            params.extend(chat_types)
+        self.c.execute(sql, params)
         self.conn.commit()
 
     def update_chat_additional_text(self, account_id: int, chat_id: str, text: str):

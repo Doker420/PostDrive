@@ -1330,16 +1330,25 @@ class AccountSessionManager:
             valid_channels = []
             channel_cache = {}  # ⭐ КЕШ ДЛЯ ОБЪЕКТОВ КАНАЛОВ
             
+            discussion_cache = {}  # channel -> discussion_chat_id
             for channel in target_channels:
                 try:
                     chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
                     logging.info(f"🔍 [{acc_name}] Checking channel: {channel} (chat_id={chat_id})")
+                    # Если аккаунт не в канале — вступаем; также вступаем в чат комментариев
+                    ok_access, discussion_id, access_msg = await self.ensure_channel_access(account_id, channel)
+                    if not ok_access:
+                        logging.warning(f"⚠️ [{acc_name}] {channel}: {access_msg}")
+                        if bot and not notifications_hidden:
+                            await bot.send_message(user_id, f"⚠️ [{acc_name}] {channel}: {access_msg}")
+                        continue
                     chat = await client.get_chat(chat_id)
                     valid_channels.append(channel)
                     channel_cache[channel] = chat  # ⭐ СОХРАНЯЕМ В КЕШ
-                    logging.info(f"✅ [{acc_name}] Channel {channel} is accessible (id={chat.id}, title={getattr(chat, 'title', 'N/A')})")
+                    discussion_cache[channel] = discussion_id
+                    logging.info(f"✅ [{acc_name}] Channel {channel} ok (id={chat.id}, discussion={discussion_id})")
                     if bot and not notifications_hidden:
-                        await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен")
+                        await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен (комментарии: {discussion_id})")
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}")
                     if bot and not notifications_hidden:
@@ -1478,50 +1487,20 @@ class AccountSessionManager:
                             
                             try:
                                 comment_sent = False
-                                discussion_chat_id = None
                                 chat_username = getattr(chat_obj, 'username', None)
-                                
-                                # ⭐ ПОИСК ЧАТА ОБСУЖДЕНИЙ
-                                try:
-                                    # 1. Pyrogram linked_chat property (возвращает Chat объект)
-                                    if hasattr(chat_obj, 'linked_chat') and chat_obj.linked_chat:
-                                        discussion_chat_id = chat_obj.linked_chat.id
-                                        logging.info(f"🔗 [{acc_name}] Found discussion chat via linked_chat: {discussion_chat_id}")
-                                    # 2. Прямые атрибуты
-                                    elif hasattr(chat_obj, 'linked_chat_id') and chat_obj.linked_chat_id:
-                                        discussion_chat_id = chat_obj.linked_chat_id
-                                    elif hasattr(chat_obj, 'discussion_chat_id') and chat_obj.discussion_chat_id:
-                                        discussion_chat_id = chat_obj.discussion_chat_id
-                                    
-                                    # 3. Если не нашли - через GetFullChannel
-                                    if not discussion_chat_id:
-                                        try:
-                                            from pyrogram.raw import functions as raw_functions
-                                            peer = await client.resolve_peer(chat_id)
-                                            channel_full = await client.invoke(
-                                                raw_functions.channels.GetFullChannel(channel=peer)
-                                            )
-                                            if hasattr(channel_full, 'full_chat'):
-                                                if hasattr(channel_full.full_chat, 'linked_chat_id'):
-                                                    discussion_chat_id = channel_full.full_chat.linked_chat_id
-                                        except Exception as e:
-                                            logging.debug(f"⚠️ [{acc_name}] GetFullChannel failed: {e}")
-                                except Exception as e:
-                                    logging.debug(f"⚠️ [{acc_name}] Failed to get discussion chat: {e}")
-                                
+
+                                # ⭐ ЧАТ ОБСУЖДЕНИЙ (берём из кеша, иначе ищем и вступаем)
+                                discussion_chat_id = discussion_cache.get(channel)
                                 if not discussion_chat_id:
-                                    logging.warning(f"⚠️ [{acc_name}] No discussion chat found for {channel}")
-                                    if bot and not notifications_hidden:
-                                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
-                                    continue
-                                
-                                # ⭐ ВСТУПАЕМ В ЧАТ ОБСУЖДЕНИЙ
-                                try:
-                                    await client.join_chat(discussion_chat_id)
-                                    logging.info(f"🔗 [{acc_name}] Joined discussion chat {discussion_chat_id}")
-                                except Exception as join_err:
-                                    logging.debug(f"⚠️ [{acc_name}] Already in discussion chat or join failed: {join_err}")
-                                
+                                    ok_access, discussion_chat_id, access_msg = await self.ensure_channel_access(account_id, channel)
+                                    if ok_access and discussion_chat_id:
+                                        discussion_cache[channel] = discussion_chat_id
+                                    else:
+                                        logging.warning(f"⚠️ [{acc_name}] No discussion chat for {channel}: {access_msg}")
+                                        if bot and not notifications_hidden:
+                                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
+                                        continue
+
                                 # ⭐ КЛЮЧЕВОЙ МОМЕНТ: НОРМАЛИЗУЕМ ID КАНАЛА НА ИСХОДЕ ИЗ chat_obj.id (а не channel string)
                                 normalized_channel_id = normalize_chat_id(chat_obj.id)
                                 logging.debug(f"🔍 [{acc_name}] chat_obj.id={chat_obj.id}, normalized={normalized_channel_id}, channel={channel}, chat_id={chat_id}")
@@ -1611,6 +1590,112 @@ class AccountSessionManager:
             self.active_comment_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
 
+    # ==================== NEUROCOMMENT: CHANNEL DISCOVERY & ACCESS ====================
+    async def get_channel_discussion_id(self, client, chat_obj, chat_ref=None):
+        """Возвращает id чата обсуждений (комментариев) канала или None."""
+        try:
+            linked = getattr(chat_obj, 'linked_chat', None)
+            if linked is not None and getattr(linked, 'id', None):
+                return linked.id
+            for attr in ('linked_chat_id', 'discussion_chat_id'):
+                val = getattr(chat_obj, attr, None)
+                if val:
+                    return val
+        except Exception:
+            pass
+        try:
+            from pyrogram.raw import functions as raw_functions
+            peer = await client.resolve_peer(chat_ref if chat_ref is not None else chat_obj.id)
+            full = await client.invoke(raw_functions.channels.GetFullChannel(channel=peer))
+            linked_id = getattr(getattr(full, 'full_chat', None), 'linked_chat_id', None)
+            if linked_id:
+                from pyrogram import utils as pyro_utils
+                return pyro_utils.get_channel_id(linked_id)
+        except Exception as e:
+            logging.debug(f"GetFullChannel failed for discussion lookup: {e}")
+        return None
+
+    async def ensure_channel_access(self, account_id: int, channel: str) -> Tuple[bool, Optional[int], str]:
+        """Гарантирует доступ аккаунта к каналу и его чату комментариев.
+
+        Если аккаунт не состоит в канале — пробует вступить. Затем находит связанный
+        чат обсуждений и вступает в него (без этого комментировать нельзя).
+
+        Возвращает (успех, discussion_chat_id, сообщение).
+        """
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return False, None, f"Ошибка подключения: {err}"
+
+        ref = channel.strip()
+        if ref.startswith('https://t.me/') or ref.startswith('t.me/'):
+            ref = ref.split('t.me/')[-1].strip('/')
+            if not ref.startswith('+') and not ref.startswith('joinchat'):
+                ref = '@' + ref.lstrip('@')
+        chat_ref = int(ref) if ref.lstrip('-').isdigit() else ref
+
+        chat_obj = None
+        try:
+            chat_obj = await client.get_chat(chat_ref)
+        except Exception as e:
+            # Не состоим в канале / не резолвится — пробуем вступить
+            logging.info(f"🔐 [acc {account_id}] No access to {channel} ({type(e).__name__}), trying to join")
+            try:
+                chat_obj = await client.join_chat(chat_ref)
+            except Exception as join_err:
+                return False, None, f"Не удалось вступить в {channel}: {str(join_err)[:120]}"
+
+        # Если состоим только как «превью» — join всё равно безопасен (уже участник → исключение игнорируем)
+        try:
+            if not getattr(chat_obj, 'is_member', True):
+                await client.join_chat(chat_ref)
+                chat_obj = await client.get_chat(chat_ref)
+        except Exception:
+            pass
+
+        discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
+        if not discussion_id:
+            return False, None, f"У канала {channel} нет открытых комментариев"
+
+        try:
+            await client.join_chat(discussion_id)
+            logging.info(f"✅ [acc {account_id}] Joined discussion chat {discussion_id} of {channel}")
+        except Exception as e:
+            # USER_ALREADY_PARTICIPANT и подобное — не ошибка
+            logging.debug(f"ℹ️ [acc {account_id}] join discussion {discussion_id}: {e}")
+
+        return True, discussion_id, "OK"
+
+    async def list_commentable_channels(self, account_id: int, refresh: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Каналы аккаунта, у которых открыты комментарии (есть привязанный чат обсуждений)."""
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return [], f"Ошибка подключения: {err}"
+
+        if refresh or not db.get_account_chats(account_id, chat_types=('channel',)):
+            await self.fetch_and_sync_chats(account_id)
+
+        channels = db.get_account_chats(account_id, chat_types=('channel',))
+        result = []
+        for ch in channels:
+            cid = ch['chat_id']
+            try:
+                chat_ref = int(cid) if cid.lstrip('-').isdigit() else cid
+                chat_obj = await client.get_chat(chat_ref)
+                discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
+                if discussion_id:
+                    result.append({
+                        'chat_id': cid,
+                        'title': ch.get('chat_title') or cid,
+                        'username': ch.get('chat_username') or '',
+                        'discussion_id': discussion_id
+                    })
+            except Exception as e:
+                logging.debug(f"list_commentable_channels skip {cid}: {e}")
+                continue
+            await asyncio.sleep(0.15)  # мягкий rate-limit, чтобы не ловить FloodWait
+        return result, None
+
     # ==================== CHAT LIST & SYNC ====================
     async def fetch_and_sync_chats(self, account_id: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         client, err = await self.get_or_start_client(account_id)
@@ -1659,11 +1744,13 @@ class AccountSessionManager:
                         full_id = str(utils.get_channel_id(ch.id))
                         title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
                         username = getattr(ch, 'username', None) or ""
+                        # megagroup / gigagroup = супергруппа (чат), иначе broadcast-канал
+                        is_group = bool(getattr(ch, 'megagroup', False) or getattr(ch, 'gigagroup', False))
                         chats_map[full_id] = {
                             'id': full_id,
                             'title': title,
                             'username': username,
-                            'chat_type': 'channel'
+                            'chat_type': 'group' if is_group else 'channel'
                         }
                     elif isinstance(ch, Chat):
                         full_id = str(-ch.id)
@@ -1682,7 +1769,7 @@ class AccountSessionManager:
                         if hasattr(peer, 'user_id'):
                             user_id = peer.user_id
                             user_obj = next((u for u in res.users if getattr(u, 'id', None) == user_id), None)
-                            if user_obj and not getattr(user_obj, 'bot', False):
+                            if user_obj:
                                 full_id = str(user_id)
                                 title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
                                 username = getattr(user_obj, 'username', None) or ""
@@ -1690,7 +1777,7 @@ class AccountSessionManager:
                                     'id': full_id,
                                     'title': title,
                                     'username': username,
-                                    'chat_type': 'private'
+                                    'chat_type': 'bot' if getattr(user_obj, 'bot', False) else 'private'
                                 }
 
                 if not hasattr(res, 'dialogs') or not res.dialogs or len(res.dialogs) < limit:
@@ -1744,7 +1831,8 @@ class AccountSessionManager:
                             full_id = str(utils.get_channel_id(ch.id))
                             title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
                             username = getattr(ch, 'username', None) or ""
-                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'channel'}
+                            is_group = bool(getattr(ch, 'megagroup', False) or getattr(ch, 'gigagroup', False))
+                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'group' if is_group else 'channel'}
                         elif isinstance(ch, Chat):
                             full_id = str(-ch.id)
                             title = ch.title or f"Группа {ch.id}"
@@ -1756,11 +1844,11 @@ class AccountSessionManager:
                         if hasattr(peer, 'user_id'):
                             user_id = peer.user_id
                             user_obj = next((u for u in res_arch.users if getattr(u, 'id', None) == user_id), None)
-                            if user_obj and not getattr(user_obj, 'bot', False):
+                            if user_obj:
                                 full_id = str(user_id)
                                 title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
                                 username = getattr(user_obj, 'username', None) or ""
-                                chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'private'}
+                                chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'bot' if getattr(user_obj, 'bot', False) else 'private'}
             except Exception:
                 pass
 
@@ -1783,8 +1871,10 @@ class AccountSessionManager:
                             chat_type = 'private'
                         elif chat.type == enums.ChatType.BOT:
                             chat_type = 'bot'
-                        elif chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.GROUP, enums.ChatType.CHANNEL]:
-                            chat_type = 'channel' if chat.type == enums.ChatType.CHANNEL else 'group'
+                        elif chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.GROUP]:
+                            chat_type = 'group'
+                        elif chat.type == enums.ChatType.CHANNEL:
+                            chat_type = 'channel'
                         chat_list.append({
                             'id': str(chat.id),
                             'title': chat.title or str(chat.id),
@@ -2053,11 +2143,12 @@ class AccountSessionManager:
                     break
 
                 # Get only enabled chats
-                spam_chats = db.get_account_chats(account_id, spam_only=True)
+                # Постинг по чатам = только группы/супергруппы (каналы, боты и ЛС исключены)
+                spam_chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
                 if not spam_chats:
                     # Try syncing if empty
-                    spam_chats, _ = await self.fetch_and_sync_chats(account_id)
-                    spam_chats = [c for c in spam_chats if c.get('spam_enabled') == 1]
+                    await self.fetch_and_sync_chats(account_id)
+                    spam_chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
 
                 if not spam_chats:
                     db.set_account_spam_status(account_id, 0)
@@ -2191,7 +2282,16 @@ class AccountSessionManager:
             self.active_spam_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
 
-    async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int, limit: int = 10000, progress_callback=None):
+    async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int,
+                               limit: int = 10000, progress_callback=None,
+                               history_limit: int = 5000, include_members: bool = True):
+        """Парсинг участников чата.
+
+        limit           — максимум пользователей, которых нужно собрать.
+        history_limit   — сколько сообщений истории просканировать (для групп со скрытыми участниками).
+        include_members — сначала попытаться взять открытый список участников (быстро),
+                          затем добрать из истории сообщений.
+        """
         account = db.get_account(account_id)
         if not account:
             return None, "Аккаунт не найден"
@@ -2204,125 +2304,148 @@ class AccountSessionManager:
         users = []
         seen_ids = set()
         seen_usernames = set()
+
+        def _add_user(u, username_override=None):
+            """Добавляет пользователя в результат. Возвращает True, если он новый."""
+            username = username_override
+            user_id_val = 0
+            first_name = last_name = phone = ''
+            if u is not None:
+                if getattr(u, 'is_bot', False):
+                    return False
+                if getattr(u, 'is_self', False):
+                    return False
+                if getattr(u, 'is_deleted', False):
+                    return False
+                user_id_val = getattr(u, 'id', 0) or 0
+                first_name = getattr(u, 'first_name', '') or ''
+                last_name = getattr(u, 'last_name', '') or ''
+                phone = getattr(u, 'phone_number', '') or ''
+                username = username or getattr(u, 'username', None)
+            if not username and not user_id_val:
+                return False
+            key_u = username.lower() if username else None
+            if key_u and key_u in seen_usernames:
+                return False
+            if user_id_val and user_id_val in seen_ids:
+                return False
+            if key_u:
+                seen_usernames.add(key_u)
+            if user_id_val:
+                seen_ids.add(user_id_val)
+            users.append({
+                'id': user_id_val,
+                'username': username or '',
+                'first_name': first_name,
+                'last_name': last_name,
+                'phone': phone
+            })
+            return True
+
+        stats = {'members': 0, 'from_history': 0, 'scanned': 0, 'mentions': 0}
         try:
-            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
-            
+            target = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+
             try:
                 chat = await client.get_chat(target)
                 chat_id_resolved = chat.id
-                logging.info(f"📥 [{acc_name}] parse_chat_users chat={chat_id_resolved} title={getattr(chat, 'title', chat_id)} limit={limit}")
+                logging.info(f"📥 [{acc_name}] parse_chat_users chat={chat_id_resolved} "
+                             f"title={getattr(chat, 'title', chat_id)} limit={limit} history_limit={history_limit}")
             except Exception as e:
                 logging.error(f"❌ [{acc_name}] parse_chat_users get_chat failed: {e}")
                 return None, f"Не удалось открыть чат: {e}"
-            
-            scanned = 0
-            skipped_bot = 0
-            skipped_self = 0
-            skipped_no_user = 0
-            skipped_no_username = 0
-            skipped_duplicate = 0
-            
-            fetch_limit = min(max(limit, 200), 10000)
-            offset = 0
-            batch = 100
-            
-            while len(users) < limit and offset < fetch_limit:
-                batch_size = min(batch, fetch_limit - offset)
-                logging.info(f"📥 [{acc_name}] parse_chat_users fetching batch offset={offset} batch={batch_size}")
-                async for msg in client.get_chat_history(chat_id_resolved, limit=batch_size, offset=offset):
-                    scanned += 1
-                    try:
-                        if not msg:
-                            skipped_no_user += 1
+
+            # ── 1. Открытый список участников (если он доступен) ──────────────
+            if include_members:
+                try:
+                    async for member in client.get_chat_members(chat_id_resolved, limit=limit):
+                        if len(users) >= limit:
+                            break
+                        if _add_user(getattr(member, 'user', None)):
+                            stats['members'] += 1
+                            if progress_callback and len(users) % 50 == 0:
+                                try:
+                                    await progress_callback(len(users))
+                                except Exception:
+                                    pass
+                    logging.info(f"👥 [{acc_name}] members list: {stats['members']} users")
+                except Exception as e:
+                    # ChatAdminRequired / участники скрыты — это нормально, идём в историю
+                    logging.info(f"ℹ️ [{acc_name}] Members list unavailable ({type(e).__name__}), "
+                                 f"parsing message history instead")
+
+            # ── 2. История сообщений (для чатов со скрытыми участниками) ──────
+            if len(users) < limit and history_limit > 0:
+                import re
+                mention_re = re.compile(r'@([a-zA-Z0-9_]{5,32})')
+                try:
+                    async for msg in client.get_chat_history(chat_id_resolved, limit=history_limit):
+                        stats['scanned'] += 1
+                        if len(users) >= limit:
+                            break
+                        try:
+                            u = getattr(msg, 'from_user', None)
+                            if u is not None:
+                                if _add_user(u):
+                                    stats['from_history'] += 1
+                            # Упоминания @username в тексте — тоже потенциальные участники
+                            text = (getattr(msg, 'text', None) or getattr(msg, 'caption', None) or '')
+                            if text and len(users) < limit:
+                                for mention in mention_re.findall(text):
+                                    if len(users) >= limit:
+                                        break
+                                    if _add_user(None, username_override=mention):
+                                        stats['mentions'] += 1
+                            if progress_callback and stats['scanned'] % 200 == 0:
+                                try:
+                                    await progress_callback(len(users), stats['scanned'])
+                                except Exception:
+                                    pass
+                        except Exception:
                             continue
-                        
-                        username = None
-                        user_id_val = 0
-                        first_name = ''
-                        last_name = ''
-                        
-                        u = msg.from_user
-                        if u:
-                            if u.is_bot:
-                                skipped_bot += 1
-                                continue
-                            if getattr(u, 'is_self', False):
-                                skipped_self += 1
-                                continue
-                            user_id_val = u.id
-                            first_name = u.first_name or ''
-                            last_name = u.last_name or ''
-                            if u.username:
-                                username = u.username
-                        
-                        if not username:
-                            text = msg.text or msg.caption or ''
-                            if text:
-                                import re
-                                mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', text)
-                                if mentions:
-                                    username = mentions[0]
-                        
-                        if not username:
-                            skipped_no_username += 1
-                            continue
-                        
-                        username_lower = username.lower()
-                        if username_lower in seen_usernames:
-                            skipped_duplicate += 1
-                            continue
-                        if user_id_val and user_id_val in seen_ids:
-                            skipped_duplicate += 1
-                            continue
-                        
-                        seen_usernames.add(username_lower)
-                        if user_id_val:
-                            seen_ids.add(user_id_val)
-                        
-                        users.append({
-                            'id': user_id_val,
-                            'username': username,
-                            'first_name': first_name,
-                            'last_name': last_name,
-                            'phone': u.phone_number if u else ''
-                        })
-                        
-                        if progress_callback and len(users) % 20 == 0:
-                            try:
-                                await progress_callback(len(users))
-                            except:
-                                pass
-                    except Exception:
-                        continue
-                
-                if scanned >= fetch_limit:
-                    break
-                offset += batch_size
-                if offset >= fetch_limit:
-                    break
-            
-            logging.info(f"📊 [{acc_name}] parse_chat_users done: scanned={scanned} users={len(users)} skipped_bot={skipped_bot} skipped_self={skipped_self} skipped_no_user={skipped_no_user} skipped_no_username={skipped_no_username} skipped_duplicate={skipped_duplicate}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as hist_err:
+                    logging.warning(f"⚠️ [{acc_name}] History parse error: {hist_err}")
+
+            logging.info(
+                f"📊 [{acc_name}] parse done: total={len(users)} members={stats['members']} "
+                f"history={stats['from_history']} mentions={stats['mentions']} scanned={stats['scanned']}"
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logging.error(f"❌ [{acc_name}] parse_chat_users error: {e}")
             return None, f"Ошибка парсинга: {e}"
 
         if not users:
-            return [], "Нет пользователей в истории"
+            return [], "Пользователей не найдено (участники скрыты и в истории нет отправителей)"
 
         try:
             db.clear_parsed_users(account_id, user_id)
-            db.save_parsed_users(account_id, user_id, users)
+            db.save_parsed_users(account_id, user_id, users, source_chat_id=str(chat_id))
         except Exception as save_err:
             logging.error(f"❌ [{acc_name}] Failed to save parsed users: {save_err}")
             return users, f"Найдено {len(users)} пользователей (ошибка сохранения: {save_err})"
-        
-        return users, f"Найдено {len(users)} пользователей"
 
-    async def parse_chat_users_background(self, account_id: int, chat_id: str, bot, user_id: int, progress_callback=None, limit: int = 10000):
+        return users, (
+            f"Найдено {len(users)} пользователей\n"
+            f"• из списка участников: {stats['members']}\n"
+            f"• из истории сообщений: {stats['from_history']}\n"
+            f"• из упоминаний: {stats['mentions']}\n"
+            f"• просканировано сообщений: {stats['scanned']}"
+        )
+
+    async def parse_chat_users_background(self, account_id: int, chat_id: str, bot, user_id: int,
+                                          progress_callback=None, limit: int = 10000,
+                                          history_limit: int = 5000, include_members: bool = True):
         task = asyncio.current_task()
         self.active_parse_tasks[account_id] = task
         try:
-            users, msg = await self.parse_chat_users(account_id, chat_id, bot, user_id, limit, progress_callback)
+            users, msg = await self.parse_chat_users(
+                account_id, chat_id, bot, user_id, limit, progress_callback,
+                history_limit=history_limit, include_members=include_members
+            )
             if users is None:
                 try:
                     await bot.send_message(user_id, f"❌ Парсинг завершен с ошибкой: {msg}")

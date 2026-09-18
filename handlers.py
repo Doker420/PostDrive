@@ -114,6 +114,9 @@ class InviteStates(StatesGroup):
     WAITING_CUSTOM_CHAT = State()
     WAITING_USERS_FILE = State()
 
+class ParseStates(StatesGroup):
+    WAITING_HISTORY_LIMIT = State()
+
 class NeuroCommentStates(StatesGroup):
     SELECTING_ACCOUNTS = State()
     SELECTING_MODE = State()
@@ -759,8 +762,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         
         all_chats = []
         for acc_id in account_ids:
-            chats = db.get_account_chats(acc_id)
-            for chat in chats:
+            # Инвайтить можно только в группы/супергруппы
+            for chat in db.get_account_chats(acc_id, chat_types=db.GROUP_CHAT_TYPES):
                 all_chats.append(chat)
         
         total = len(all_chats)
@@ -1831,8 +1834,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             InlineKeyboardButton(text="🚀 Запустить спам", callback_data=f"start_spam_{account_id}")
         )
 
-        chats = db.get_account_chats(account_id)
-        enabled_chats_count = sum(1 for c in chats if c.get('spam_enabled') == 1)
+        total_groups = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES)
+        enabled_chats_count = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES, spam_only=True)
 
         notifications_hidden = account.get('notifications_hidden', 0) == 1
         notif_btn = (
@@ -1845,7 +1848,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [spam_btn],
             [InlineKeyboardButton(text="📝 Настройки поста", callback_data=f"acc_post_{account_id}"),
              InlineKeyboardButton(text="⏱ Интервал", callback_data=f"acc_timeout_{account_id}")],
-            [InlineKeyboardButton(text=f"💬 Выбор чатов ({enabled_chats_count}/{len(chats)})", callback_data=f"acc_chats_{account_id}_0"),
+            [InlineKeyboardButton(text=f"💬 Выбор групп ({enabled_chats_count}/{total_groups})", callback_data=f"acc_chats_{account_id}_0"),
              InlineKeyboardButton(text="🚪 Массовый выход", callback_data=f"acc_massleave_{account_id}_0")],
             [InlineKeyboardButton(text="📥 Вступить в чаты", callback_data=f"acc_join_{account_id}"),
              InlineKeyboardButton(text="📦 Вступить из пака", callback_data=f"acc_join_pack_{account_id}")],
@@ -1874,7 +1877,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Телефон:</b> <code>{phone}</code>\n"
             f"• <b>Прокси:</b> <code>{proxy_str}</code>\n"
             f"• <b>Интервал цикла:</b> {account.get('timeout', 5)} мин\n"
-            f"• <b>Чатов всего:</b> {len(chats)} (выбрано для спама: {enabled_chats_count})\n"
+            f"• <b>Групп всего:</b> {total_groups} (выбрано для рассылки: {enabled_chats_count})\n"
             f"• <b>Текст поста:</b> {post_text_preview}\n"
             f"• <b>Медиа:</b> {has_photo}"
         )
@@ -1921,12 +1924,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not account or not account.get('post_text'):
             await callback.answer("⚠️ Сначала настройте текст поста!", show_alert=True)
             return
-        chats = db.get_account_chats(account_id, spam_only=True)
+        chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
-            chats, _ = await account_manager.fetch_and_sync_chats(account_id)
-            chats = [c for c in chats if c.get('spam_enabled') == 1]
+            await account_manager.fetch_and_sync_chats(account_id)
+            chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
-            await callback.answer("⚠️ Нет чатов для рассылки!", show_alert=True)
+            await callback.answer("⚠️ Нет выбранных групп для рассылки!", show_alert=True)
             return
         ok, msg = await account_manager.start_account_spam(account_id, bot, user_id)
         await callback.answer(msg, show_alert=True)
@@ -2021,68 +2024,170 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         file = BufferedInputFile(output.getvalue().encode('utf-8'), filename=f"report_{report_id}.csv")
         await callback.message.answer_document(file, caption=f"📊 Отчет #{report_id}")
 
+    PARSE_DEPTH_OPTIONS = [500, 1000, 5000, 10000, 50000]
+
     @dp.callback_query(F.data.startswith('acc_parse_'))
     async def acc_parse_callback(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
-        per_page = 20
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
+        per_page = 10
+        # Парсинг участников имеет смысл только для групп
+        page_chats, total = db.get_account_chats_paginated(
+            account_id, page=page, per_page=per_page, chat_types=db.GROUP_CHAT_TYPES
+        )
+        if total == 0:
+            await callback.answer("💬 Групп не найдено. Синхронизируйте чаты!", show_alert=True)
             return
-        total = len(chats)
-        start = page * per_page
-        end = start + per_page
-        page_chats = chats[start:end]
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(
+                account_id, page=page, per_page=per_page, chat_types=db.GROUP_CHAT_TYPES
+            )
         buttons = []
         for chat in page_chats:
             title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"👥 {title[:35]}", callback_data=f"parse_chat_{account_id}_{chat['chat_id']}")])
+            buttons.append([InlineKeyboardButton(
+                text=f"👥 {title[:35]}",
+                callback_data=f"parsecfg_{account_id}_{page}_{chat['chat_id']}"
+            )])
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_parse_{account_id}_{page-1}"))
-        if end < total:
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_parse_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
+        buttons.append(nav_buttons)
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"👥 <b>Выберите чат для парсинга пользователей</b> (стр. {page+1}, всего: {total})", markup)
+        await edit_message(
+            callback,
+            f"👥 <b>Парсинг пользователей</b>\n\nВыберите группу (всего: {total}, стр. {page+1}/{total_pages})",
+            markup
+        )
 
-    @dp.callback_query(F.data.startswith('parse_chat_'))
-    async def parse_chat_callback(callback: CallbackQuery, state: FSMContext):
+    @dp.callback_query(F.data.startswith('parsecfg_'))
+    async def parse_config_callback(callback: CallbackQuery, state: FSMContext):
+        # parsecfg_{account_id}_{page}_{chat_id}
         parts = callback.data.split('_')
-        account_id = int(parts[2])
+        account_id = int(parts[1])
+        page = int(parts[2])
         chat_id = '_'.join(parts[3:])
-        user_id = callback.from_user.id
-        
-        if account_id in account_manager.active_parse_tasks:
-            await callback.answer("⏳ Парсинг уже выполняется!", show_alert=True)
-            return
-        
-        chat_title = chat_id
-        for c in db.get_account_chats(account_id):
-            if c['chat_id'] == chat_id:
-                chat_title = c.get('chat_title') or chat_id
-                break
-        
-        buttons = [
-            [InlineKeyboardButton(text="🛑 Отменить парсинг", callback_data=f"cancel_parse_{account_id}")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"acc_parse_{account_id}")]
-        ]
+        await state.update_data(parse_account_id=account_id, parse_chat_id=chat_id, parse_page=page)
+
+        chat = db.get_account_chat(account_id, chat_id)
+        chat_title = (chat.get('chat_title') if chat else None) or chat_id
+
+        buttons = []
+        row = []
+        for depth in PARSE_DEPTH_OPTIONS:
+            row.append(InlineKeyboardButton(text=f"{depth}", callback_data=f"parsego_{account_id}_{depth}_{chat_id}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton(text="✍️ Своё число сообщений", callback_data=f"parsecustom_{account_id}_{chat_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"acc_parse_{account_id}_{page}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        progress_msg = await callback.message.answer("⏳ <b>Парсинг пользователей...</b>\n\nПрогресс: 0/200")
-        
-        async def update_progress(found):
+        await edit_message(
+            callback,
+            f"👥 <b>Парсинг: {chat_title[:40]}</b>\n\n"
+            f"Если список участников группы скрыт, пользователи собираются из истории сообщений.\n\n"
+            f"<b>Сколько сообщений истории просканировать?</b>\n"
+            f"Чем больше — тем больше пользователей, но тем дольше парсинг.",
+            markup
+        )
+
+    @dp.callback_query(F.data.startswith('parsecustom_'))
+    async def parse_custom_depth_callback(callback: CallbackQuery, state: FSMContext):
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        chat_id = '_'.join(parts[2:])
+        await state.update_data(parse_account_id=account_id, parse_chat_id=chat_id)
+        await state.set_state(ParseStates.WAITING_HISTORY_LIMIT)
+        await edit_message(
+            callback,
+            "✍️ Введите количество сообщений истории для сканирования (от 100 до 200000):",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(ParseStates.WAITING_HISTORY_LIMIT)
+    async def process_parse_history_limit(message: Message, state: FSMContext):
+        data = await state.get_data()
+        account_id = data.get('parse_account_id')
+        chat_id = data.get('parse_chat_id')
+        try:
+            history_limit = int(message.text.strip())
+        except (TypeError, ValueError):
+            await message.answer("❌ Введите число!")
+            return
+        if not (100 <= history_limit <= 200000):
+            await message.answer("❌ Значение должно быть от 100 до 200000!")
+            return
+        await state.clear()
+        await start_parse_task(message, account_id, chat_id, history_limit, message.from_user.id)
+
+    async def start_parse_task(target, account_id: int, chat_id: str, history_limit: int, user_id: int):
+        if account_id in account_manager.active_parse_tasks:
+            if isinstance(target, CallbackQuery):
+                await target.answer("⏳ Парсинг уже выполняется!", show_alert=True)
+            else:
+                await target.answer("⏳ Парсинг уже выполняется!")
+            return
+
+        chat = db.get_account_chat(account_id, chat_id)
+        chat_title = (chat.get('chat_title') if chat else None) or chat_id
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Отменить парсинг", callback_data=f"cancel_parse_{account_id}")]
+        ])
+        base_msg = target.message if isinstance(target, CallbackQuery) else target
+        progress_msg = await base_msg.answer(
+            f"⏳ <b>Парсинг: {chat_title[:40]}</b>\n\n"
+            f"Глубина истории: {history_limit} сообщений\n"
+            f"Найдено пользователей: 0",
+            reply_markup=markup
+        )
+
+        last_edit = {'t': 0.0}
+
+        async def update_progress(found, scanned=0):
+            # Троттлинг правок, чтобы не ловить flood-limit Telegram
+            now = time.time()
+            if now - last_edit['t'] < 3:
+                return
+            last_edit['t'] = now
             try:
-                text = f"⏳ <b>Парсинг пользователей...</b>\n\nПрогресс: {min(found, 200)}/200"
-                await progress_msg.edit_text(text)
-            except:
+                await progress_msg.edit_text(
+                    f"⏳ <b>Парсинг: {chat_title[:40]}</b>\n\n"
+                    f"Глубина истории: {history_limit} сообщений\n"
+                    f"Просканировано: {scanned}\n"
+                    f"Найдено пользователей: {found}",
+                    reply_markup=markup
+                )
+            except Exception:
                 pass
-        
-        asyncio.create_task(account_manager.run_limited(account_manager.parse_chat_users_background(account_id, chat_id, bot, user_id, update_progress)))
+
+        asyncio.create_task(account_manager.run_limited(
+            account_manager.parse_chat_users_background(
+                account_id, chat_id, bot, user_id, update_progress,
+                limit=100000, history_limit=history_limit
+            )
+        ))
+
+    @dp.callback_query(F.data.startswith('parsego_'))
+    async def parse_go_callback(callback: CallbackQuery, state: FSMContext):
+        # parsego_{account_id}_{depth}_{chat_id}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        history_limit = int(parts[2])
+        chat_id = '_'.join(parts[3:])
+        await state.clear()
+        await callback.answer("🚀 Запускаю парсинг...")
+        await start_parse_task(callback, account_id, chat_id, history_limit, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('cancel_parse_'))
     async def cancel_parse_callback(callback: CallbackQuery):
@@ -2310,46 +2415,176 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         await message.answer("✅ Промт для отслеживания постов сохранён!", reply_markup=main_menu_keyboard(message.from_user.id))
 
+    def _nc_channel_list(account_id: int) -> list:
+        nc = db.get_neurocomment_settings(account_id)
+        current = nc.get('target_channels', '') if nc else ''
+        return [c.strip() for c in (current or '').split(',') if c.strip()]
+
+    def _nc_save_channels(account_id: int, user_id: int, channels: list):
+        channels_str = ', '.join(dict.fromkeys(channels))
+        if not db.get_neurocomment_settings(account_id):
+            db.create_neurocomment_settings(account_id, user_id, target_channels=channels_str)
+        else:
+            db.update_neurocomment_settings(account_id, target_channels=channels_str)
+
     @dp.callback_query(F.data.startswith('nc_channels_'))
     async def nc_channels_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[2])
         await state.update_data(nc_account_id=account_id)
-        await state.set_state(NeuroCommentStates.WAITING_TARGET_CHANNELS)
-        nc = db.get_neurocomment_settings(account_id)
-        current = nc.get('target_channels', '') if nc else ''
-        current_list = [c.strip() for c in current.split(',') if c.strip()] if current else []
+        current_list = _nc_channel_list(account_id)
         preview = '\n'.join([f"{i+1}. {c}" for i, c in enumerate(current_list[:10])]) if current_list else 'Не заданы'
+        if len(current_list) > 10:
+            preview += f"\n… и ещё {len(current_list) - 10}"
+        buttons = [
+            [InlineKeyboardButton(text="📢 Выбрать из моих каналов с комментариями", callback_data=f"nccl_{account_id}_0")],
+            [InlineKeyboardButton(text="✍️ Ввести свой список", callback_data=f"ncman_{account_id}")],
+            [InlineKeyboardButton(text="🗑 Очистить список", callback_data=f"ncclr_{account_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"nc_acc_{account_id}")]
+        ]
         await edit_message(callback,
             f"🎯 <b>Целевые каналы</b>\n\n"
-            f"Текущие каналы:\n{preview}\n\n"
-            f"Введите список каналов через запятую или с новой строки:\n"
-            f"Примеры:\n"
-            f"@channel1, @channel2, -100123456789",
+            f"Выбрано: {len(current_list)}\n{preview}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    @dp.callback_query(F.data.startswith('ncman_'))
+    async def nc_manual_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        await state.update_data(nc_account_id=account_id)
+        await state.set_state(NeuroCommentStates.WAITING_TARGET_CHANNELS)
+        await edit_message(callback,
+            "✍️ <b>Свой список каналов</b>\n\n"
+            "Введите каналы через запятую или с новой строки:\n"
+            "<code>@channel1, @channel2, -100123456789, https://t.me/channel3</code>\n\n"
+            "Если аккаунт не состоит в канале — бот попробует вступить в канал "
+            "и в его чат комментариев автоматически.",
             reply_markup=cancel_inline_keyboard()
         )
+
+    @dp.callback_query(F.data.startswith('ncclr_'))
+    async def nc_clear_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        _nc_save_channels(account_id, callback.from_user.id, [])
+        await callback.answer("🗑 Список очищен")
+        await nc_channels_callback(callback, state)
+
+    @dp.callback_query(F.data.startswith('nccl_'))
+    async def nc_channel_list_callback(callback: CallbackQuery, state: FSMContext):
+        # nccl_{account_id}_{page}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
+        per_page = 8
+
+        cache_key = f"nc_channels_cache_{account_id}"
+        data = await state.get_data()
+        cached = data.get(cache_key)
+        if not cached:
+            await callback.answer("⏳ Ищу каналы с открытыми комментариями...")
+            cached, err = await account_manager.list_commentable_channels(account_id)
+            if err:
+                await callback.answer(f"❌ {err}", show_alert=True)
+                return
+            await state.update_data(**{cache_key: cached, 'nc_account_id': account_id})
+
+        if not cached:
+            await callback.answer(
+                "📢 Каналов с открытыми комментариями не найдено. "
+                "Синхронизируйте чаты или добавьте каналы вручную.",
+                show_alert=True
+            )
+            return
+
+        selected = set(_nc_channel_list(account_id))
+        total = len(cached)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        page_items = cached[page * per_page:(page + 1) * per_page]
+
+        buttons = []
+        for ch in page_items:
+            ref = f"@{ch['username']}" if ch.get('username') else ch['chat_id']
+            icon = "☑️" if ref in selected or ch['chat_id'] in selected else "⬜"
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {ch['title'][:32]}",
+                callback_data=f"nctg_{account_id}_{page}_{ch['chat_id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"nccl_{account_id}_{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nccl_{account_id}_{page+1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"ncrf_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"nc_channels_{account_id}")])
+        await edit_message(callback,
+            f"📢 <b>Каналы с открытыми комментариями</b>\n\n"
+            f"Найдено: {total} | Выбрано: {len(selected)}\n"
+            f"Страница {page+1}/{total_pages}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    @dp.callback_query(F.data.startswith('ncrf_'))
+    async def nc_refresh_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        await callback.answer("🔄 Обновляю...")
+        cached, err = await account_manager.list_commentable_channels(account_id, refresh=True)
+        if err:
+            await callback.answer(f"❌ {err}", show_alert=True)
+            return
+        await state.update_data(**{f"nc_channels_cache_{account_id}": cached})
+        callback.data = f"nccl_{account_id}_0"
+        await nc_channel_list_callback(callback, state)
+
+    @dp.callback_query(F.data.startswith('nctg_'))
+    async def nc_toggle_channel_callback(callback: CallbackQuery, state: FSMContext):
+        # nctg_{account_id}_{page}_{chat_id}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        page = int(parts[2])
+        chat_id = '_'.join(parts[3:])
+
+        data = await state.get_data()
+        cached = data.get(f"nc_channels_cache_{account_id}", [])
+        entry = next((c for c in cached if c['chat_id'] == chat_id), None)
+        ref = f"@{entry['username']}" if entry and entry.get('username') else chat_id
+
+        channels = _nc_channel_list(account_id)
+        if ref in channels:
+            channels.remove(ref)
+        elif chat_id in channels:
+            channels.remove(chat_id)
+        else:
+            channels.append(ref)
+        _nc_save_channels(account_id, callback.from_user.id, channels)
+        await callback.answer()
+        callback.data = f"nccl_{account_id}_{page}"
+        await nc_channel_list_callback(callback, state)
 
     @dp.message(NeuroCommentStates.WAITING_TARGET_CHANNELS)
     async def process_nc_channels(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('nc_account_id')
-        text = message.text.strip()
+        text = (message.text or '').strip()
         lines = [l.strip() for l in text.replace(',', '\n').split('\n') if l.strip()]
         channels = []
         for line in lines:
-            if line.startswith('@'):
-                channels.append(line)
-            elif line.startswith('-') or line.startswith('https://t.me/'):
+            if line.startswith('https://t.me/') or line.startswith('t.me/'):
+                slug = line.split('t.me/')[-1].strip('/')
+                channels.append(slug if slug.startswith('+') else f"@{slug.lstrip('@')}")
+            elif line.startswith('@') or line.lstrip('-').isdigit():
                 channels.append(line)
             else:
-                channels.append(f"@{line}")
-        channels_str = ', '.join(channels)
-        nc = db.get_neurocomment_settings(account_id)
-        if not nc:
-            db.create_neurocomment_settings(account_id, message.from_user.id, target_channels=channels_str)
-        else:
-            db.update_neurocomment_settings(account_id, target_channels=channels_str)
+                channels.append(f"@{line.lstrip('@')}")
+        existing = _nc_channel_list(account_id)
+        merged = list(dict.fromkeys(existing + channels))
+        _nc_save_channels(account_id, message.from_user.id, merged)
         await state.clear()
-        await message.answer(f"✅ Сохранено {len(channels)} каналов!")
+        await message.answer(
+            f"✅ Добавлено {len(channels)} каналов. Всего в списке: {len(merged)}.\n\n"
+            f"При запуске бот автоматически вступит в каналы и чаты комментариев, если аккаунт в них не состоит."
+        )
 
     @dp.callback_query(F.data.startswith('nc_delay_'))
     async def nc_delay_callback(callback: CallbackQuery, state: FSMContext):
@@ -3669,31 +3904,66 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ Введите число!")
 
     # ==================== CHAT MANAGEMENT (Selective & Mass Leave) ====================
+    GROUP_TYPES = db.GROUP_CHAT_TYPES
+
     async def render_acc_chats(callback: CallbackQuery, account_id: int, page: int = 0):
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
+        # Для постинга по чатам нужны ТОЛЬКО группы/супергруппы — каналы, боты и ЛС исключены
+        page_chats, total = db.get_account_chats_paginated(
+            account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+        )
+        if total == 0:
+            total_any = db.count_account_chats(account_id)
+            if total_any:
+                await callback.answer(
+                    "💬 Групп не найдено. Нажмите «Синхронизировать чаты» — старые записи без типа нужно обновить.",
+                    show_alert=True
+                )
+            else:
+                await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
             return
-        start = page * CHATS_PER_PAGE
-        end = start + CHATS_PER_PAGE
-        page_chats = chats[start:end]
+
+        total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(
+                account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+            )
+
+        enabled_count = db.count_account_chats(account_id, chat_types=GROUP_TYPES, spam_only=True)
+
         buttons = []
         for chat in page_chats:
-            icon = "✅" if chat['spam_enabled'] == 1 else "❌"
+            icon = "✅" if chat.get('spam_enabled') == 1 else "❌"
             title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"{icon} {title[:30]}", callback_data=f"toggle_chat_{account_id}_{chat['chat_id']}")])
+            # page передаём в callback, чтобы после переключения остаться на той же странице
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {title[:30]}",
+                callback_data=f"toggle_chat_{account_id}_{page}_{chat['chat_id']}"
+            )])
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_chats_{account_id}_{page-1}"))
-        if end < len(chats):
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_chats_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
-        buttons.append([InlineKeyboardButton(text="✅ Включить все", callback_data=f"enable_all_chats_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="❌ Отключить все", callback_data=f"disable_all_chats_{account_id}")])
+        buttons.append(nav_buttons)
+        buttons.append([
+            InlineKeyboardButton(text="✅ Включить все", callback_data=f"enable_all_chats_{account_id}_{page}"),
+            InlineKeyboardButton(text="❌ Отключить все", callback_data=f"disable_all_chats_{account_id}_{page}")
+        ])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"💬 <b>Выбор чатов</b> (стр. {page+1})", reply_markup=markup)
+        await edit_message(
+            callback,
+            f"💬 <b>Выбор групп для постинга</b>\n\n"
+            f"Групп всего: {total} | Выбрано: {enabled_count}\n"
+            f"Страница {page+1}/{total_pages}",
+            reply_markup=markup
+        )
+
+    @dp.callback_query(F.data == "noop")
+    async def noop_callback(callback: CallbackQuery):
+        await callback.answer()
 
     @dp.callback_query(F.data.startswith('acc_chats_'))
     async def acc_chats_callback(callback: CallbackQuery):
@@ -3704,73 +3974,95 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('toggle_chat_'))
     async def toggle_chat_callback(callback: CallbackQuery):
+        # toggle_chat_{account_id}_{page}_{chat_id}
         parts = callback.data.split('_')
         account_id = int(parts[2])
-        chat_id = parts[3]
+        try:
+            page = int(parts[3])
+            chat_id = '_'.join(parts[4:])
+        except (ValueError, IndexError):
+            page = 0
+            chat_id = '_'.join(parts[3:])
         new_state = db.toggle_chat_spam(account_id, chat_id)
         await callback.answer(f"{'✅ Включен' if new_state == 1 else '❌ Отключен'}!", show_alert=False)
-        await render_acc_chats(callback, account_id, 0)
+        # Остаёмся на текущей странице
+        await render_acc_chats(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('enable_all_chats_'))
     async def enable_all_chats_callback(callback: CallbackQuery):
-        account_id = int(callback.data.split('_')[3])
-        db.set_all_chats_spam(account_id, 1)
-        await callback.answer("✅ Все чаты включены!", show_alert=True)
-        await render_acc_chats(callback, account_id, 0)
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        db.set_all_chats_spam(account_id, 1, chat_types=GROUP_TYPES)
+        await callback.answer("✅ Все группы включены!", show_alert=False)
+        await render_acc_chats(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('disable_all_chats_'))
     async def disable_all_chats_callback(callback: CallbackQuery):
-        account_id = int(callback.data.split('_')[3])
-        db.set_all_chats_spam(account_id, 0)
-        await callback.answer("❌ Все чаты отключены!", show_alert=True)
-        await render_acc_chats(callback, account_id, 0)
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        db.set_all_chats_spam(account_id, 0, chat_types=GROUP_TYPES)
+        await callback.answer("❌ Все группы отключены!", show_alert=False)
+        await render_acc_chats(callback, account_id, page)
+
+    async def render_massleave(callback: CallbackQuery, account_id: int, page: int = 0):
+        page_chats, total = db.get_account_chats_paginated(account_id, page=page, per_page=CHATS_PER_PAGE)
+        if total == 0:
+            await callback.answer("💬 Нет чатов для выхода!", show_alert=True)
+            return
+        total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(account_id, page=page, per_page=CHATS_PER_PAGE)
+        user_id = callback.from_user.id
+        selected = user_selected_leave_chats.setdefault(user_id, set())
+        buttons = []
+        for chat in page_chats:
+            icon = "☑️" if chat['chat_id'] in selected else "⬜"
+            title = chat.get('chat_title') or chat['chat_id']
+            type_icon = {'group': '👥', 'channel': '📢', 'private': '👤', 'bot': '🤖'}.get(chat.get('chat_type'), '💬')
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {type_icon} {title[:28]}",
+                callback_data=f"select_leave_{account_id}_{page}_{chat['chat_id']}"
+            )])
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_massleave_{account_id}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_massleave_{account_id}_{page+1}"))
+        buttons.append(nav_buttons)
+        buttons.append([InlineKeyboardButton(text=f"🚪 Выйти из выбранных ({len(selected)})", callback_data=f"confirm_leave_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await edit_message(callback, f"🚪 <b>Массовый выход из чатов</b>\n\nВсего: {total} | Страница {page+1}/{total_pages}", reply_markup=markup)
 
     @dp.callback_query(F.data.startswith('acc_massleave_'))
     async def acc_massleave_callback(callback: CallbackQuery):
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов для выхода!", show_alert=True)
-            return
-        start = page * CHATS_PER_PAGE
-        end = start + CHATS_PER_PAGE
-        page_chats = chats[start:end]
-        user_id = callback.from_user.id
-        if user_id not in user_selected_leave_chats:
-            user_selected_leave_chats[user_id] = set()
-        buttons = []
-        for chat in page_chats:
-            icon = "☑️" if chat['chat_id'] in user_selected_leave_chats[user_id] else "⬜"
-            title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"{icon} {title[:30]}", callback_data=f"select_leave_{account_id}_{chat['chat_id']}")])
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_massleave_{account_id}_{page-1}"))
-        if end < len(chats):
-            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_massleave_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
-        selected_count = len(user_selected_leave_chats[user_id])
-        buttons.append([InlineKeyboardButton(text=f"🚪 Выйти из выбранных ({selected_count})", callback_data=f"confirm_leave_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"🚪 <b>Массовый выход из чатов</b> (стр. {page+1})\n\nВыберите чаты для выхода:", reply_markup=markup)
+        await render_massleave(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('select_leave_'))
     async def select_leave_callback(callback: CallbackQuery):
         parts = callback.data.split('_')
         account_id = int(parts[2])
-        chat_id = parts[3]
+        try:
+            page = int(parts[3])
+            chat_id = '_'.join(parts[4:])
+        except (ValueError, IndexError):
+            page = 0
+            chat_id = '_'.join(parts[3:])
         user_id = callback.from_user.id
-        if user_id not in user_selected_leave_chats:
-            user_selected_leave_chats[user_id] = set()
-        if chat_id in user_selected_leave_chats[user_id]:
-            user_selected_leave_chats[user_id].discard(chat_id)
+        selected = user_selected_leave_chats.setdefault(user_id, set())
+        if chat_id in selected:
+            selected.discard(chat_id)
         else:
-            user_selected_leave_chats[user_id].add(chat_id)
-        await acc_massleave_callback(callback)
+            selected.add(chat_id)
+        await callback.answer()
+        await render_massleave(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('confirm_leave_'))
     async def confirm_leave_callback(callback: CallbackQuery):
