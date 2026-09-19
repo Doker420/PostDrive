@@ -22,6 +22,10 @@
 3. Создать backend foundation: auth, organizations, projects, API keys, migrations.
 4. Добавить sandbox-платёж с идемпотентностью и webhook.
 
+## Telegram operations bot
+
+См. [apps/telegram_bot/README.md](apps/telegram_bot/README.md). Бот запускается отдельно от API.
+
 ## Локальный запуск legacy-бота
 
 См. [старую инструкцию](README.MD). Не используйте её настройки для production и не добавляйте реальные секреты в git.
