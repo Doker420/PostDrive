@@ -155,6 +155,9 @@ class PaymentOut(BaseModel):
     payment_url: str
     expires_at: datetime
     metadata: dict
+    platform_fee: Decimal = Decimal("0")
+    supplier_fee: Decimal = Decimal("0")
+    merchant_net: Decimal = Decimal("0")
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)) -> User:
@@ -192,7 +195,8 @@ def payment_response(payment: Payment) -> PaymentOut:
                       currency=payment.currency, order_id=payment.order_id,
                       payment_url=payment.payment_url,
                       expires_at=payment.created_at.replace(tzinfo=timezone.utc),
-                      metadata=payment.metadata_json or {})
+                      metadata=payment.metadata_json or {}, platform_fee=payment.platform_fee,
+                      supplier_fee=payment.supplier_fee, merchant_net=payment.merchant_net)
 
 
 def emit_payment_event(db: Session, payment: Payment, event_type: str) -> PaymentEvent:
@@ -396,9 +400,26 @@ def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
     payment.status = payload.status
     if payload.status == "succeeded":
         project = db.get(Project, payment.project_id)
+        platform_fee = (payment.amount * settings.platform_fee_percent / Decimal("100")).quantize(Decimal("0.01"))
+        supplier_fee = Decimal("0")
+        supplier_org_id = None
+        if payment.channel_id:
+            channel = db.get(PaymentChannel, payment.channel_id)
+            supplier = db.get(SupplierProfile, channel.supplier_id) if channel else None
+            if supplier:
+                supplier_fee = (payment.amount * supplier.commission_percent / Decimal("100")).quantize(Decimal("0.01"))
+                supplier_org_id = supplier.organization_id
+        merchant_net = payment.amount - platform_fee - supplier_fee
+        if merchant_net < 0:
+            raise HTTPException(422, "fees_exceed_payment_amount")
+        payment.platform_fee, payment.supplier_fee, payment.merchant_net = platform_fee, supplier_fee, merchant_net
         db.add(LedgerEntry(organization_id=project.organization_id, payment_id=payment.id,
-                           amount=payment.amount, currency=payment.currency,
-                           entry_type="payment_credit", description=f"Payment {payment.public_id}"))
+                           amount=merchant_net, currency=payment.currency,
+                           entry_type="payment_credit", description=f"Net payment {payment.public_id}"))
+        if supplier_org_id and supplier_fee:
+            db.add(LedgerEntry(organization_id=supplier_org_id, payment_id=payment.id,
+                               amount=supplier_fee, currency=payment.currency,
+                               entry_type="supplier_commission", description=f"Commission for {payment.public_id}"))
     event = emit_payment_event(db, payment, f"payment.{payload.status}")
     db.commit()
     delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
