@@ -9,6 +9,7 @@ import httpx
 import pyotp
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
@@ -24,6 +25,7 @@ from .security import (encrypt_secret, hash_password, issue_token, new_api_key, 
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
+app.mount("/web", StaticFiles(directory="apps/web"), name="web")
 bearer = HTTPBearer(auto_error=False)
 
 

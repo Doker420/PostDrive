@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FlowPay — control center</title>
+  <link rel="stylesheet" href="/web/styles.css" />
+</head>
+<body>
+  <main id="app">
+    <section id="auth-view" class="auth-shell">
+      <div class="brand"><span class="brand-mark">F</span><span>FlowPay</span></div>
+      <div class="auth-card">
+        <p class="eyebrow">PAYMENT OPERATING SYSTEM</p>
+        <h1 id="auth-title">Войти в кабинет</h1>
+        <p class="muted" id="auth-subtitle">Управляйте платежами, каналами и выплатами в одном месте.</p>
+        <form id="auth-form">
+          <label>Email<input id="email" type="email" required placeholder="you@company.com" /></label>
+          <label>Пароль<input id="password" type="password" minlength="10" required placeholder="Минимум 10 символов" /></label>
+          <label id="org-field" class="hidden">Название организации<input id="organization" placeholder="Мой магазин" /></label>
+          <button class="primary" type="submit" id="auth-submit">Войти</button>
+        </form>
+        <button class="link-button" id="auth-switch">Создать аккаунт</button>
+        <p id="auth-error" class="error"></p>
+      </div>
+    </section>
+    <section id="dashboard-view" class="hidden">
+      <aside class="sidebar">
+        <div class="brand"><span class="brand-mark">F</span><span>FlowPay</span></div>
+        <nav>
+          <button class="nav-item active" data-page="overview">Обзор</button>
+          <button class="nav-item" data-page="payments">Платежи</button>
+          <button class="nav-item" data-page="analytics">Аналитика</button>
+          <button class="nav-item" data-page="payouts">Выплаты</button>
+          <button class="nav-item" data-page="security">Безопасность</button>
+        </nav>
+        <button id="logout" class="logout">Выйти</button>
+      </aside>
+      <div class="content"><header><div><p class="eyebrow">CONTROL CENTER</p><h1 id="page-title">Обзор</h1></div><div class="user-chip" id="user-email"></div></header><div id="page-content"></div></div>
+    </section>
+  </main>
+  <script src="/web/app.js"></script>
+</body>
+</html>
