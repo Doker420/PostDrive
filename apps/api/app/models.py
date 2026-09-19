@@ -57,6 +57,32 @@ class ApiKey(Base):
     project: Mapped[Project] = relationship(back_populates="api_keys")
 
 
+class SupplierProfile(Base):
+    __tablename__ = "supplier_profiles"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
+    display_name: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    commission_percent: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=Decimal("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class PaymentChannel(Base):
+    __tablename__ = "payment_channels"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("supplier_profiles.id"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    method: Mapped[str] = mapped_column(String(40))
+    currency: Mapped[str] = mapped_column(String(3))
+    min_amount: Mapped[Decimal] = mapped_column(Numeric(20, 2))
+    max_amount: Mapped[Decimal] = mapped_column(Numeric(20, 2))
+    daily_limit: Mapped[Decimal] = mapped_column(Numeric(20, 2))
+    used_today: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"))
+    encrypted_details: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="inactive")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Payment(Base):
     __tablename__ = "payments"
     __table_args__ = (UniqueConstraint("project_id", "idempotency_key"),)
