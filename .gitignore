@@ -15,6 +15,15 @@ config.ini
 __pycache__/
 *.pyc
 
+# FlowPay local secrets and runtime data
+.env
+.env.*
+!.env.example
+node_modules/
+coverage/
+.dist/
+
+
 # Downloads / media
 downloads/
 photos/
