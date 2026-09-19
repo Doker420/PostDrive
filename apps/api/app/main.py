@@ -7,7 +7,7 @@ import secrets
 
 import httpx
 import pyotp
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import and_, select
@@ -167,11 +167,22 @@ class PaymentOut(BaseModel):
     merchant_net: Decimal = Decimal("0")
 
 
-def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer), db: Session = Depends(get_db)) -> User:
-    user_id = read_token(credentials.credentials) if credentials else None
-    user = db.get(User, user_id) if user_id else None
+def create_session(db: Session, user: User, token: str, request: Request | None = None) -> None:
+    db.add(AuthSession(user_id=user.id, token_hash=token_hash(token),
+                       ip_address=request.client.host if request and request.client else None,
+                       user_agent=request.headers.get("user-agent") if request else None))
+
+
+def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+                 request: Request = None, db: Session = Depends(get_db)) -> User:
+    token = credentials.credentials if credentials else None
+    user_id = read_token(token) if token else None
+    session = db.scalar(select(AuthSession).where(AuthSession.token_hash == token_hash(token) if token else False,
+                                                  AuthSession.revoked_at.is_(None)))
+    user = db.get(User, user_id) if user_id and session else None
     if not user:
         raise HTTPException(status_code=401, detail="unauthorized")
+    session.last_seen_at = datetime.now(timezone.utc)
     return user
 
 
@@ -273,7 +284,7 @@ def health() -> dict:
 
 
 @app.post("/api/v1/auth/register", response_model=TokenOut, status_code=201)
-def register(payload: RegisterIn, db: Session = Depends(get_db)):
+def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(409, "email_already_registered")
@@ -282,11 +293,14 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
-    return TokenOut(access_token=issue_token(user.id))
+    token = issue_token(user.id)
+    create_session(db, user, token, request)
+    db.commit()
+    return TokenOut(access_token=token)
 
 
 @app.post("/api/v1/auth/login", response_model=TokenOut)
-def login(payload: LoginIn, db: Session = Depends(get_db)):
+def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == payload.email.strip().lower()))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(401, "invalid_credentials")
@@ -298,7 +312,41 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
         if backup_hash in (user.backup_codes or []):
             user.backup_codes.remove(backup_hash)
             db.commit()
-    return TokenOut(access_token=issue_token(user.id))
+    token = issue_token(user.id)
+    create_session(db, user, token, request)
+    db.commit()
+    return TokenOut(access_token=token)
+
+
+@app.get("/api/v1/auth/sessions")
+def list_sessions(credentials: HTTPAuthorizationCredentials = Depends(bearer),
+                  user: User = Depends(current_user), db: Session = Depends(get_db)):
+    current_hash = token_hash(credentials.credentials)
+    rows = db.scalars(select(AuthSession).where(AuthSession.user_id == user.id,
+                                                AuthSession.revoked_at.is_(None))).all()
+    return [{"id": row.id, "current": row.token_hash == current_hash, "ip_address": row.ip_address,
+             "user_agent": row.user_agent, "created_at": row.created_at,
+             "last_seen_at": row.last_seen_at} for row in rows]
+
+
+@app.delete("/api/v1/auth/sessions/{session_id}")
+def revoke_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    session = db.scalar(select(AuthSession).where(AuthSession.id == session_id, AuthSession.user_id == user.id,
+                                                 AuthSession.revoked_at.is_(None)))
+    if not session:
+        raise HTTPException(404, "session_not_found")
+    session.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"status": "revoked", "session_id": session.id}
+
+
+@app.post("/api/v1/auth/logout-all")
+def logout_all(credentials: HTTPAuthorizationCredentials = Depends(bearer),
+               user: User = Depends(current_user), db: Session = Depends(get_db)):
+    db.query(AuthSession).filter(AuthSession.user_id == user.id, AuthSession.revoked_at.is_(None)).update(
+        {"revoked_at": datetime.now(timezone.utc)})
+    db.commit()
+    return {"status": "ok"}
 
 
 @app.post("/api/v1/auth/2fa/setup")
@@ -692,7 +740,7 @@ def save_wallet(payload: WalletIn, user: User = Depends(current_user), db: Sessi
 @app.post("/api/v1/payouts", status_code=201)
 def create_payout(payload: PayoutIn, authorization: str | None = Header(default=None),
                   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-                  db: Session = Depends(get_db)):
+                  db: Session = Dependends(get_db)):
     if not idempotency_key:
         raise HTTPException(400, "idempotency_key_required")
     _, project = api_context(authorization, db)
@@ -721,3 +769,4 @@ def get_payment(public_id: str, authorization: str | None = Header(default=None)
     if not payment:
         raise HTTPException(404, "payment_not_found")
     return payment_response(payment)
+ment_response(payment)

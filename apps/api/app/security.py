@@ -30,6 +30,10 @@ def issue_token(user_id: int) -> str:
     return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
 
 
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def read_token(token: str) -> int | None:
     try:
         decoded = base64.urlsafe_b64decode(token.encode()).decode()
