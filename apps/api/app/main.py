@@ -32,6 +32,14 @@ class LoginIn(BaseModel):
     password: str
 
 
+class AdminStatusIn(BaseModel):
+    status: str = Field(pattern="^(pending|active|blocked|suspended)$")
+
+
+class AdminChannelStatusIn(BaseModel):
+    status: str = Field(pattern="^(active|inactive|blocked)$")
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -129,6 +137,12 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     return user
 
 
+def admin_user(user: User = Depends(current_user)) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin_role_required")
+    return user
+
+
 def api_context(authorization: str | None, db: Session) -> tuple[ApiKey, Project]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -206,6 +220,79 @@ def create_api_key(project_id: int, payload: ApiKeyIn, user: User = Depends(curr
     db.commit()
     db.refresh(api_key)
     return ApiKeyOut(id=api_key.id, label=api_key.label, mode=api_key.mode, key=raw)
+
+
+@app.post("/api/v1/admin/bootstrap", status_code=201)
+def bootstrap_admin(email: str, bootstrap_token: str = Header(alias="X-Admin-Bootstrap-Token"), db: Session = Depends(get_db)):
+    if bootstrap_token != settings.admin_bootstrap_token:
+        raise HTTPException(403, "invalid_bootstrap_token")
+    user = db.scalar(select(User).where(User.email == email.strip().lower()))
+    if not user:
+        raise HTTPException(404, "user_not_found")
+    user.role = "admin"
+    db.commit()
+    return {"status": "ok", "user_id": user.id, "role": user.role}
+
+
+@app.get("/api/v1/admin/overview")
+def admin_overview(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    return {
+        "organizations": db.query(Organization).count(),
+        "users": db.query(User).count(),
+        "projects": db.query(Project).count(),
+        "suppliers": db.query(SupplierProfile).count(),
+        "channels": db.query(PaymentChannel).count(),
+        "payments": db.query(Payment).count(),
+        "pending_payments": db.query(Payment).filter(Payment.status == "pending").count(),
+    }
+
+
+@app.get("/api/v1/admin/suppliers")
+def admin_suppliers(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(SupplierProfile).order_by(SupplierProfile.created_at.desc())).all()
+    return [{"id": row.id, "organization_id": row.organization_id, "display_name": row.display_name,
+             "status": row.status, "commission_percent": row.commission_percent,
+             "channels": db.query(PaymentChannel).filter(PaymentChannel.supplier_id == row.id).count()}
+            for row in rows]
+
+
+@app.patch("/api/v1/admin/suppliers/{supplier_id}")
+def admin_supplier_status(supplier_id: int, payload: AdminStatusIn, _: User = Depends(admin_user), db: Session = Depends(get_db)):
+    supplier = db.get(SupplierProfile, supplier_id)
+    if not supplier:
+        raise HTTPException(404, "supplier_not_found")
+    supplier.status = payload.status
+    if payload.status != "active":
+        db.query(PaymentChannel).filter(PaymentChannel.supplier_id == supplier.id).update({"status": "inactive"})
+    db.commit()
+    return {"id": supplier.id, "status": supplier.status}
+
+
+@app.get("/api/v1/admin/channels")
+def admin_channels(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(PaymentChannel).order_by(PaymentChannel.created_at.desc())).all()
+    return [{"id": row.id, "supplier_id": row.supplier_id, "name": row.name, "method": row.method,
+             "currency": row.currency, "min_amount": row.min_amount, "max_amount": row.max_amount,
+             "daily_limit": row.daily_limit, "used_today": row.used_today, "status": row.status}
+            for row in rows]
+
+
+@app.patch("/api/v1/admin/channels/{channel_id}")
+def admin_channel_status(channel_id: int, payload: AdminChannelStatusIn, _: User = Depends(admin_user), db: Session = Depends(get_db)):
+    channel = db.get(PaymentChannel, channel_id)
+    if not channel:
+        raise HTTPException(404, "channel_not_found")
+    channel.status = payload.status
+    db.commit()
+    return {"id": channel.id, "status": channel.status}
+
+
+@app.get("/api/v1/admin/payments")
+def admin_payments(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(100)).all()
+    return [{"id": row.public_id, "project_id": row.project_id, "channel_id": row.channel_id,
+             "order_id": row.order_id, "amount": row.amount, "currency": row.currency,
+             "status": row.status, "created_at": row.created_at} for row in rows]
 
 
 @app.post("/api/v1/supplier", status_code=201)
