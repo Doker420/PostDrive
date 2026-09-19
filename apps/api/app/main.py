@@ -4,6 +4,8 @@ from decimal import Decimal
 from hashlib import sha256
 from uuid import uuid4
 import secrets
+import time
+from collections import defaultdict, deque
 
 import httpx
 import pyotp
@@ -27,6 +29,29 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
 app.mount("/web", StaticFiles(directory="apps/web"), name="web")
 bearer = HTTPBearer(auto_error=False)
+_rate_windows: dict[str, deque[float]] = defaultdict(deque)
+
+
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    if request.url.path in {"/health", "/health/ready"} or request.url.path.startswith("/docs"):
+        return await call_next(request)
+    client = request.client.host if request.client else "unknown"
+    group = "auth" if "/auth/" in request.url.path else "api"
+    limit = 20 if group == "auth" else settings.rate_limit_per_minute
+    key = f"{client}:{group}"
+    now = time.monotonic()
+    window = _rate_windows[key]
+    while window and window[0] <= now - 60:
+        window.popleft()
+    if len(window) >= limit:
+        return Response(status_code=429, content='{"detail":"rate_limited"}', media_type="application/json",
+                        headers={"Retry-After": "60"})
+    window.append(now)
+    response = await call_next(request)
+    response.headers["X-RateLimit-Limit"] = str(limit)
+    response.headers["X-RateLimit-Remaining"] = str(max(0, limit - len(window)))
+    return response
 
 
 class RegisterIn(BaseModel):

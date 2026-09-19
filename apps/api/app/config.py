@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str = "sqlite:///./flowpay.db"
     redis_url: str = "redis://localhost:6379"
+    rate_limit_per_minute: int = 120
     token_secret: str = "change-me-in-production"
     api_key_prefix: str = "fp_live_"
     token_ttl_hours: int = 24
