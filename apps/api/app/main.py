@@ -334,6 +334,30 @@ def bootstrap_admin(email: str, bootstrap_token: str = Header(alias="X-Admin-Boo
     return {"status": "ok", "user_id": user.id, "role": user.role}
 
 
+@app.get("/api/v1/export/payments.csv")
+def merchant_payments_csv(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    _, project = api_context(authorization, db)
+    rows = db.scalars(select(Payment).where(Payment.project_id == project.id).order_by(Payment.created_at.desc())).all()
+    lines = ["id,order_id,amount,currency,status,platform_fee,supplier_fee,merchant_net,created_at"]
+    lines += [f"{p.public_id},{p.order_id},{p.amount},{p.currency},{p.status},{p.platform_fee},{p.supplier_fee},{p.merchant_net},{p.created_at.isoformat()}" for p in rows]
+    return Response(content="\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=flowpay-payments.csv"})
+
+
+@app.get("/api/v1/admin/statistics")
+def admin_statistics(_: User = Depends(admin_user), days: int = Query(default=30, ge=1, le=365), db: Session = Depends(get_db)):
+    since = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
+    payments = db.scalars(select(Payment).where(Payment.created_at >= since)).all()
+    succeeded = [p for p in payments if p.status == "succeeded"]
+    return {"period_days": days, "payments": len(payments), "succeeded": len(succeeded),
+            "pending": sum(p.status == "pending" for p in payments),
+            "failed": sum(p.status == "failed" for p in payments),
+            "gross": str(sum((p.amount for p in succeeded), Decimal("0"))),
+            "platform_fees": str(sum((p.platform_fee for p in succeeded), Decimal("0"))),
+            "supplier_fees": str(sum((p.supplier_fee for p in succeeded), Decimal("0"))),
+            "merchant_net": str(sum((p.merchant_net for p in succeeded), Decimal("0"))),
+            "conversion_percent": round((len(succeeded) / len(payments) * 100), 2) if payments else 0}
+
+
 @app.get("/api/v1/admin/overview")
 def admin_overview(_: User = Depends(admin_user), db: Session = Depends(get_db)):
     return {
@@ -413,13 +437,13 @@ def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
         if merchant_net < 0:
             raise HTTPException(422, "fees_exceed_payment_amount")
         payment.platform_fee, payment.supplier_fee, payment.merchant_net = platform_fee, supplier_fee, merchant_net
-        db.add(LedgerEntry(organization_id=project.organization_id, payment_id=payment.id,
-                           amount=merchant_net, currency=payment.currency,
-                           entry_type="payment_credit", description=f"Net payment {payment.public_id}"))
+        db.add(LedgerEntry(organization_id=project.organization_id, payment_id=payment.id, amount=merchant_net,
+                           currency=payment.currency, entry_type="payment_credit",
+                           description=f"Net payment {payment.public_id}"))
         if supplier_org_id and supplier_fee:
-            db.add(LedgerEntry(organization_id=supplier_org_id, payment_id=payment.id,
-                               amount=supplier_fee, currency=payment.currency,
-                               entry_type="supplier_commission", description=f"Commission for {payment.public_id}"))
+            db.add(LedgerEntry(organization_id=supplier_org_id, payment_id=payment.id, amount=supplier_fee,
+                               currency=payment.currency, entry_type="supplier_commission",
+                               description=f"Commission for {payment.public_id}"))
     event = emit_payment_event(db, payment, f"payment.{payload.status}")
     db.commit()
     delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
@@ -578,6 +602,24 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
     if delivery:
         background_tasks.add_task(deliver_webhook, delivery.id)
     return payment_response(payment)
+
+
+@app.get("/api/v1/statistics")
+def merchant_statistics(authorization: str | None = Header(default=None),
+                       days: int = Query(default=30, ge=1, le=365), db: Session = Depends(get_db)):
+    _, project = api_context(authorization, db)
+    since = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
+    query = select(Payment).where(Payment.project_id == project.id, Payment.created_at >= since)
+    payments = db.scalars(query).all()
+    succeeded = [p for p in payments if p.status == "succeeded"]
+    return {"period_days": days, "payments": len(payments), "succeeded": len(succeeded),
+            "failed": sum(p.status == "failed" for p in payments),
+            "conversion_percent": round((len(succeeded) / len(payments) * 100), 2) if payments else 0,
+            "gross": str(sum((p.amount for p in succeeded), Decimal("0"))),
+            "platform_fees": str(sum((p.platform_fee for p in succeeded), Decimal("0"))),
+            "supplier_fees": str(sum((p.supplier_fee for p in succeeded), Decimal("0"))),
+            "merchant_net": str(sum((p.merchant_net for p in succeeded), Decimal("0"))),
+            "average_check": str((sum((p.amount for p in succeeded), Decimal("0")) / len(succeeded)).quantize(Decimal("0.01"))) if succeeded else "0.00"}
 
 
 @app.get("/api/v1/balance")
