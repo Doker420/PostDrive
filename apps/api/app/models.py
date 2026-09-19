@@ -128,6 +128,33 @@ class WebhookDelivery(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class CryptoWallet(Base):
+    __tablename__ = "crypto_wallets"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
+    currency: Mapped[str] = mapped_column(String(10), default="USDT")
+    network: Mapped[str] = mapped_column(String(20))
+    address: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Payout(Base):
+    __tablename__ = "payouts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 2))
+    currency: Mapped[str] = mapped_column(String(3))
+    crypto_currency: Mapped[str] = mapped_column(String(10))
+    network: Mapped[str] = mapped_column(String(20))
+    address: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    tx_hash: Mapped[str | None] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
+
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
     id: Mapped[int] = mapped_column(primary_key=True)

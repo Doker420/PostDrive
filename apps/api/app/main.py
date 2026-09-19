@@ -48,6 +48,25 @@ class AdminPaymentStatusIn(BaseModel):
     status: str = Field(pattern="^(pending|processing|succeeded|failed|expired|cancelled)$")
 
 
+class WalletIn(BaseModel):
+    currency: str = Field(default="USDT", pattern="^(USDT|USDC)$")
+    network: str = Field(pattern="^(TRC20|ERC20|POLYGON)$")
+    address: str = Field(min_length=20, max_length=160)
+
+
+class PayoutIn(BaseModel):
+    amount: Decimal = Field(gt=0, decimal_places=2)
+    currency: str = Field(default="RUB", min_length=3, max_length=3)
+    crypto_currency: str = Field(default="USDT", pattern="^(USDT|USDC)$")
+    network: str = Field(pattern="^(TRC20|ERC20|POLYGON)$")
+    address: str = Field(min_length=20, max_length=160)
+
+
+class PayoutStatusIn(BaseModel):
+    status: str = Field(pattern="^(processing|completed|failed|cancelled)$")
+    tx_hash: str | None = Field(default=None, max_length=160)
+
+
 class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -150,6 +169,12 @@ def admin_user(user: User = Depends(current_user)) -> User:
     if user.role != "admin":
         raise HTTPException(status_code=403, detail="admin_role_required")
     return user
+
+
+def organization_balance(db: Session, organization_id: int, currency: str) -> Decimal:
+    entries = db.scalars(select(LedgerEntry).where(LedgerEntry.organization_id == organization_id,
+                                                   LedgerEntry.currency == currency.upper())).all()
+    return sum((Decimal(str(entry.amount)) for entry in entries), Decimal("0"))
 
 
 def api_context(authorization: str | None, db: Session) -> tuple[ApiKey, Project]:
@@ -405,6 +430,32 @@ def admin_webhook_deliveries(_: User = Depends(admin_user), db: Session = Depend
              "last_error": row.last_error, "created_at": row.created_at} for row in rows]
 
 
+@app.get("/api/v1/admin/payouts")
+def admin_payouts(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Payout).order_by(Payout.created_at.desc()).limit(100)).all()
+    return [{"id": row.public_id, "organization_id": row.organization_id, "amount": row.amount,
+             "currency": row.currency, "crypto_currency": row.crypto_currency,
+             "network": row.network, "address": row.address, "status": row.status,
+             "tx_hash": row.tx_hash, "created_at": row.created_at} for row in rows]
+
+
+@app.patch("/api/v1/admin/payouts/{public_id}/status")
+def admin_payout_status(public_id: str, payload: PayoutStatusIn,
+                        _: User = Depends(admin_user), db: Session = Depends(get_db)):
+    payout = db.scalar(select(Payout).where(Payout.public_id == public_id))
+    if not payout:
+        raise HTTPException(404, "payout_not_found")
+    if payout.status in {"completed", "failed", "cancelled"}:
+        raise HTTPException(409, "payout_already_final")
+    payout.status, payout.tx_hash = payload.status, payload.tx_hash
+    if payload.status in {"failed", "cancelled"}:
+        db.add(LedgerEntry(organization_id=payout.organization_id, amount=payout.amount,
+                           currency=payout.currency, entry_type="payout_reversal",
+                           description=f"Reversal for {payout.public_id}"))
+    db.commit()
+    return {"id": payout.public_id, "status": payout.status, "tx_hash": payout.tx_hash}
+
+
 @app.get("/api/v1/admin/payments")
 def admin_payments(_: User = Depends(admin_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(100)).all()
@@ -506,6 +557,52 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
     if delivery:
         background_tasks.add_task(deliver_webhook, delivery.id)
     return payment_response(payment)
+
+
+@app.get("/api/v1/balance")
+def merchant_balance(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
+    _, project = api_context(authorization, db)
+    balance = organization_balance(db, project.organization_id, "RUB")
+    return {"available": str(balance), "currency": "RUB"}
+
+
+@app.post("/api/v1/wallet", status_code=201)
+def save_wallet(payload: WalletIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    wallet = db.scalar(select(CryptoWallet).where(CryptoWallet.organization_id == user.organization_id))
+    if wallet:
+        wallet.currency, wallet.network, wallet.address, wallet.status = payload.currency, payload.network, payload.address, "pending"
+    else:
+        wallet = CryptoWallet(organization_id=user.organization_id, currency=payload.currency,
+                              network=payload.network, address=payload.address, status="pending")
+        db.add(wallet)
+    db.commit()
+    return {"id": wallet.id, "currency": wallet.currency, "network": wallet.network,
+            "address": wallet.address, "status": wallet.status}
+
+
+@app.post("/api/v1/payouts", status_code=201)
+def create_payout(payload: PayoutIn, authorization: str | None = Header(default=None),
+                  idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+                  db: Session = Depends(get_db)):
+    if not idempotency_key:
+        raise HTTPException(400, "idempotency_key_required")
+    _, project = api_context(authorization, db)
+    available = organization_balance(db, project.organization_id, payload.currency)
+    if payload.amount > available:
+        raise HTTPException(422, "insufficient_balance")
+    payout_id = "po_" + uuid4().hex
+    payout = Payout(public_id=payout_id, organization_id=project.organization_id, amount=payload.amount,
+                    currency=payload.currency.upper(), crypto_currency=payload.crypto_currency,
+                    network=payload.network, address=payload.address, status="pending")
+    db.add(payout)
+    db.flush()
+    db.add(LedgerEntry(organization_id=project.organization_id, amount=-payload.amount,
+                       currency=payload.currency.upper(), entry_type="payout_reserve",
+                       description=f"Payout {payout_id}"))
+    db.commit()
+    return {"id": payout.public_id, "amount": str(payout.amount), "currency": payout.currency,
+            "crypto_currency": payout.crypto_currency, "network": payout.network,
+            "address": payout.address, "status": payout.status}
 
 
 @app.get("/api/v1/payments/{public_id}", response_model=PaymentOut)
