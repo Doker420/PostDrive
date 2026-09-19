@@ -22,6 +22,17 @@ class Organization(Base):
     projects: Mapped[list["Project"]] = relationship(back_populates="organization")
 
 
+class RiskEvent(Base):
+    __tablename__ = "risk_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"), index=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    score: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="open")
+    reason: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class NotificationSetting(Base):
     __tablename__ = "notification_settings"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -137,6 +148,8 @@ class Payment(Base):
     platform_fee: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"))
     supplier_fee: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"))
     merchant_net: Mapped[Decimal] = mapped_column(Numeric(20, 2), default=Decimal("0"))
+    risk_score: Mapped[int] = mapped_column(Integer, default=0)
+    risk_status: Mapped[str] = mapped_column(String(30), default="clear")
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)

@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, SessionLocal, engine, get_db
 from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organization, Payment,
-                      PaymentChannel, PaymentEvent, Payout, Project, SupplierProfile,
+                      PaymentChannel, PaymentEvent, Payout, Project, RiskEvent, SupplierProfile,
                       NotificationSetting, TelegramIntegration, User, WebhookDelivery)
 from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, token_hash, verify_password)
@@ -800,8 +800,21 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
                       success_url=str(payload.success_url) if payload.success_url else None,
                       fail_url=str(payload.fail_url) if payload.fail_url else None,
                       metadata_json=payload.metadata)
+    score = 0
+    reasons = []
+    if payload.amount >= Decimal("100000"):
+        score += 40
+        reasons.append("high_amount")
+    if not channel:
+        score += 20
+        reasons.append("no_preselected_channel")
+    payment.risk_score = score
+    payment.risk_status = "review" if score >= 50 else "clear"
     db.add(payment)
     db.flush()
+    if score:
+        db.add(RiskEvent(payment_id=payment.id, organization_id=project.organization_id,
+                         score=score, status="open", reason=",".join(reasons)))
     event = emit_payment_event(db, payment, "payment.pending")
     try:
         db.commit()
