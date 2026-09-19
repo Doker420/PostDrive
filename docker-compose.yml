@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://flowpay:flowpay@postgres:5432/flowpay
+      TOKEN_SECRET: change-me-local-only
+      ENVIRONMENT: development
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/workspace
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: flowpay
+      POSTGRES_USER: flowpay
+      POSTGRES_PASSWORD: flowpay
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowpay -d flowpay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - flowpay_pgdata:/var/lib/postgresql/data
+volumes:
+  flowpay_pgdata:
