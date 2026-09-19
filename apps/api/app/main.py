@@ -318,6 +318,15 @@ def health() -> dict:
     return {"status": "ok", "service": "flowpay-api", "environment": settings.environment}
 
 
+@app.get("/health/ready")
+def readiness(db: Session = Depends(get_db)):
+    try:
+        db.execute(select(1))
+        return {"status": "ready", "database": "ok"}
+    except Exception:
+        raise HTTPException(503, "database_unavailable")
+
+
 @app.post("/api/v1/auth/register", response_model=TokenOut, status_code=201)
 def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()

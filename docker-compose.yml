@@ -12,8 +12,14 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
     volumes:
       - .:/workspace
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:
