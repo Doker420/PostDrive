@@ -6,7 +6,7 @@ from uuid import uuid4
 import secrets
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import and_, select
