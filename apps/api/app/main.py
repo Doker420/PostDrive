@@ -402,55 +402,6 @@ def disable_2fa(payload: OtpCodeIn, user: User = Depends(current_user), db: Sess
     return {"enabled": False}
 
 
-@app.get("/api/v1/notifications")
-def get_notification_settings(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    settings_row = db.scalar(select(NotificationSetting).where(NotificationSetting.organization_id == user.organization_id))
-    if not settings_row:
-        settings_row = NotificationSetting(organization_id=user.organization_id)
-        db.add(settings_row)
-        db.commit()
-    return {"enabled_events": settings_row.enabled_events, "telegram_enabled": settings_row.telegram_enabled, "email_enabled": settings_row.email_enabled}
-
-
-@app.patch("/api/v1/notifications")
-def update_notification_settings(payload: NotificationSettingsIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    settings_row = db.scalar(select(NotificationSetting).where(NotificationSetting.organization_id == user.organization_id))
-    if not settings_row:
-        settings_row = NotificationSetting(organization_id=user.organization_id)
-        db.add(settings_row)
-    settings_row.enabled_events = payload.enabled_events
-    settings_row.telegram_enabled = payload.telegram_enabled
-    settings_row.email_enabled = payload.email_enabled
-    db.commit()
-    return {"enabled_events": settings_row.enabled_events, "telegram_enabled": settings_row.telegram_enabled, "email_enabled": settings_row.email_enabled}
-
-
-@app.post("/api/v1/telegram", status_code=201)
-def connect_telegram(payload: TelegramIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    integration = db.scalar(select(TelegramIntegration).where(TelegramIntegration.organization_id == user.organization_id))
-    if integration:
-        integration.bot_token_encrypted = encrypt_secret(payload.bot_token)
-        integration.chat_id = payload.chat_id
-        integration.status = "active"
-    else:
-        integration = TelegramIntegration(organization_id=user.organization_id,
-                                          bot_token_encrypted=encrypt_secret(payload.bot_token),
-                                          chat_id=payload.chat_id, status="active")
-        db.add(integration)
-    db.commit()
-    return {"id": integration.id, "chat_id": integration.chat_id, "status": integration.status}
-
-
-@app.delete("/api/v1/telegram")
-def disconnect_telegram(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    integration = db.scalar(select(TelegramIntegration).where(TelegramIntegration.organization_id == user.organization_id))
-    if not integration:
-        raise HTTPException(404, "telegram_not_connected")
-    integration.status = "disabled"
-    db.commit()
-    return {"status": "disabled"}
-
-
 @app.get("/api/v1/me", response_model=UserOut)
 def me(user: User = Depends(current_user)):
     return user
@@ -881,3 +832,6 @@ def get_payment(public_id: str, authorization: str | None = Header(default=None)
 
 from .routes.auth import router as auth_router
 app.include_router(auth_router)
+
+from .routes.notifications import router as notifications_router
+app.include_router(notifications_router)
