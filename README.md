@@ -22,6 +22,10 @@
 3. Создать backend foundation: auth, organizations, projects, API keys, migrations.
 4. Добавить sandbox-платёж с идемпотентностью и webhook.
 
+## Production
+
+См. [production runbook](docs/production.md), [security policy](SECURITY.md) и [инструкцию миграций](apps/api/migrations/README.md).
+
 ## Telegram operations bot
 
 См. [apps/telegram_bot/README.md](apps/telegram_bot/README.md). Бот запускается отдельно от API.
