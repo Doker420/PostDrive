@@ -746,9 +746,9 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
                    authorization: str | None = Header(default=None),
                    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
                    db: Session = Depends(get_db)):
+    _, project = api_context(authorization, db)
     if not idempotency_key:
         raise HTTPException(400, "idempotency_key_required")
-    _, project = api_context(authorization, db)
     existing = db.scalar(select(Payment).where(Payment.project_id == project.id, Payment.idempotency_key == idempotency_key))
     if existing:
         if existing.order_id != payload.order_id or existing.amount != payload.amount:

@@ -25,7 +25,8 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def issue_token(user_id: int) -> str:
     expires = int((datetime.now(timezone.utc) + timedelta(hours=settings.token_ttl_hours)).timestamp())
-    payload = f"{user_id}:{expires}"
+    nonce = secrets.token_urlsafe(12)
+    payload = f"{user_id}:{expires}:{nonce}"
     signature = hmac.new(settings.token_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
 
@@ -37,8 +38,8 @@ def token_hash(token: str) -> str:
 def read_token(token: str) -> int | None:
     try:
         decoded = base64.urlsafe_b64decode(token.encode()).decode()
-        user, expires, signature = decoded.split(":", 2)
-        payload = f"{user}:{expires}"
+        user, expires, nonce, signature = decoded.split(":", 3)
+        payload = f"{user}:{expires}:{nonce}"
         expected = hmac.new(settings.token_secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(signature, expected) or int(expires) < int(datetime.now(timezone.utc).timestamp()):
             return None
