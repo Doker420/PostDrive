@@ -2,6 +2,8 @@ import base64
 import hashlib
 import hmac
 import secrets
+
+from cryptography.fernet import Fernet
 from datetime import datetime, timedelta, timezone
 
 from .config import settings
