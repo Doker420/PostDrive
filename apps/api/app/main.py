@@ -16,10 +16,11 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import Base, SessionLocal, engine, get_db
-from .models import (ApiKey, CryptoWallet, LedgerEntry, Organization, Payment, PaymentChannel,
-                      PaymentEvent, Payout, Project, SupplierProfile, User, WebhookDelivery)
+from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organization, Payment,
+                      PaymentChannel, PaymentEvent, Payout, Project, SupplierProfile, User,
+                      WebhookDelivery)
 from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
-                       sign_webhook, verify_password)
+                       sign_webhook, token_hash, verify_password)
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
