@@ -740,7 +740,7 @@ def save_wallet(payload: WalletIn, user: User = Depends(current_user), db: Sessi
 @app.post("/api/v1/payouts", status_code=201)
 def create_payout(payload: PayoutIn, authorization: str | None = Header(default=None),
                   idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-                  db: Session = Dependends(get_db)):
+                  db: Session = Depends(get_db)):
     if not idempotency_key:
         raise HTTPException(400, "idempotency_key_required")
     _, project = api_context(authorization, db)
