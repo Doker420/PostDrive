@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from hashlib import sha256
 from uuid import uuid4
+import secrets
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,7 +14,8 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import Base, engine, get_db
-from .models import ApiKey, LedgerEntry, Organization, Payment, PaymentChannel, Project, SupplierProfile, User
+from .models import (ApiKey, LedgerEntry, Organization, Payment, PaymentChannel, PaymentEvent,
+                      Project, SupplierProfile, User, WebhookDelivery)
 from .security import encrypt_secret, hash_password, issue_token, new_api_key, read_token, verify_password
 
 Base.metadata.create_all(bind=engine)
@@ -38,6 +40,10 @@ class AdminStatusIn(BaseModel):
 
 class AdminChannelStatusIn(BaseModel):
     status: str = Field(pattern="^(active|inactive|blocked)$")
+
+
+class AdminPaymentStatusIn(BaseModel):
+    status: str = Field(pattern="^(pending|processing|succeeded|failed|expired|cancelled)$")
 
 
 class TokenOut(BaseModel):
@@ -159,6 +165,32 @@ def payment_response(payment: Payment) -> PaymentOut:
                       payment_url=payment.payment_url,
                       expires_at=payment.created_at.replace(tzinfo=timezone.utc),
                       metadata=payment.metadata_json or {})
+
+
+def emit_payment_event(db: Session, payment: Payment, event_type: str) -> PaymentEvent:
+    event_id = "evt_" + secrets.token_urlsafe(18)
+    payload = {
+        "id": event_id,
+        "type": event_type,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "data": {"id": payment.public_id, "status": payment.status,
+                 "amount": str(payment.amount), "currency": payment.currency,
+                 "order_id": payment.order_id, "metadata": payment.metadata_json or {}},
+    }
+    event = PaymentEvent(event_id=event_id, payment_id=payment.id, event_type=event_type, payload=payload)
+    db.add(event)
+    project = db.get(Project, payment.project_id)
+    if project and project.webhook_url:
+        db.add(WebhookDelivery(event_id=event_id, project_id=project.id, url=project.webhook_url,
+                               payload=payload))
+    return event
+
+
+ALLOWED_TRANSITIONS = {
+    "pending": {"processing", "failed", "expired", "cancelled", "succeeded"},
+    "processing": {"succeeded", "failed", "expired"},
+    "succeeded": set(), "failed": set(), "expired": set(), "cancelled": set(),
+}
 
 
 @app.get("/health")
@@ -287,6 +319,34 @@ def admin_channel_status(channel_id: int, payload: AdminChannelStatusIn, _: User
     return {"id": channel.id, "status": channel.status}
 
 
+@app.patch("/api/v1/admin/payments/{public_id}/status")
+def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
+                         _: User = Depends(admin_user), db: Session = Depends(get_db)):
+    payment = db.scalar(select(Payment).where(Payment.public_id == public_id))
+    if not payment:
+        raise HTTPException(404, "payment_not_found")
+    if payload.status not in ALLOWED_TRANSITIONS.get(payment.status, set()):
+        raise HTTPException(409, f"invalid_status_transition:{payment.status}->{payload.status}")
+    old_status = payment.status
+    payment.status = payload.status
+    if payload.status == "succeeded":
+        project = db.get(Project, payment.project_id)
+        db.add(LedgerEntry(organization_id=project.organization_id, payment_id=payment.id,
+                           amount=payment.amount, currency=payment.currency,
+                           entry_type="payment_credit", description=f"Payment {payment.public_id}"))
+    emit_payment_event(db, payment, f"payment.{payload.status}")
+    db.commit()
+    return {"id": payment.public_id, "old_status": old_status, "status": payment.status}
+
+
+@app.get("/api/v1/admin/webhook-deliveries")
+def admin_webhook_deliveries(_: User = Depends(admin_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(WebhookDelivery).order_by(WebhookDelivery.created_at.desc()).limit(100)).all()
+    return [{"id": row.id, "event_id": row.event_id, "project_id": row.project_id,
+             "url": row.url, "status": row.status, "attempts": row.attempts,
+             "last_error": row.last_error, "created_at": row.created_at} for row in rows]
+
+
 @app.get("/api/v1/admin/payments")
 def admin_payments(_: User = Depends(admin_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Payment).order_by(Payment.created_at.desc()).limit(100)).all()
@@ -372,6 +432,8 @@ def create_payment(payload: PaymentIn, authorization: str | None = Header(defaul
                       fail_url=str(payload.fail_url) if payload.fail_url else None,
                       metadata_json=payload.metadata)
     db.add(payment)
+    db.flush()
+    emit_payment_event(db, payment, "payment.pending")
     try:
         db.commit()
     except IntegrityError:

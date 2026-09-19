@@ -103,6 +103,30 @@ class Payment(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
 
 
+class PaymentEvent(Base):
+    __tablename__ = "payment_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payments.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(60))
+    payload: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class WebhookDelivery(Base):
+    __tablename__ = "webhook_deliveries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(50), index=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id"), index=True)
+    url: Mapped[str] = mapped_column(String(2048))
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
     id: Mapped[int] = mapped_column(primary_key=True)
