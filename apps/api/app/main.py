@@ -35,6 +35,11 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     email: str
     password: str
+    otp_code: str | None = None
+
+
+class OtpCodeIn(BaseModel):
+    code: str = Field(min_length=6, max_length=12)
 
 
 class AdminStatusIn(BaseModel):
