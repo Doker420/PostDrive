@@ -71,6 +71,7 @@ class Payment(Base):
     payment_url: Mapped[str] = mapped_column(String(2048))
     success_url: Mapped[str | None] = mapped_column(String(2048))
     fail_url: Mapped[str | None] = mapped_column(String(2048))
+    channel_id: Mapped[int | None] = mapped_column(ForeignKey("payment_channels.id"))
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
