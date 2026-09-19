@@ -40,6 +40,7 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(160))
     mode: Mapped[str] = mapped_column(String(20), default="test")
     webhook_url: Mapped[str | None] = mapped_column(String(2048))
+    webhook_secret: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     organization: Mapped[Organization] = relationship(back_populates="projects")
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="project")

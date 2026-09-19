@@ -5,7 +5,8 @@ from hashlib import sha256
 from uuid import uuid4
 import secrets
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+import httpx
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import and_, select
@@ -13,10 +14,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import Base, engine, get_db
+from .db import Base, SessionLocal, engine, get_db
 from .models import (ApiKey, LedgerEntry, Organization, Payment, PaymentChannel, PaymentEvent,
                       Project, SupplierProfile, User, WebhookDelivery)
-from .security import encrypt_secret, hash_password, issue_token, new_api_key, read_token, verify_password
+from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
+                       sign_webhook, verify_password)
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
@@ -71,6 +73,7 @@ class ProjectOut(BaseModel):
     name: str
     mode: str
     webhook_url: str | None
+    webhook_secret: str | None = None
 
 
 class SupplierIn(BaseModel):
@@ -186,6 +189,41 @@ def emit_payment_event(db: Session, payment: Payment, event_type: str) -> Paymen
     return event
 
 
+async def deliver_webhook(delivery_id: int) -> None:
+    db = SessionLocal()
+    try:
+        delivery = db.get(WebhookDelivery, delivery_id)
+        if not delivery or delivery.status == "delivered":
+            return
+        project = db.get(Project, delivery.project_id)
+        if not project or not project.webhook_url:
+            return
+        body = json.dumps(delivery.payload, separators=(",", ":"), ensure_ascii=False)
+        timestamp = str(int(datetime.now(timezone.utc).timestamp()))
+        signature = sign_webhook(project.webhook_secret, timestamp, body)
+        delivery.attempts += 1
+        try:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+                response = await client.post(delivery.url, content=body.encode(), headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "FlowPay-Webhook/1.0",
+                    "X-FlowPay-Event-Id": delivery.event_id,
+                    "X-FlowPay-Signature": f"t={timestamp},v1={signature}",
+                })
+            if 200 <= response.status_code < 300:
+                delivery.status = "delivered"
+                delivery.last_error = None
+            else:
+                delivery.status = "failed" if delivery.attempts >= 5 else "pending"
+                delivery.last_error = f"http_{response.status_code}"
+        except Exception as exc:
+            delivery.status = "failed" if delivery.attempts >= 5 else "pending"
+            delivery.last_error = str(exc)[:500]
+        db.commit()
+    finally:
+        db.close()
+
+
 ALLOWED_TRANSITIONS = {
     "pending": {"processing", "failed", "expired", "cancelled", "succeeded"},
     "processing": {"succeeded", "failed", "expired"},
@@ -227,7 +265,8 @@ def me(user: User = Depends(current_user)):
 @app.post("/api/v1/projects", response_model=ProjectOut, status_code=201)
 def create_project(payload: ProjectIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     project = Project(organization_id=user.organization_id, name=payload.name, mode=payload.mode,
-                      webhook_url=str(payload.webhook_url) if payload.webhook_url else None)
+                      webhook_url=str(payload.webhook_url) if payload.webhook_url else None,
+                      webhook_secret="whsec_" + secrets.token_urlsafe(32))
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -321,6 +360,7 @@ def admin_channel_status(channel_id: int, payload: AdminChannelStatusIn, _: User
 
 @app.patch("/api/v1/admin/payments/{public_id}/status")
 def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
+                         background_tasks: BackgroundTasks,
                          _: User = Depends(admin_user), db: Session = Depends(get_db)):
     payment = db.scalar(select(Payment).where(Payment.public_id == public_id))
     if not payment:
@@ -334,9 +374,27 @@ def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
         db.add(LedgerEntry(organization_id=project.organization_id, payment_id=payment.id,
                            amount=payment.amount, currency=payment.currency,
                            entry_type="payment_credit", description=f"Payment {payment.public_id}"))
-    emit_payment_event(db, payment, f"payment.{payload.status}")
+    event = emit_payment_event(db, payment, f"payment.{payload.status}")
     db.commit()
+    delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
+    if delivery:
+        background_tasks.add_task(deliver_webhook, delivery.id)
     return {"id": payment.public_id, "old_status": old_status, "status": payment.status}
+
+
+@app.post("/api/v1/admin/webhook-deliveries/{delivery_id}/retry")
+def admin_retry_webhook(delivery_id: int, background_tasks: BackgroundTasks,
+                        _: User = Depends(admin_user), db: Session = Depends(get_db)):
+    delivery = db.get(WebhookDelivery, delivery_id)
+    if not delivery:
+        raise HTTPException(404, "webhook_delivery_not_found")
+    if delivery.status == "delivered":
+        return {"id": delivery.id, "status": delivery.status}
+    delivery.status = "pending"
+    delivery.last_error = None
+    db.commit()
+    background_tasks.add_task(deliver_webhook, delivery.id)
+    return {"id": delivery.id, "status": "queued"}
 
 
 @app.get("/api/v1/admin/webhook-deliveries")
@@ -399,7 +457,8 @@ def list_channels(user: User = Depends(current_user), db: Session = Depends(get_
 
 
 @app.post("/api/v1/payments", response_model=PaymentOut, status_code=201)
-def create_payment(payload: PaymentIn, authorization: str | None = Header(default=None),
+def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
+                   authorization: str | None = Header(default=None),
                    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
                    db: Session = Depends(get_db)):
     if not idempotency_key:
@@ -433,7 +492,7 @@ def create_payment(payload: PaymentIn, authorization: str | None = Header(defaul
                       metadata_json=payload.metadata)
     db.add(payment)
     db.flush()
-    emit_payment_event(db, payment, "payment.pending")
+    event = emit_payment_event(db, payment, "payment.pending")
     try:
         db.commit()
     except IntegrityError:
@@ -443,6 +502,9 @@ def create_payment(payload: PaymentIn, authorization: str | None = Header(defaul
             return payment_response(existing)
         raise HTTPException(409, "payment_conflict")
     db.refresh(payment)
+    delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
+    if delivery:
+        background_tasks.add_task(deliver_webhook, delivery.id)
     return payment_response(payment)
 
 

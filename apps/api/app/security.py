@@ -48,6 +48,11 @@ def _fernet() -> Fernet:
     return Fernet(key)
 
 
+def sign_webhook(secret: str, timestamp: str, body: str) -> str:
+    message = f"{timestamp}.{body}".encode()
+    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+
+
 def encrypt_secret(value: str) -> str:
     return _fernet().encrypt(value.encode()).decode()
 
