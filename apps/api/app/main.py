@@ -15,8 +15,8 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import Base, SessionLocal, engine, get_db
-from .models import (ApiKey, LedgerEntry, Organization, Payment, PaymentChannel, PaymentEvent,
-                      Project, SupplierProfile, User, WebhookDelivery)
+from .models import (ApiKey, CryptoWallet, LedgerEntry, Organization, Payment, PaymentChannel,
+                      PaymentEvent, Payout, Project, SupplierProfile, User, WebhookDelivery)
 from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, verify_password)
 
