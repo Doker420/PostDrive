@@ -20,6 +20,19 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    command: ["python", "-m", "apps.worker.main"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://flowpay:flowpay@postgres:5432/flowpay
+      TOKEN_SECRET: change-me-local-only
+      WORKER_INTERVAL_SECONDS: 10
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
     environment:
