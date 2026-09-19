@@ -340,41 +340,6 @@ ALLOWED_TRANSITIONS = {
 }
 
 
-@app.post("/api/v1/auth/register", response_model=TokenOut, status_code=201)
-def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)):
-    email = payload.email.strip().lower()
-    if db.scalar(select(User).where(User.email == email)):
-        raise HTTPException(409, "email_already_registered")
-    organization = Organization(name=payload.organization_name, kind="merchant")
-    user = User(email=email, password_hash=hash_password(payload.password), organization=organization)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    token = issue_token(user.id)
-    create_session(db, user, token, request)
-    db.commit()
-    return TokenOut(access_token=token)
-
-
-@app.post("/api/v1/auth/login", response_model=TokenOut)
-def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == payload.email.strip().lower()))
-    if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(401, "invalid_credentials")
-    if user.twofa_enabled:
-        valid_totp = bool(payload.otp_code and user.totp_secret and pyotp.TOTP(user.totp_secret).verify(payload.otp_code))
-        backup_hash = sha256(payload.otp_code.encode()).hexdigest() if payload.otp_code else ""
-        if not valid_totp and backup_hash not in (user.backup_codes or []):
-            raise HTTPException(401, "two_factor_code_required")
-        if backup_hash in (user.backup_codes or []):
-            user.backup_codes.remove(backup_hash)
-            db.commit()
-    token = issue_token(user.id)
-    create_session(db, user, token, request)
-    db.commit()
-    return TokenOut(access_token=token)
-
-
 @app.get("/api/v1/auth/sessions")
 def list_sessions(credentials: HTTPAuthorizationCredentials = Depends(bearer),
                   user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -912,3 +877,7 @@ def get_payment(public_id: str, authorization: str | None = Header(default=None)
     if not payment:
         raise HTTPException(404, "payment_not_found")
     return payment_response(payment)
+
+
+from .routes.auth import router as auth_router
+app.include_router(auth_router)
