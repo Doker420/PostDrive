@@ -22,13 +22,13 @@ class Organization(Base):
     projects: Mapped[list["Project"]] = relationship(back_populates="organization")
 
 
-class TelegramIntegration(Base):
-    __tablename__ = "telegram_integrations"
+class NotificationSetting(Base):
+    __tablename__ = "notification_settings"
     id: Mapped[int] = mapped_column(primary_key=True)
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
-    bot_token_encrypted: Mapped[str] = mapped_column(Text)
-    chat_id: Mapped[str] = mapped_column(String(80))
-    status: Mapped[str] = mapped_column(String(30), default="active")
+    enabled_events: Mapped[list] = mapped_column(JSON, default=lambda: ["payment.created", "payment.succeeded", "payment.failed", "payout.completed", "payout.failed"])
+    telegram_enabled: Mapped[bool] = mapped_column(default=True)
+    email_enabled: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

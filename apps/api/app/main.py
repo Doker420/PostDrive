@@ -19,7 +19,7 @@ from .config import settings
 from .db import Base, SessionLocal, engine, get_db
 from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organization, Payment,
                       PaymentChannel, PaymentEvent, Payout, Project, SupplierProfile,
-                      TelegramIntegration, User, WebhookDelivery)
+                      NotificationSetting, TelegramIntegration, User, WebhookDelivery)
 from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, token_hash, verify_password)
 
@@ -55,6 +55,17 @@ class AdminChannelStatusIn(BaseModel):
 
 class AdminPaymentStatusIn(BaseModel):
     status: str = Field(pattern="^(pending|processing|succeeded|failed|expired|cancelled)$")
+
+
+class NotificationSettingsIn(BaseModel):
+    enabled_events: list[str] = Field(default_factory=list)
+    telegram_enabled: bool = True
+    email_enabled: bool = False
+
+
+class TelegramIn(BaseModel):
+    bot_token: str = Field(min_length=20, max_length=300)
+    chat_id: str = Field(min_length=1, max_length=80)
 
 
 class WalletIn(BaseModel):
@@ -274,9 +285,12 @@ async def deliver_webhook(delivery_id: int) -> None:
         db.close()
 
 
-async def send_telegram(organization_id: int, text: str) -> None:
+async def send_telegram(organization_id: int, text: str, event_type: str | None = None) -> None:
     db = SessionLocal()
     try:
+        preference = db.scalar(select(NotificationSetting).where(NotificationSetting.organization_id == organization_id))
+        if preference and (not preference.telegram_enabled or (event_type and event_type not in (preference.enabled_events or []))):
+            return
         integration = db.scalar(select(TelegramIntegration).where(
             TelegramIntegration.organization_id == organization_id,
             TelegramIntegration.status == "active"))
@@ -399,6 +413,29 @@ def disable_2fa(payload: OtpCodeIn, user: User = Depends(current_user), db: Sess
     user.backup_codes = []
     db.commit()
     return {"enabled": False}
+
+
+@app.get("/api/v1/notifications")
+def get_notification_settings(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    settings_row = db.scalar(select(NotificationSetting).where(NotificationSetting.organization_id == user.organization_id))
+    if not settings_row:
+        settings_row = NotificationSetting(organization_id=user.organization_id)
+        db.add(settings_row)
+        db.commit()
+    return {"enabled_events": settings_row.enabled_events, "telegram_enabled": settings_row.telegram_enabled, "email_enabled": settings_row.email_enabled}
+
+
+@app.patch("/api/v1/notifications")
+def update_notification_settings(payload: NotificationSettingsIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    settings_row = db.scalar(select(NotificationSetting).where(NotificationSetting.organization_id == user.organization_id))
+    if not settings_row:
+        settings_row = NotificationSetting(organization_id=user.organization_id)
+        db.add(settings_row)
+    settings_row.enabled_events = payload.enabled_events
+    settings_row.telegram_enabled = payload.telegram_enabled
+    settings_row.email_enabled = payload.email_enabled
+    db.commit()
+    return {"enabled_events": settings_row.enabled_events, "telegram_enabled": settings_row.telegram_enabled, "email_enabled": settings_row.email_enabled}
 
 
 @app.post("/api/v1/telegram", status_code=201)
