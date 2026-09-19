@@ -29,6 +29,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(300))
     role: Mapped[str] = mapped_column(String(40), default="owner")
     organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"))
+    totp_secret: Mapped[str | None] = mapped_column(String(64))
+    twofa_enabled: Mapped[bool] = mapped_column(default=False)
+    backup_codes: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     organization: Mapped[Organization] = relationship(back_populates="users")
 

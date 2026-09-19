@@ -6,6 +6,7 @@ from uuid import uuid4
 import secrets
 
 import httpx
+import pyotp
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
@@ -78,6 +79,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     organization_id: int
+    twofa_enabled: bool
 
 
 class ProjectIn(BaseModel):
@@ -283,7 +285,46 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == payload.email.strip().lower()))
     if not user or not verify_password(payload.password, user.password_hash):
         raise HTTPException(401, "invalid_credentials")
+    if user.twofa_enabled:
+        valid_totp = bool(payload.otp_code and user.totp_secret and pyotp.TOTP(user.totp_secret).verify(payload.otp_code))
+        backup_hash = sha256(payload.otp_code.encode()).hexdigest() if payload.otp_code else ""
+        if not valid_totp and backup_hash not in (user.backup_codes or []):
+            raise HTTPException(401, "two_factor_code_required")
+        if backup_hash in (user.backup_codes or []):
+            user.backup_codes.remove(backup_hash)
+            db.commit()
     return TokenOut(access_token=issue_token(user.id))
+
+
+@app.post("/api/v1/auth/2fa/setup")
+def setup_2fa(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    secret = pyotp.random_base32()
+    user.totp_secret = secret
+    user.twofa_enabled = False
+    db.commit()
+    return {"secret": secret, "otpauth_url": pyotp.TOTP(secret).provisioning_uri(name=user.email, issuer_name="FlowPay")}
+
+
+@app.post("/api/v1/auth/2fa/confirm")
+def confirm_2fa(payload: OtpCodeIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if not user.totp_secret or not pyotp.TOTP(user.totp_secret).verify(payload.code):
+        raise HTTPException(400, "invalid_two_factor_code")
+    user.twofa_enabled = True
+    codes = [secrets.token_hex(5) for _ in range(8)]
+    user.backup_codes = [sha256(code.encode()).hexdigest() for code in codes]
+    db.commit()
+    return {"enabled": True, "backup_codes": codes}
+
+
+@app.post("/api/v1/auth/2fa/disable")
+def disable_2fa(payload: OtpCodeIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if not user.twofa_enabled or not user.totp_secret or not pyotp.TOTP(user.totp_secret).verify(payload.code):
+        raise HTTPException(400, "invalid_two_factor_code")
+    user.twofa_enabled = False
+    user.totp_secret = None
+    user.backup_codes = []
+    db.commit()
+    return {"enabled": False}
 
 
 @app.get("/api/v1/me", response_model=UserOut)
