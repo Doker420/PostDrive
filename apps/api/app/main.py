@@ -22,12 +22,14 @@ from .db import Base, SessionLocal, engine, get_db
 from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organization, Payment,
                       PaymentChannel, PaymentEvent, Payout, Project, RiskEvent, SupplierProfile,
                       NotificationSetting, TelegramIntegration, User, WebhookDelivery)
-from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
+from .security import (decrypt_secret, encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, token_hash, verify_password)
+from .routes.health import router as health_router
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
 app.mount("/web", StaticFiles(directory="apps/web"), name="web")
+app.include_router(health_router)
 bearer = HTTPBearer(auto_error=False)
 _rate_windows: dict[str, deque[float]] = defaultdict(deque)
 
@@ -336,20 +338,6 @@ ALLOWED_TRANSITIONS = {
     "processing": {"succeeded", "failed", "expired"},
     "succeeded": set(), "failed": set(), "expired": set(), "cancelled": set(),
 }
-
-
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok", "service": "flowpay-api", "environment": settings.environment}
-
-
-@app.get("/health/ready")
-def readiness(db: Session = Depends(get_db)):
-    try:
-        db.execute(select(1))
-        return {"status": "ready", "database": "ok"}
-    except Exception:
-        raise HTTPException(503, "database_unavailable")
 
 
 @app.post("/api/v1/auth/register", response_model=TokenOut, status_code=201)
