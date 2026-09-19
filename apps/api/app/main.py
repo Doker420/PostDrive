@@ -769,4 +769,3 @@ def get_payment(public_id: str, authorization: str | None = Header(default=None)
     if not payment:
         raise HTTPException(404, "payment_not_found")
     return payment_response(payment)
-ment_response(payment)
