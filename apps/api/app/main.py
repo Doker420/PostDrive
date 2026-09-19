@@ -18,8 +18,8 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import Base, SessionLocal, engine, get_db
 from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organization, Payment,
-                      PaymentChannel, PaymentEvent, Payout, Project, SupplierProfile, User,
-                      WebhookDelivery)
+                      PaymentChannel, PaymentEvent, Payout, Project, SupplierProfile,
+                      TelegramIntegration, User, WebhookDelivery)
 from .security import (encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, token_hash, verify_password)
 
@@ -274,6 +274,24 @@ async def deliver_webhook(delivery_id: int) -> None:
         db.close()
 
 
+async def send_telegram(organization_id: int, text: str) -> None:
+    db = SessionLocal()
+    try:
+        integration = db.scalar(select(TelegramIntegration).where(
+            TelegramIntegration.organization_id == organization_id,
+            TelegramIntegration.status == "active"))
+        if not integration:
+            return
+        token = decrypt_secret(integration.bot_token_encrypted)
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={"chat_id": integration.chat_id, "text": text})
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
 ALLOWED_TRANSITIONS = {
     "pending": {"processing", "failed", "expired", "cancelled", "succeeded"},
     "processing": {"succeeded", "failed", "expired"},
@@ -381,6 +399,32 @@ def disable_2fa(payload: OtpCodeIn, user: User = Depends(current_user), db: Sess
     user.backup_codes = []
     db.commit()
     return {"enabled": False}
+
+
+@app.post("/api/v1/telegram", status_code=201)
+def connect_telegram(payload: TelegramIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    integration = db.scalar(select(TelegramIntegration).where(TelegramIntegration.organization_id == user.organization_id))
+    if integration:
+        integration.bot_token_encrypted = encrypt_secret(payload.bot_token)
+        integration.chat_id = payload.chat_id
+        integration.status = "active"
+    else:
+        integration = TelegramIntegration(organization_id=user.organization_id,
+                                          bot_token_encrypted=encrypt_secret(payload.bot_token),
+                                          chat_id=payload.chat_id, status="active")
+        db.add(integration)
+    db.commit()
+    return {"id": integration.id, "chat_id": integration.chat_id, "status": integration.status}
+
+
+@app.delete("/api/v1/telegram")
+def disconnect_telegram(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    integration = db.scalar(select(TelegramIntegration).where(TelegramIntegration.organization_id == user.organization_id))
+    if not integration:
+        raise HTTPException(404, "telegram_not_connected")
+    integration.status = "disabled"
+    db.commit()
+    return {"status": "disabled"}
 
 
 @app.get("/api/v1/me", response_model=UserOut)
@@ -546,6 +590,8 @@ def admin_payment_status(public_id: str, payload: AdminPaymentStatusIn,
     delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
     if delivery:
         background_tasks.add_task(deliver_webhook, delivery.id)
+    background_tasks.add_task(send_telegram, project.organization_id,
+                              f"FlowPay: платеж {payment.public_id} → {payment.status}\\nСумма: {payment.amount} {payment.currency}")
     return {"id": payment.public_id, "old_status": old_status, "status": payment.status}
 
 
@@ -698,6 +744,8 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
     delivery = db.scalar(select(WebhookDelivery).where(WebhookDelivery.event_id == event.event_id))
     if delivery:
         background_tasks.add_task(deliver_webhook, delivery.id)
+    background_tasks.add_task(send_telegram, project.organization_id,
+                              f"FlowPay: создан платеж {payment.public_id}\\nСумма: {payment.amount} {payment.currency}")
     return payment_response(payment)
 
 

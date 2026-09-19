@@ -22,6 +22,26 @@ class Organization(Base):
     projects: Mapped[list["Project"]] = relationship(back_populates="organization")
 
 
+class TelegramIntegration(Base):
+    __tablename__ = "telegram_integrations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
+    bot_token_encrypted: Mapped[str] = mapped_column(Text)
+    chat_id: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class TelegramIntegration(Base):
+    __tablename__ = "telegram_integrations"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    organization_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), unique=True)
+    bot_token_encrypted: Mapped[str] = mapped_column(Text)
+    chat_id: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class AuthSession(Base):
     __tablename__ = "auth_sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
