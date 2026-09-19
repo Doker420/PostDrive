@@ -679,3 +679,6 @@ from .routes.auth import router as auth_router
 app.include_router(auth_router)
 from .routes.notifications import router as notifications_router
 app.include_router(notifications_router)
+
+from .routes.payouts import router as payouts_router
+app.include_router(payouts_router)
