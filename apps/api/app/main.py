@@ -25,6 +25,8 @@ from .models import (ApiKey, AuthSession, CryptoWallet, LedgerEntry, Organizatio
 from .security import (decrypt_secret, encrypt_secret, hash_password, issue_token, new_api_key, read_token,
                        sign_webhook, token_hash, verify_password)
 from .routes.health import router as health_router
+from .services.risk import score_payment
+from .services.ledger import balance as ledger_balance
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title=settings.app_name, version="0.1.0", description="FlowPay B2B payment orchestration API")
@@ -234,9 +236,7 @@ def admin_user(user: User = Depends(current_user)) -> User:
 
 
 def organization_balance(db: Session, organization_id: int, currency: str) -> Decimal:
-    entries = db.scalars(select(LedgerEntry).where(LedgerEntry.organization_id == organization_id,
-                                                   LedgerEntry.currency == currency.upper())).all()
-    return sum((Decimal(str(entry.amount)) for entry in entries), Decimal("0"))
+    return ledger_balance(db, organization_id, currency)
 
 
 def api_context(authorization: str | None, db: Session) -> tuple[ApiKey, Project]:
@@ -788,14 +788,7 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
                       success_url=str(payload.success_url) if payload.success_url else None,
                       fail_url=str(payload.fail_url) if payload.fail_url else None,
                       metadata_json=payload.metadata)
-    score = 0
-    reasons = []
-    if payload.amount >= Decimal("100000"):
-        score += 40
-        reasons.append("high_amount")
-    if not channel:
-        score += 20
-        reasons.append("no_preselected_channel")
+    score, reasons = score_payment(payload.amount, bool(channel))
     payment.risk_score = score
     payment.risk_status = "review" if score >= 50 else "clear"
     db.add(payment)
