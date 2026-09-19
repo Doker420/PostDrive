@@ -679,7 +679,7 @@ def create_payment(background_tasks: BackgroundTasks, payload: PaymentIn,
     payment = Payment(public_id=public_id, project_id=project.id, idempotency_key=idempotency_key,
                       channel_id=channel.id if channel else None,
                       order_id=payload.order_id, amount=payload.amount, currency=payload.currency.upper(),
-                      payment_url=f"{settings.app_name.lower().replace(' ', '-')}/pay/{public_id}",
+                      payment_url=f"/web/checkout.html?payment={public_id}",
                       success_url=str(payload.success_url) if payload.success_url else None,
                       fail_url=str(payload.fail_url) if payload.fail_url else None,
                       metadata_json=payload.metadata)
@@ -763,6 +763,33 @@ def create_payout(payload: PayoutIn, authorization: str | None = Header(default=
     return {"id": payout.public_id, "amount": str(payout.amount), "currency": payout.currency,
             "crypto_currency": payout.crypto_currency, "network": payout.network,
             "address": payout.address, "status": payout.status}
+
+
+@app.get("/api/v1/checkout/{public_id}")
+def checkout(public_id: str, db: Session = Depends(get_db)):
+    payment = db.scalar(select(Payment).where(Payment.public_id == public_id))
+    if not payment:
+        raise HTTPException(404, "payment_not_found")
+    details, method_label = {}, "Payment channel"
+    if payment.channel_id:
+        channel = db.get(PaymentChannel, payment.channel_id)
+        if channel:
+            method_label = {"sbp": "СБП", "card": "Банковская карта", "bank_transfer": "Банковский перевод"}.get(channel.method, channel.method)
+            try:
+                details = json.loads(decrypt_secret(channel.encrypted_details))
+            except Exception:
+                details = {}
+    return {"id": payment.public_id, "amount": str(payment.amount), "currency": payment.currency,
+            "order_id": payment.order_id, "status": payment.status, "method_label": method_label,
+            "details": details, "success_url": payment.success_url, "fail_url": payment.fail_url}
+
+
+@app.post("/api/v1/checkout/{public_id}/check")
+def checkout_check(public_id: str, db: Session = Depends(get_db)):
+    payment = db.scalar(select(Payment).where(Payment.public_id == public_id))
+    if not payment:
+        raise HTTPException(404, "payment_not_found")
+    return {"id": payment.public_id, "status": payment.status}
 
 
 @app.get("/api/v1/payments/{public_id}", response_model=PaymentOut)
