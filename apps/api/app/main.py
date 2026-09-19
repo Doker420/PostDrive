@@ -627,49 +627,6 @@ def admin_payments(_: User = Depends(admin_user), db: Session = Depends(get_db))
              "status": row.status, "created_at": row.created_at} for row in rows]
 
 
-@app.post("/api/v1/supplier", status_code=201)
-def create_supplier(payload: SupplierIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    existing = db.scalar(select(SupplierProfile).where(SupplierProfile.organization_id == user.organization_id))
-    if existing:
-        raise HTTPException(409, "supplier_profile_exists")
-    profile = SupplierProfile(organization_id=user.organization_id, display_name=payload.display_name,
-                              commission_percent=payload.commission_percent, status="active")
-    user.organization.kind = "supplier"
-    db.add(profile)
-    db.commit()
-    db.refresh(profile)
-    return {"id": profile.id, "display_name": profile.display_name, "status": profile.status,
-            "commission_percent": profile.commission_percent}
-
-
-@app.post("/api/v1/supplier/channels", response_model=ChannelOut, status_code=201)
-def create_channel(payload: ChannelIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    if payload.max_amount < payload.min_amount:
-        raise HTTPException(422, "max_amount_below_min_amount")
-    supplier = db.scalar(select(SupplierProfile).where(
-        SupplierProfile.organization_id == user.organization_id,
-        SupplierProfile.status == "active"))
-    if not supplier:
-        raise HTTPException(403, "active_supplier_profile_required")
-    channel = PaymentChannel(supplier_id=supplier.id, name=payload.name, method=payload.method,
-                            currency=payload.currency.upper(), min_amount=payload.min_amount,
-                            max_amount=payload.max_amount, daily_limit=payload.daily_limit,
-                            encrypted_details=encrypt_secret(json.dumps(payload.details, ensure_ascii=False)),
-                            status="active")
-    db.add(channel)
-    db.commit()
-    db.refresh(channel)
-    return channel
-
-
-@app.get("/api/v1/supplier/channels", response_model=list[ChannelOut])
-def list_channels(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    supplier = db.scalar(select(SupplierProfile).where(SupplierProfile.organization_id == user.organization_id))
-    if not supplier:
-        raise HTTPException(404, "supplier_profile_not_found")
-    return list(db.scalars(select(PaymentChannel).where(PaymentChannel.supplier_id == supplier.id)))
-
-
 
 
 from .routes.payments import router as payments_router
@@ -682,3 +639,5 @@ app.include_router(notifications_router)
 
 from .routes.payouts import router as payouts_router
 app.include_router(payouts_router)
+from .routes.supplier import router as supplier_router
+app.include_router(supplier_router)
