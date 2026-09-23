@@ -3433,7 +3433,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         account_id = int(callback.data.split('_')[2])
         if not db.is_user_subscribed(user_id, ADMIN):
-            await callback.answer("🔒 Для использования нейрокомментинга требуется активная подписка.", show_alert=True)
+            await callback.answer(
+                "🔒 Подписка не активна.\n\n"
+                "Если вы её оплачивали — нажмите «💳 Подписка» и проверьте статус, "
+                "либо напишите в поддержку.",
+                show_alert=True
+            )
             return
         nc = db.get_neurocomment_settings(account_id)
         if not nc:

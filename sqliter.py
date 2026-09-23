@@ -1056,27 +1056,81 @@ class DBConnection(metaclass=_PoolBoundMeta):
         return self._dict_fetchall()
 
     def is_user_subscribed(self, user_id: int, admin_id: int = 0) -> bool:
-        if user_id == admin_id:
+        """Активна ли подписка.
+
+        Проверяются оба источника, иначе бот требовал оформить подписку
+        у людей, которым её уже выдали:
+          • users.subscription_until — срок, выданный оплатой/промокодом/админом;
+          • user_entitlements.tariff_code — платный тариф, выданный при оплате.
+        """
+        if admin_id and user_id == admin_id:
             return True
-        user = self.get_user(user_id)
-        if not user:
-            return False
-        if user.get('is_admin') == 1:
-            return True
-        sub_until = user.get('subscription_until', 0) or 0
-        return sub_until > int(time.time())
+        now = int(time.time())
+
+        c = self._cursor()
+        c.execute('SELECT subscription_until, is_admin FROM users WHERE user_id = ?', (user_id,))
+        row = c.fetchone()
+        if row is not None:
+            if isinstance(row, dict):
+                sub_until, is_admin = row.get('subscription_until'), row.get('is_admin')
+            else:
+                sub_until, is_admin = row[0], row[1]
+            if is_admin == 1:
+                return True
+            try:
+                if int(sub_until or 0) > now:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+        # Подписки по времени нет — но мог быть выдан платный тариф
+        try:
+            c.execute('SELECT tariff_code FROM user_entitlements WHERE user_id = ?', (user_id,))
+            ent = c.fetchone()
+            if ent is not None:
+                code = (ent.get('tariff_code') if isinstance(ent, dict) else ent[0]) or ''
+                code = str(code).strip().lower()
+                # trial — бесплатный ознакомительный, полноценной подпиской не считается
+                if code and code != 'trial':
+                    return True
+        except sqlite3.OperationalError:
+            pass          # старая БД без user_entitlements
+        return False
 
     def add_subscription_days(self, user_id: int, days: int):
-        user = self.get_user(user_id)
-        now = int(time.time())
-        current_sub = user.get('subscription_until', 0) if user else 0
-        
-        if current_sub and current_sub > now:
-            new_sub = current_sub + (days * 86400)
-        else:
-            new_sub = now + (days * 86400)
+        """Продлевает подписку. Создаёт пользователя, если его ещё нет.
 
-        self.c.execute('UPDATE users SET subscription_until = ? WHERE user_id = ?', (new_sub, user_id))
+        Раньше делался только UPDATE: если пользователь не нажимал /start
+        (или запись не создалась), запрос не задевал ни одной строки, но
+        функция всё равно рапортовала об успехе. Подписка «выдавалась»
+        в никуда, и бот продолжал требовать оформить её.
+        """
+        now = int(time.time())
+        c = self._cursor()
+        c.execute('SELECT subscription_until FROM users WHERE user_id = ?', (user_id,))
+        row = c.fetchone()
+        if row is None:
+            # Пользователя нет — заводим вместе с подпиской
+            new_sub = now + (days * 86400)
+            c.execute(
+                'INSERT INTO users (user_id, username, first_name, last_name, '
+                'subscription_until, is_admin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (user_id, '', '', '', new_sub, 0, now)
+            )
+            self.conn_ctx.commit()
+            logger.info(f"Подписка на {days} дн. выдана новому пользователю {user_id}")
+            return new_sub
+
+        current_sub = (row[0] if not isinstance(row, dict) else row.get('subscription_until')) or 0
+        try:
+            current_sub = int(current_sub)
+        except (TypeError, ValueError):
+            current_sub = 0
+        # Активную подписку продлеваем, истёкшую отсчитываем от текущего момента
+        base = current_sub if current_sub > now else now
+        new_sub = base + (days * 86400)
+        c.execute('UPDATE users SET subscription_until = ? WHERE user_id = ?',
+                  (new_sub, user_id))
         self.conn_ctx.commit()
         return new_sub
 
