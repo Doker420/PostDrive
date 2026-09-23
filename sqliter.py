@@ -752,96 +752,52 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self.conn_ctx.commit()
         c.close()
 
+    def _safe_ddl(self, c, sql: str) -> bool:
+        """Выполняет миграционный DDL, игнорируя «уже существует».
+
+        Под PostgreSQL неудачный ALTER TABLE переводит транзакцию в состояние
+        aborted, и все последующие запросы падают с InFailedSqlTransaction.
+        Поэтому после ошибки откатываемся, а под SQLite rollback безвреден.
+        """
+        try:
+            c.execute(sql)
+            return True
+        except Exception as e:
+            try:
+                self.conn_ctx.rollback()
+            except Exception:
+                pass
+            msg = str(e).lower()
+            expected = ('duplicate column', 'already exists', 'duplicate_column',
+                        'уже существует')
+            if not any(m in msg for m in expected):
+                logger.debug(f"DDL пропущен: {sql[:60]}... -> {type(e).__name__}: {e}")
+            return False
+
     def update_db(self):
         c = self._cursor()
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN subscription_until INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT \'\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN post_entities TEXT DEFAULT NULL')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_account_chats_acc_chat ON account_chats(account_id, chat_id)')
-        except Exception:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_enabled INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_text TEXT DEFAULT \'\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_media_path TEXT DEFAULT \'\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_media_type TEXT DEFAULT \'\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_entities TEXT DEFAULT NULL')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN autoresponder_parse_mode TEXT DEFAULT "HTML"')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN post_parse_mode TEXT DEFAULT "HTML"')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE recurring_messages ADD COLUMN media_file_id TEXT DEFAULT ""')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE recurring_messages ADD COLUMN buttons TEXT DEFAULT "[]"')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE account_chats ADD COLUMN custom_text TEXT DEFAULT ""')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE accounts ADD COLUMN notifications_hidden INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE account_chats ADD COLUMN chat_type TEXT DEFAULT \'unknown\'')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE account_chats ADD COLUMN synced_at INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE neurocomment_settings ADD COLUMN comment_delay INTEGER DEFAULT 60')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE parsed_users ADD COLUMN user_id_val INTEGER DEFAULT 0')
-        except sqlite3.OperationalError:
-            pass
-        try:
-            c.execute('ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
-        except sqlite3.OperationalError:
-            pass
+        self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN subscription_until INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT \'\'')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN post_entities TEXT DEFAULT NULL')
+        self._safe_ddl(c, 'CREATE UNIQUE INDEX IF NOT EXISTS idx_account_chats_acc_chat ON account_chats(account_id, chat_id)')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_enabled INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_text TEXT DEFAULT \'\'')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_media_path TEXT DEFAULT \'\'')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_media_type TEXT DEFAULT \'\'')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_entities TEXT DEFAULT NULL')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_parse_mode TEXT DEFAULT "HTML"')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN post_parse_mode TEXT DEFAULT "HTML"')
+        self._safe_ddl(c, 'ALTER TABLE recurring_messages ADD COLUMN media_file_id TEXT DEFAULT ""')
+        self._safe_ddl(c, 'ALTER TABLE recurring_messages ADD COLUMN buttons TEXT DEFAULT "[]"')
+        self._safe_ddl(c, 'ALTER TABLE account_chats ADD COLUMN custom_text TEXT DEFAULT ""')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN notifications_hidden INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE account_chats ADD COLUMN chat_type TEXT DEFAULT \'unknown\'')
+        self._safe_ddl(c, 'ALTER TABLE account_chats ADD COLUMN synced_at INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE neurocomment_settings ADD COLUMN comment_delay INTEGER DEFAULT 60')
+        self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN user_id_val INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
         for _ddl in (
             # access_hash позволяет обращаться к каналу без get_chat:
             # массовые get_chat при поиске каналов вызывали FloodWait
@@ -858,11 +814,11 @@ class DBConnection(metaclass=_PoolBoundMeta):
             "ALTER TABLE tariffs ADD COLUMN ai_comments_per_day INTEGER DEFAULT 20",
             "ALTER TABLE tariffs ADD COLUMN sort_order INTEGER DEFAULT 0",
         ):
-            try:
-                c.execute(_ddl)
-            except Exception:
-                pass
-        self.conn_ctx.commit()
+            self._safe_ddl(c, _ddl)
+        try:
+            self.conn_ctx.commit()
+        except Exception:
+            pass
         c.close()
 
     # Тарифная сетка: (code, название, дней, $, описание, макс. аккаунтов, AI/сутки, порядок)
@@ -1093,7 +1049,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
                 # trial — бесплатный ознакомительный, полноценной подпиской не считается
                 if code and code != 'trial':
                     return True
-        except sqlite3.OperationalError:
+        except Exception:
             pass          # старая БД без user_entitlements
         return False
 
