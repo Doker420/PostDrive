@@ -745,6 +745,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
         c.execute('CREATE INDEX IF NOT EXISTS idx_account_chats_spam ON account_chats(account_id, spam_enabled)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_parsed_users_account ON parsed_users(account_id, user_id)')
+        self._migrate_parsed_users_unique(c)
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_user ON running_tasks(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_status ON running_tasks(status)')
 
@@ -1758,35 +1759,141 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self.conn_ctx.commit()
 
     # ==================== PARSED USERS ====================
-    def save_parsed_users(self, account_id: int, user_id: int, users: List[Dict[str, Any]], source_chat_id: str = ''):
+    def _migrate_parsed_users_unique(self, c):
+        """Чинит UNIQUE-ограничение таблицы parsed_users.
+
+        В старой схеме было UNIQUE(account_id, user_id), где user_id — это
+        владелец бота, а не спарсенный пользователь. Колонка user_id_val
+        добавлялась позже через ALTER TABLE и в ограничение не попадала,
+        поэтому INSERT OR IGNORE сохранял ТОЛЬКО ПЕРВОГО пользователя, а все
+        последующие молча отбрасывались как дубликаты.
+        """
         try:
-            for u in users:
-                self.c.execute(
-                    'INSERT OR IGNORE INTO parsed_users (account_id, user_id, user_id_val, username, first_name, last_name, phone, source_chat_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                    (account_id, user_id, u.get('id', 0), u.get('username', ''), u.get('first_name', ''), u.get('last_name', ''), u.get('phone', ''), source_chat_id)
-                )
-            self.conn_ctx.commit()
-        except sqlite3.OperationalError:
-            # Fallback for old DB schema without user_id_val
+            row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='parsed_users'"
+            ).fetchone()
+            if not row or not row[0]:
+                return
+            ddl = row[0]
+            # Уже правильная схема — выходим
+            if 'user_id_val' in ddl.split('UNIQUE')[-1]:
+                return
+            logger.warning(
+                "parsed_users: обнаружено устаревшее UNIQUE(account_id, user_id) — "
+                "пересоздаю таблицу, из-за него сохранялся только первый пользователь"
+            )
+            # На время переноса отключаем FK: в старых БД встречаются записи
+            # осиротевших аккаунтов, из-за них перенос падал бы целиком.
+            fk_was_on = bool(c.execute('PRAGMA foreign_keys').fetchone()[0])
+            if fk_was_on:
+                c.execute('PRAGMA foreign_keys=OFF')
+            c.execute('ALTER TABLE parsed_users RENAME TO parsed_users_old')
+            c.execute("""CREATE TABLE parsed_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_id_val INTEGER DEFAULT 0,
+                username TEXT DEFAULT '',
+                first_name TEXT DEFAULT '',
+                last_name TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                source_chat_id TEXT DEFAULT '',
+                parsed_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+                UNIQUE(account_id, user_id, user_id_val)
+            )""")
+            cols = {r[1] for r in c.execute('PRAGMA table_info(parsed_users_old)')}
+            src = ['account_id', 'user_id']
+            for opt in ('user_id_val', 'username', 'first_name', 'last_name',
+                        'phone', 'source_chat_id', 'parsed_at'):
+                if opt in cols:
+                    src.append(opt)
+            c.execute(
+                f"INSERT OR IGNORE INTO parsed_users ({', '.join(src)}) "
+                f"SELECT {', '.join(src)} FROM parsed_users_old"
+            )
+            moved = c.execute('SELECT COUNT(*) FROM parsed_users').fetchone()[0]
+            c.execute('DROP TABLE parsed_users_old')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_parsed_users_account '
+                      'ON parsed_users(account_id, user_id)')
+            if fk_was_on:
+                c.execute('PRAGMA foreign_keys=ON')
+            logger.info(f"parsed_users: миграция UNIQUE завершена, перенесено {moved} записей")
+        except Exception as e:
+            logger.error(f"parsed_users: миграция UNIQUE не удалась: {e}")
+            # Откатываемся к исходной таблице, чтобы не потерять данные
             try:
-                for u in users:
-                    self.c.execute(
-                        'INSERT OR IGNORE INTO parsed_users (account_id, user_id, username, first_name, last_name, phone) VALUES (?, ?, ?, ?, ?, ?)',
-                        (account_id, user_id, u.get('username', ''), u.get('first_name', ''), u.get('last_name', ''), u.get('phone', ''))
-                    )
-                self.conn_ctx.commit()
-            except sqlite3.OperationalError:
-                pass
+                has_old = c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='parsed_users_old'").fetchone()
+                if has_old:
+                    c.execute('DROP TABLE IF EXISTS parsed_users')
+                    c.execute('ALTER TABLE parsed_users_old RENAME TO parsed_users')
+                    logger.warning("parsed_users: исходная таблица восстановлена")
+            except Exception as rollback_err:
+                logger.error(f"parsed_users: откат не удался: {rollback_err}")
+
+    def save_parsed_users(self, account_id: int, user_id: int, users: List[Dict[str, Any]],
+                          source_chat_id: str = '') -> int:
+        """Сохраняет спарсенных пользователей. Возвращает число новых записей.
+
+        user_id — владелец бота, user_id_val — Telegram ID спарсенного
+        пользователя. Уникальность считается по тройке, иначе сохранялся бы
+        только первый пользователь.
+        """
+        if not users:
+            return 0
+        rows = []
+        for u in users:
+            uid = u.get('id', 0) or 0
+            if not uid:
+                continue          # без Telegram ID запись бесполезна
+            rows.append((account_id, user_id, uid, u.get('username', '') or '',
+                         u.get('first_name', '') or '', u.get('last_name', '') or '',
+                         u.get('phone', '') or '', source_chat_id))
+        if not rows:
+            return 0
+        try:
+            before = self.c.execute(
+                'SELECT COUNT(*) FROM parsed_users WHERE account_id = ? AND user_id = ?',
+                (account_id, user_id)).fetchone()[0]
+            with self.transaction() as pooled:
+                pooled.raw.executemany(
+                    'INSERT OR IGNORE INTO parsed_users '
+                    '(account_id, user_id, user_id_val, username, first_name, '
+                    ' last_name, phone, source_chat_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    rows)
+            after = self.c.execute(
+                'SELECT COUNT(*) FROM parsed_users WHERE account_id = ? AND user_id = ?',
+                (account_id, user_id)).fetchone()[0]
+            added = after - before
+            if added < len(rows):
+                logger.info(f"parsed_users: {len(rows) - added} дубликатов пропущено "
+                            f"(добавлено {added} из {len(rows)})")
+            return added
+        except Exception as e:
+            logger.error(f"save_parsed_users failed (account {account_id}): {e}")
+            return 0
 
     def get_parsed_users(self, account_id: int, user_id: int) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM parsed_users WHERE account_id = ? AND user_id = ? ORDER BY parsed_at DESC', (account_id, user_id))
         return self._dict_fetchall()
 
-    def get_parsed_users_paginated(self, account_id: int, user_id: int, page: int = 0, per_page: int = 20) -> Tuple[List[Dict[str, Any]], int]:
-        offset = page * per_page
-        self.c.execute('SELECT COUNT(*) FROM parsed_users WHERE account_id = ? AND user_id = ?', (account_id, user_id))
+    def get_parsed_users_paginated(self, account_id: int, user_id: int, page: int = 0,
+                                   per_page: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+        """Страница списка + общее количество. Страница подрезается под диапазон."""
+        self.c.execute('SELECT COUNT(*) FROM parsed_users WHERE account_id = ? AND user_id = ?',
+                       (account_id, user_id))
         total = self.c.fetchone()[0]
-        self.c.execute('SELECT * FROM parsed_users WHERE account_id = ? AND user_id = ? ORDER BY parsed_at DESC LIMIT ? OFFSET ?', (account_id, user_id, per_page, offset))
+        if total == 0:
+            return [], 0
+        per_page = max(1, per_page)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        self.c.execute(
+            'SELECT * FROM parsed_users WHERE account_id = ? AND user_id = ? '
+            'ORDER BY id ASC LIMIT ? OFFSET ?',
+            (account_id, user_id, per_page, page * per_page))
         return self._dict_fetchall(), total
 
     def clear_parsed_users(self, account_id: int, user_id: int):

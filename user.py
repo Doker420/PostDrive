@@ -3180,7 +3180,9 @@ class AccountSessionManager:
 
         try:
             db.clear_parsed_users(account_id, user_id)
-            db.save_parsed_users(account_id, user_id, users, source_chat_id=str(chat_id))
+            saved = db.save_parsed_users(account_id, user_id, users, source_chat_id=str(chat_id))
+            if saved and saved < len(users):
+                logging.info(f"[{acc_name}] сохранено {saved} из {len(users)} (остальные — дубликаты)")
         except Exception as save_err:
             logging.error(f"❌ [{acc_name}] Failed to save parsed users: {save_err}")
             return users, f"Найдено {len(users)} пользователей (ошибка сохранения: {save_err})"
@@ -3213,7 +3215,8 @@ class AccountSessionManager:
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 markup = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📋 Показать список", callback_data=f"parsed_users_page_{account_id}_0")],
-                    [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")],
+                    [InlineKeyboardButton(text="🌐 HTML-таблица", callback_data=f"parsed_html_{account_id}"),
+                     InlineKeyboardButton(text="📥 CSV", callback_data=f"download_parsed_{account_id}")],
                     [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
                 ])
                 await bot.send_message(user_id, f"✅ Парсинг завершен! {msg}", reply_markup=markup)

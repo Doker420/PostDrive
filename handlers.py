@@ -7,7 +7,132 @@ import logging
 import random
 import string
 from datetime import datetime
+from html import escape as html_escape
 from typing import List, Dict, Optional, Any, Tuple
+
+
+def _build_parsed_html(users, acc_name: str = "") -> str:
+    """Самодостаточная HTML-страница с таблицей контактов.
+
+    Без внешних библиотек и CDN: файл должен открываться локально
+    двойным кликом, в том числе без интернета.
+    """
+    from datetime import datetime as _dt
+
+    rows = []
+    for i, u in enumerate(users, 1):
+        uid = u.get('user_id_val') or ''
+        uname = u.get('username') or ''
+        fname = html_escape(u.get('first_name') or '')
+        lname = html_escape(u.get('last_name') or '')
+        phone = html_escape(u.get('phone') or '')
+        src = html_escape(str(u.get('source_chat_id') or ''))
+        uname_cell = (f'<a href="https://t.me/{html_escape(uname)}" target="_blank">'
+                      f'@{html_escape(uname)}</a>') if uname else '<span class="muted">—</span>'
+        rows.append(
+            f'<tr><td class="num">{i}</td>'
+            f'<td class="mono">{uid or "<span class=muted>—</span>"}</td>'
+            f'<td>{uname_cell}</td>'
+            f'<td>{fname or "<span class=muted>—</span>"}</td>'
+            f'<td>{lname or "<span class=muted>—</span>"}</td>'
+            f'<td class="mono">{phone or "<span class=muted>—</span>"}</td>'
+            f'<td class="mono muted">{src or "—"}</td></tr>'
+        )
+
+    with_username = sum(1 for u in users if u.get('username'))
+    with_phone = sum(1 for u in users if u.get('phone'))
+    generated = _dt.now().strftime('%d.%m.%Y %H:%M')
+
+    return f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Спарсенные пользователи — {html_escape(acc_name)}</title>
+<style>
+:root {{ color-scheme: light dark; }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; padding:24px; background:#f5f6f8; color:#1a1a1a;
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; }}
+.wrap {{ max-width:1100px; margin:0 auto; }}
+h1 {{ font-size:22px; margin:0 0 4px; }}
+.sub {{ color:#667; font-size:14px; margin-bottom:18px; }}
+.cards {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:18px; }}
+.card {{ background:#fff; border:1px solid #e3e6ea; border-radius:10px;
+  padding:12px 18px; min-width:130px; }}
+.card b {{ display:block; font-size:22px; }}
+.card span {{ color:#667; font-size:13px; }}
+#q {{ width:100%; padding:11px 14px; font-size:15px; border:1px solid #d7dbe0;
+  border-radius:10px; margin-bottom:14px; background:#fff; }}
+#q:focus {{ outline:2px solid #2f81f7; border-color:transparent; }}
+table {{ width:100%; border-collapse:collapse; background:#fff;
+  border:1px solid #e3e6ea; border-radius:10px; overflow:hidden; }}
+th,td {{ padding:9px 12px; text-align:left; border-bottom:1px solid #eef0f3;
+  font-size:14px; }}
+th {{ background:#fafbfc; font-weight:600; cursor:pointer; user-select:none;
+  position:sticky; top:0; white-space:nowrap; }}
+th:hover {{ background:#f0f2f5; }}
+th::after {{ content:" \\2195"; color:#aab; font-size:11px; }}
+tr:last-child td {{ border-bottom:none; }}
+tbody tr:hover {{ background:#f7f9fc; }}
+.num {{ color:#8a93a0; width:52px; }}
+.mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; }}
+.muted {{ color:#aab; }}
+a {{ color:#2f81f7; text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+.foot {{ margin-top:14px; color:#889; font-size:13px; }}
+.hidden {{ display:none; }}
+@media (prefers-color-scheme: dark) {{
+  body {{ background:#15171a; color:#e6e8eb; }}
+  .card,table,#q {{ background:#1d2025; border-color:#2c313a; color:#e6e8eb; }}
+  th {{ background:#22262c; }} th:hover {{ background:#282d34; }}
+  td {{ border-color:#262b32; }} tbody tr:hover {{ background:#22262c; }}
+  .sub,.card span,.muted,.foot {{ color:#8b93a1; }}
+}}
+@media print {{ #q,.cards {{ display:none; }} body {{ padding:0; background:#fff; }} }}
+</style></head><body><div class="wrap">
+<h1>👥 Спарсенные пользователи</h1>
+<div class="sub">{html_escape(acc_name)} · выгружено {generated}</div>
+<div class="cards">
+  <div class="card"><b>{len(users)}</b><span>всего контактов</span></div>
+  <div class="card"><b>{with_username}</b><span>с username</span></div>
+  <div class="card"><b>{with_phone}</b><span>с телефоном</span></div>
+</div>
+<input id="q" type="search" placeholder="Поиск по имени, username, ID или телефону...">
+<table id="t"><thead><tr>
+<th>#</th><th>Telegram ID</th><th>Username</th><th>Имя</th>
+<th>Фамилия</th><th>Телефон</th><th>Источник</th>
+</tr></thead><tbody>
+{chr(10).join(rows)}
+</tbody></table>
+<div class="foot" id="cnt"></div>
+</div><script>
+var q=document.getElementById('q'),tb=document.querySelector('#t tbody'),
+    rows=[].slice.call(tb.rows),cnt=document.getElementById('cnt');
+function upd(n){{cnt.textContent='Показано '+n+' из '+rows.length;}}
+upd(rows.length);
+q.addEventListener('input',function(){{
+  var v=q.value.toLowerCase().trim(),n=0;
+  rows.forEach(function(r){{
+    var m=!v||r.textContent.toLowerCase().indexOf(v)>-1;
+    r.classList.toggle('hidden',!m); if(m)n++;
+  }});
+  upd(n);
+}});
+var dir={{}};
+[].forEach.call(document.querySelectorAll('#t th'),function(th,i){{
+  th.addEventListener('click',function(){{
+    dir[i]=!dir[i]; var k=dir[i]?1:-1;
+    rows.sort(function(a,b){{
+      var x=a.cells[i].textContent.trim(),y=b.cells[i].textContent.trim();
+      var nx=parseFloat(x.replace(/[^0-9.-]/g,'')),ny=parseFloat(y.replace(/[^0-9.-]/g,''));
+      if(!isNaN(nx)&&!isNaN(ny)&&x.replace(/[^0-9.-]/g,'')!==''&&y.replace(/[^0-9.-]/g,''))
+        return (nx-ny)*k;
+      return x.localeCompare(y,'ru')*k;
+    }});
+    rows.forEach(function(r){{tb.appendChild(r);}});
+  }});
+}});
+</script></body></html>"""
+
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
@@ -2224,6 +2349,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             InlineKeyboardButton(text="🚀 Запустить спам", callback_data=f"start_spam_{account_id}")
         )
 
+        try:
+            _, _parsed_total = db.get_parsed_users_paginated(account_id, user_id, page=0, per_page=1)
+        except Exception:
+            _parsed_total = 0
         total_groups = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES)
         enabled_chats_count = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES, spam_only=True)
 
@@ -2249,6 +2378,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="🔄 Синхронизировать чаты", callback_data=f"acc_sync_{account_id}"),
              notif_btn],
             [InlineKeyboardButton(text="👥 Парсинг пользователей", callback_data=f"acc_parse_{account_id}")],
+            *([[InlineKeyboardButton(
+                text=f"📋 Спарсенные контакты ({_parsed_total})",
+                callback_data=f"parsed_users_page_{account_id}_0")]] if _parsed_total else []),
             [InlineKeyboardButton(text="📊 Отчет", callback_data=f"acc_report_{account_id}")],
             [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"acc_del_{account_id}")],
             [InlineKeyboardButton(text="◀️ Назад к аккаунтам", callback_data="back_to_accounts")]
@@ -2634,6 +2766,77 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             await callback.answer("❌ Нет активного парсинга", show_alert=True)
 
+    PARSED_PER_PAGE = 20
+
+    def _parsed_display_name(u) -> str:
+        name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+        return name or (f"@{u['username']}" if u.get('username') else f"ID {u.get('user_id_val') or '—'}")
+
+    async def _render_parsed_users(callback: CallbackQuery, account_id: int,
+                                   page: int = 0, notice: str = ""):
+        """Карусель спарсенных пользователей, по 20 на страницу."""
+        user_id = callback.from_user.id
+        per_page = PARSED_PER_PAGE
+        users, total = db.get_parsed_users_paginated(account_id, user_id,
+                                                     page=page, per_page=per_page)
+        if total == 0:
+            await callback.answer(
+                "📭 Список пуст. Сначала запустите парсинг группы.", show_alert=True)
+            return
+
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        start_no = page * per_page + 1
+
+        lines = [f"👥 <b>Спарсенные пользователи</b>",
+                 f"Всего: <b>{total}</b> | Страница {page + 1}/{total_pages}", ""]
+        for i, u in enumerate(users, start=start_no):
+            name = html_escape(_parsed_display_name(u))[:38]
+            uname = f" @{html_escape(u['username'])}" if u.get('username') else ""
+            uid = u.get('user_id_val') or 0
+            phone = f" 📞{html_escape(u['phone'])}" if u.get('phone') else ""
+            lines.append(f"{i}. {name}{uname}{phone}\n     <code>{uid}</code>")
+        if notice:
+            lines.append(f"\n{notice}")
+        text = "\n".join(lines)
+
+        buttons = []
+        nav = []
+        if total_pages > 1:
+            if page > 0:
+                nav.append(InlineKeyboardButton(
+                    text="⬅️", callback_data=f"parsed_users_page_{account_id}_{page - 1}"))
+            nav.append(InlineKeyboardButton(
+                text=f"{page + 1}/{total_pages}", callback_data="noop"))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton(
+                    text="➡️", callback_data=f"parsed_users_page_{account_id}_{page + 1}"))
+            buttons.append(nav)
+            # быстрый прыжок в начало/конец при длинном списке
+            if total_pages > 3:
+                jump = []
+                if page > 1:
+                    jump.append(InlineKeyboardButton(
+                        text="⏮ В начало", callback_data=f"parsed_users_page_{account_id}_0"))
+                if page < total_pages - 2:
+                    jump.append(InlineKeyboardButton(
+                        text="В конец ⏭",
+                        callback_data=f"parsed_users_page_{account_id}_{total_pages - 1}"))
+                if jump:
+                    buttons.append(jump)
+
+        buttons.append([
+            InlineKeyboardButton(text="🌐 HTML-таблица",
+                                 callback_data=f"parsed_html_{account_id}"),
+            InlineKeyboardButton(text="📥 CSV",
+                                 callback_data=f"download_parsed_{account_id}"),
+        ])
+        buttons.append([InlineKeyboardButton(
+            text="🗑 Очистить список", callback_data=f"parsed_clear_{account_id}")])
+        buttons.append([InlineKeyboardButton(
+            text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
     @dp.callback_query(F.data.startswith('download_parsed_'))
     async def download_parsed_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
@@ -2642,49 +2845,81 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not users:
             await callback.answer("📊 Нет данных!", show_alert=True)
             return
-        import csv
-        import io
+        import csv, io
         output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['ID', 'Username', 'First Name', 'Last Name', 'Phone'])
-        for u in users:
-            writer.writerow([u['user_id'], u['username'], u['first_name'], u['last_name'], u['phone']])
-        output.seek(0)
-        from aiogram.types import BufferedInputFile
-        file = BufferedInputFile(output.getvalue().encode('utf-8'), filename=f"parsed_users_{account_id}.csv")
-        await callback.message.answer_document(file, caption=f"👥 Парсинг #{account_id}")
+        # Разделитель ';' — Excel с русской локалью иначе кладёт всё в один столбец
+        writer = csv.writer(output, delimiter=';', quoting=csv.QUOTE_MINIMAL,
+                            lineterminator='\r\n')
+        writer.writerow(['№', 'Telegram ID', 'Username', 'Имя', 'Фамилия', 'Телефон', 'Источник'])
+        for i, u in enumerate(users, 1):
+            writer.writerow([
+                i,
+                u.get('user_id_val') or '',        # ID спарсенного, а не владельца бота
+                f"@{u['username']}" if u.get('username') else '',
+                u.get('first_name') or '',
+                u.get('last_name') or '',
+                # телефон как текст, иначе Excel съедает "+" и ведущие нули
+                f"\t{u['phone']}" if u.get('phone') else '',
+                u.get('source_chat_id') or '',
+            ])
+        # BOM обязателен: без него Excel открывает кириллицу кракозябрами
+        data = '\ufeff' + output.getvalue()
+        file = BufferedInputFile(data.encode('utf-8'),
+                                 filename=f"parsed_users_{account_id}.csv")
+        await callback.answer("📥 Готовлю CSV...")
+        await callback.message.answer_document(
+            file,
+            caption=(f"👥 Спарсено: {len(users)}\n\n"
+                     "Разделитель — точка с запятой, кодировка UTF-8 с BOM.\n"
+                     "Открывается в Excel и Google Таблицах без настройки."))
+
+    @dp.callback_query(F.data.startswith('parsed_html_'))
+    async def parsed_html_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        user_id = callback.from_user.id
+        users = db.get_parsed_users(account_id, user_id)
+        if not users:
+            await callback.answer("📊 Нет данных!", show_alert=True)
+            return
+        await callback.answer("🌐 Собираю таблицу...")
+        acc = db.get_account(account_id)
+        acc_name = (acc.get('account_name') if acc else None) or f"Аккаунт #{account_id}"
+        html = _build_parsed_html(users, acc_name)
+        file = BufferedInputFile(html.encode('utf-8'),
+                                 filename=f"parsed_users_{account_id}.html")
+        await callback.message.answer_document(
+            file,
+            caption=(f"🌐 Таблица на {len(users)} пользователей.\n\n"
+                     "Откройте файл в браузере: работает поиск по списку "
+                     "и сортировка по столбцам."))
+
+    @dp.callback_query(F.data.startswith('parsed_clear_'))
+    async def parsed_clear_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, очистить",
+                                  callback_data=f"parsed_clearok_{account_id}")],
+            [InlineKeyboardButton(text="❌ Отмена",
+                                  callback_data=f"parsed_users_page_{account_id}_0")],
+        ])
+        await edit_message(callback,
+                           "❓ Удалить все спарсенные контакты этого аккаунта?",
+                           markup)
+
+    @dp.callback_query(F.data.startswith('parsed_clearok_'))
+    async def parsed_clear_ok_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        db.clear_parsed_users(account_id, callback.from_user.id)
+        await callback.answer("🗑 Список очищен", show_alert=True)
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('parsed_users_page_'))
     async def parsed_users_page_callback(callback: CallbackQuery):
         parts = callback.data.split('_')
         account_id = int(parts[3])
         page = int(parts[4])
-        user_id = callback.from_user.id
-        
-        users, total = db.get_parsed_users_paginated(account_id, user_id, page=page, per_page=20)
-        if not users:
-            await callback.answer("📭 Пусто!", show_alert=True)
-            return
-        
-        total_pages = max(1, (total + 20 - 1) // 20)
-        text = f"👥 <b>Спарсено пользователей:</b> {total}\n\n"
-        for u in users:
-            text += f"• {u['first_name']} {u['last_name']} @{u['username']} ID:{u['user_id_val']}\n"
-        
-        buttons = []
-        if total > 20:
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"parsed_users_page_{account_id}_{page-1}"))
-            if page < total_pages - 1:
-                nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"parsed_users_page_{account_id}_{page+1}"))
-            if nav_buttons:
-                buttons.append(nav_buttons)
-        
-        buttons.append([InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, text, markup)
+        await callback.answer()
+        await _render_parsed_users(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('acc_del_'))
     async def acc_del_callback(callback: CallbackQuery):
