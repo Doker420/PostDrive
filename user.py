@@ -89,6 +89,14 @@ config.read(config_path)
 # Максимальное ожидание FloodWait, которое имеет смысл пересидеть внутри задачи.
 MAX_FLOOD_WAIT = int(config.get('LIMITS', 'MAX_FLOOD_WAIT', fallback='1800'))
 
+# ID владельца бота. Фоновые задачи периодически перепроверяют подписку, и без
+# admin_id проверка для админа проваливалась: аккаунт владельца останавливался
+# с «Подписка истекла», хотя у него безлимитный доступ.
+try:
+    ADMIN_ID = int(os.environ.get('BOT_ADMIN') or config.get('BOT', 'ADMIN', fallback='0') or 0)
+except (ValueError, TypeError):
+    ADMIN_ID = 0
+
 # ── Патч диапазонов ID каналов в Pyrogram ────────────────────────
 # Pyrogram 2.0.106 считает валидными ID каналов только до -1002147483647
 # (32-битный предел). Telegram давно выдаёт ID вплоть до -1997852516352
@@ -1981,7 +1989,7 @@ class AccountSessionManager:
                 loop_count += 1
                 logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} start | channels={len(valid_channels)} | mode={mode} | delay={comment_delay}s")
                 
-                if not db.is_user_subscribed(user_id):
+                if not db.is_user_subscribed(user_id, ADMIN_ID):
                     logging.warning(f"⚠️ [{acc_name}] Subscription expired for user {user_id}, stopping")
                     await self.stop_neurocomment(account_id)
                     if bot and not notifications_hidden:
@@ -2841,7 +2849,7 @@ class AccountSessionManager:
         try:
             while True:
                 # Re-check subscription & status
-                if not db.is_user_subscribed(user_id):
+                if not db.is_user_subscribed(user_id, ADMIN_ID):
                     db.set_account_spam_status(account_id, 0)
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"⚠️ [{acc_name}] Подписка истекла! Рассылка остановлена.")

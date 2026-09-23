@@ -85,5 +85,32 @@ block = block[:block.index("nc = db.get_neurocomment_settings")]
 assert 'поддержку' in block or 'Подписка' in block, "отказ не объясняет, что делать"
 results.append("сообщение об отказе подсказывает проверить статус: OK")
 
+# ── 10. Фоновые задачи проверяют подписку С admin_id ──────────────
+# Баг: в user.py стояло is_user_subscribed(user_id) без admin_id. Для
+# владельца бота, которого нет в таблице users (или без записи is_admin),
+# проверка проваливалась, и работающая задача останавливалась с
+# «Подписка истекла», хотя у админа безлимитный доступ.
+u = open(os.path.join(os.path.dirname(__file__), '..', 'user.py')).read()
+assert 'is_user_subscribed(user_id)' not in u, \
+    "в user.py снова проверка подписки без admin_id"
+assert u.count('is_user_subscribed(user_id, ADMIN_ID)') >= 2, \
+    "фоновые задачи должны проверять подписку с ADMIN_ID"
+assert "config.get('BOT', 'ADMIN'" in u, "ADMIN_ID не читается из конфига"
+assert 'ADMIN_ID = 0' in u, "нет безопасного значения ADMIN_ID по умолчанию"
+results.append("фоновые задачи (спам/нейрокомментинг) учитывают admin_id: OK")
+
+# админ, которого нет в users, считается подписанным
+db4 = fresh()
+assert db4.is_user_subscribed(77777, 77777), "админ без записи в users должен иметь доступ"
+assert not db4.is_user_subscribed(77777, 0), "без admin_id доступа быть не должно — это и был баг"
+results.append("админ без записи в users: с admin_id доступ есть, без — нет: OK")
+
+# ── 11. Все проверки подписки в handlers.py передают ADMIN ─────────
+h2 = open(os.path.join(os.path.dirname(__file__), '..', 'handlers.py')).read()
+import re as _re
+bad = _re.findall(r'is_user_subscribed\(\s*user_id\s*\)', h2)
+assert not bad, f"в handlers.py есть проверки без ADMIN: {len(bad)}"
+results.append("все проверки в handlers.py передают ADMIN: OK")
+
 print("\n".join("  " + r for r in results))
 print("\nALL SUBSCRIPTION TESTS PASSED")
