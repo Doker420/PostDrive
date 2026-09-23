@@ -13,11 +13,140 @@ from pyrogram import Client, enums, filters
 from pyrogram import utils
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import MessageEntity
+
+# ── Telegram error taxonomy ───────────────────────────────────────
+# Имена классов различаются между версиями Pyrogram, поэтому импортируем
+# устойчиво: отсутствующие классы заменяются на заглушку, которая никогда
+# не поймается (важно, чтобы бот не падал на ImportError при обновлении).
+class _NeverRaised(Exception):
+    """Заглушка для отсутствующих в данной версии Pyrogram классов ошибок."""
+
+
+def _err(name: str):
+    try:
+        import pyrogram.errors as _pe
+        return getattr(_pe, name, _NeverRaised)
+    except Exception:
+        return _NeverRaised
+
+
+FloodWait = _err('FloodWait')
+SlowmodeWait = _err('SlowmodeWait')
+FloodPremiumWait = _err('FloodPremiumWait')
+PeerFlood = _err('PeerFlood')
+UserDeactivated = _err('UserDeactivated')
+UserDeactivatedBan = _err('UserDeactivatedBan')
+AuthKeyUnregistered = _err('AuthKeyUnregistered')
+AuthKeyDuplicated = _err('AuthKeyDuplicated')
+SessionRevoked = _err('SessionRevoked')
+SessionExpired = _err('SessionExpired')
+UserBannedInChannel = _err('UserBannedInChannel')
+ChatWriteForbidden = _err('ChatWriteForbidden')
+ChatAdminRequired = _err('ChatAdminRequired')
+UserBlocked = _err('UserBlocked')
+UserIsBlocked = _err('UserIsBlocked')
+ChannelPrivate = _err('ChannelPrivate')
+UsernameNotOccupied = _err('UsernameNotOccupied')
+InviteHashExpired = _err('InviteHashExpired')
+UserAlreadyParticipant = _err('UserAlreadyParticipant')
+UserPrivacyRestricted = _err('UserPrivacyRestricted')
+
+# Ждём и повторяем
+FLOOD_ERRORS = tuple({FloodWait, SlowmodeWait, FloodPremiumWait} - {_NeverRaised})
+# Аккаунт под спам-блоком: останавливаем задачи, но сессия жива
+SPAMBLOCK_ERRORS = tuple({PeerFlood, UserBannedInChannel} - {_NeverRaised})
+# Сессия мертва: нужен повторный вход
+DEAD_SESSION_ERRORS = tuple({
+    UserDeactivated, UserDeactivatedBan, AuthKeyUnregistered,
+    AuthKeyDuplicated, SessionRevoked, SessionExpired,
+} - {_NeverRaised})
+# Проблема конкретного чата, а не аккаунта: пропускаем цель, задачу продолжаем
+SKIP_TARGET_ERRORS = tuple({
+    ChatWriteForbidden, ChatAdminRequired, ChannelPrivate, UsernameNotOccupied,
+    InviteHashExpired, UserPrivacyRestricted, UserBlocked, UserIsBlocked,
+} - {_NeverRaised})
+
+
+class AccountBlockedError(Exception):
+    """Аккаунт нельзя использовать дальше (спам-блок или мёртвая сессия)."""
+
+    def __init__(self, message: str, kind: str = 'restricted'):
+        super().__init__(message)
+        self.kind = kind          # 'restricted' | 'banned'
+
+
+class TargetSkipError(Exception):
+    """Цель (чат/пользователь) недоступна — пропускаем её, задача продолжается."""
+
+
+
 from sqliter import DBConnection, get_db_sync
 
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
-config.read(config_path)
+config.read(config_path, encoding='utf-8')
+
+# Максимальное ожидание FloodWait, которое имеет смысл пересидеть внутри задачи.
+MAX_FLOOD_WAIT = int(config.get('LIMITS', 'MAX_FLOOD_WAIT', fallback='1800'))
+
+# ── Патч диапазонов ID каналов в Pyrogram ────────────────────────
+# Pyrogram 2.0.106 считает валидными ID каналов только до -1002147483647
+# (32-битный предел). Telegram давно выдаёт ID вплоть до -1997852516352
+# (https://core.telegram.org/api/bots/ids), поэтому все новые супергруппы
+# и каналы (-1002.../-1003.../-1004...) падали с ValueError: Peer id invalid.
+# Из-за этого чат не резолвился, и рассылка/нейрокомментинг его пропускали.
+def _patch_pyrogram_peer_ranges():
+    from pyrogram import utils as _pu
+
+    # Официальные границы Bot API dialog ID
+    _MIN_CHANNEL_ID = -1997852516352
+    _MIN_CHAT_ID = -999999999999
+    _MAX_USER_ID = 0xFFFFFFFFFF   # 2^40 - 1
+
+    if getattr(_pu, '_postdrive_patched', False):
+        return
+
+    _pu.MIN_CHANNEL_ID = _MIN_CHANNEL_ID
+    _pu.MIN_CHAT_ID = _MIN_CHAT_ID
+    _pu.MAX_USER_ID = _MAX_USER_ID
+
+    def get_peer_type(peer_id: int) -> str:
+        if peer_id < 0:
+            if _MIN_CHAT_ID <= peer_id:
+                return "chat"
+            if _MIN_CHANNEL_ID <= peer_id < _pu.MAX_CHANNEL_ID:
+                return "channel"
+        elif 0 < peer_id <= _MAX_USER_ID:
+            return "user"
+        raise ValueError(f"Peer id invalid: {peer_id}")
+
+    _pu.get_peer_type = get_peer_type
+
+    # Те же функции импортированы по значению в другие модули Pyrogram —
+    # подменяем и там, иначе патч не подействует.
+    import sys
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith('pyrogram') or mod is None:
+            continue
+        if getattr(mod, 'get_peer_type', None) is not None:
+            try:
+                mod.get_peer_type = get_peer_type
+            except Exception:
+                pass
+        for const, val in (('MIN_CHANNEL_ID', _MIN_CHANNEL_ID),
+                           ('MIN_CHAT_ID', _MIN_CHAT_ID),
+                           ('MAX_USER_ID', _MAX_USER_ID)):
+            if getattr(mod, const, None) is not None:
+                try:
+                    setattr(mod, const, val)
+                except Exception:
+                    pass
+
+    _pu._postdrive_patched = True
+    logging.info("🔧 Pyrogram: диапазоны ID каналов расширены до -1997852516352")
+
+
+_patch_pyrogram_peer_ranges()
 
 _original_handle_updates = Client.handle_updates
 
@@ -36,13 +165,57 @@ async def _safe_handle_updates(self, updates):
         raise
 
 Client.handle_updates = _safe_handle_updates
-AI_MODEL = config.get('AI', 'MODEL', fallback='llama-3.1-70b-versatile').strip()
+AI_MODEL = config.get('AI', 'MODEL', fallback='openai/gpt-oss-20b').strip()
+
+# Актуальные модели Groq (проверено по console.groq.com/docs/deprecations).
+# ВАЖНО: llama-3.1-70b-versatile / llama-3.3-70b-versatile / llama-3.1-8b-instant /
+# mixtral-8x7b-32768 / gemma2-9b-it ОТКЛЮЧЕНЫ Groq и возвращают model_decommissioned.
+GROQ_MODELS = [
+    'openai/gpt-oss-20b',      # быстрый и дешёвый, дефолт для коротких комментариев
+    'openai/gpt-oss-120b',     # умнее, чуть медленнее
+    'qwen/qwen3.6-27b',
+]
+# Карта автозамены снятых с обслуживания моделей
+GROQ_DECOMMISSIONED = {
+    'llama-3.1-70b-versatile': 'openai/gpt-oss-120b',
+    'llama-3.3-70b-versatile': 'openai/gpt-oss-120b',
+    'llama-3.1-8b-instant': 'openai/gpt-oss-20b',
+    'mixtral-8x7b-32768': 'openai/gpt-oss-120b',
+    'gemma2-9b-it': 'openai/gpt-oss-20b',
+    'qwen/qwen3-32b': 'openai/gpt-oss-120b',
+    'meta-llama/llama-4-scout-17b-16e-instruct': 'openai/gpt-oss-120b',
+}
 OPENAI_API_KEY = config.get('AI', 'OPENAI_API_KEY', fallback='').strip()
 ANTHROPIC_API_KEY = config.get('AI', 'ANTHROPIC_API_KEY', fallback='').strip()
 GEMINI_API_KEY = config.get('AI', 'GEMINI_API_KEY', fallback='').strip()
-G4F_API_KEY = config.get('AI', 'G4F_API_KEY', fallback='').strip()
 GROQ_API_KEY = config.get('AI', 'GROQ_API_KEY', fallback='').strip()
 OPENROUTER_API_KEY = config.get('AI', 'OPENROUTER_API_KEY', fallback='').strip()
+
+# ── g4f (бесплатный фолбэк без ключей) ───────────────────────────
+G4F_ENABLED = config.get('AI', 'G4F_ENABLED', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
+G4F_TIMEOUT = int(config.get('AI', 'G4F_TIMEOUT', fallback='45'))
+# Явные провайдеры перебираются первыми: они не требуют манифеста с g4f.dev,
+# из-за недоступности которого g4f 8.x падает целиком.
+# Имена провайдеров в g4f меняются от версии к версии, поэтому список
+# из конфига фильтруется по реально существующим классам, а если ничего
+# не осталось — провайдеры ищутся автоматически (см. _g4f_providers).
+# ВАЖНО: только провайдеры, работающие БЕЗ ключа и БЕЗ оплаты.
+# PollinationsAI/OpenAIFM убраны: перешли на платную модель (402 No cake credits).
+G4F_PROVIDERS = [p.strip() for p in config.get(
+    'AI', 'G4F_PROVIDERS',
+    fallback='Yqcloud,ChatGptOss,GLM,Qwen,TeachAnything,PhindAi,Cloudflare,DeepAI,OperaAria,You'
+).split(',') if p.strip()]
+# Пусто = использовать default_model каждого провайдера (надёжнее, чем
+# навязывать имя модели, которого у провайдера может не быть).
+G4F_MODELS = [m.strip() for m in config.get(
+    'AI', 'G4F_MODELS', fallback=''
+).split(',') if m.strip()]
+
+
+class _ModelGoneError(RuntimeError):
+    """Модель снята с обслуживания провайдером (нужно взять следующую из списка)."""
+    pass
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1069,163 +1242,582 @@ class AccountSessionManager:
         except Exception as e:
             return False, str(e)
 
-    async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
-        logging.info(f"🤖 Generating AI comment | model={AI_MODEL} | prompt_len={len(prompt)} | post_len={len(post_text)}")
-        
-        messages = []
-        if post_text:
-            messages.append({"role": "system", "content": f"Сгенерируй короткий осмысленный комментарий к посту. Промт: {prompt}"})
-            messages.append({"role": "user", "content": post_text[:500]})
+    # Шаблон системного промта. {instruction} — то, что пользователь пишет в настройках
+    # (например: "дополнительно призыв глянуть профиль или био").
+    # Максимальная длина комментария. Живой подписчик не пишет простыни,
+    # а длинный текст мгновенно выдаёт бота и ловит бан.
+    MAX_COMMENT_CHARS = 320
+
+    AI_SYSTEM_TEMPLATE = (
+        "Ты — живой человек, читающий Telegram-канал, а не бот. "
+        "Напиши ОДИН короткий комментарий (максимум 2 предложения, "
+        "не длиннее 300 символов) к посту ниже на языке поста.\n"
+        "Правила:\n"
+        "- пиши естественно и по теме поста, как обычный подписчик;\n"
+        "- без приветствий, без кавычек, без хештегов, без markdown;\n"
+        "- НИКАКИХ списков, таблиц, заголовков, пунктов и разметки;\n"
+        "- не давай советов, анализа и инструкций, если об этом не просили;\n"
+        "- не пересказывай пост и не повторяй его дословно;\n"
+        "- не упоминай, что ты ИИ, и не объясняй свой ответ;\n"
+        "- в ответе только текст комментария, одним абзацем.\n"
+        "{instruction_block}"
+    )
+
+    @staticmethod
+    def build_comment_messages(instruction: str, post_text: str = "") -> list:
+        """Собирает messages для LLM.
+
+        instruction — пожелание пользователя (тематика + доп. указания, например
+        призыв заглянуть в профиль). Оно идёт ОТДЕЛЬНЫМ блоком требований, а не
+        просто подклеивается к тексту, поэтому модель выполняет его как инструкцию,
+        а не считает частью поста.
+        """
+        instruction = (instruction or '').strip()
+        if instruction:
+            instruction_block = (
+                "\nДополнительные требования от заказчика (обязательно учти их в комментарии):\n"
+                f"{instruction}\n"
+            )
         else:
-            messages.append({"role": "user", "content": prompt})
+            instruction_block = ""
 
-        # 1. Groq API (бесплатный, быстрый, лимиты 30k tok/min)
-        if GROQ_API_KEY and not GROQ_API_KEY.startswith('ЗАМЕНИТЕ') and not GROQ_API_KEY.startswith('REPLACE'):
+        system = AccountSessionManager.AI_SYSTEM_TEMPLATE.format(instruction_block=instruction_block)
+        messages = [{"role": "system", "content": system}]
+        # Пример диалога: показываем модели ожидаемый формат ответа.
+        # Без этого reasoning-модели (gpt-oss и подобные) отвечают развёрнутым
+        # разбором с таблицами вместо живой реплики.
+        messages.append({"role": "user", "content":
+                         "Текст поста:\nСегодня рынок снова удивил: активы прибавили 5% за сутки."})
+        messages.append({"role": "assistant", "content":
+                         "Вот это скачок, давно такого не было. Интересно, удержится ли."})
+        if post_text:
+            messages.append({"role": "user", "content": f"Текст поста:\n{post_text[:1500]}"})
+        else:
+            messages.append({"role": "user", "content": "Напиши комментарий по требованиям выше."})
+        return messages
+
+    @staticmethod
+    def _clean_ai_output(text: str) -> str:
+        """Убирает типовой мусор LLM: кавычки-обёртки, префиксы, markdown, лишние строки."""
+        if not text:
+            return ""
+        result = text.strip()
+        # срезаем reasoning-блоки некоторых моделей
+        if '</think>' in result:
+            result = result.split('</think>')[-1].strip()
+        # первая непустая строка-абзац (модель иногда даёт варианты списком)
+        for prefix in ('Комментарий:', 'Ответ:', 'Comment:', 'Answer:'):
+            if result.lower().startswith(prefix.lower()):
+                result = result[len(prefix):].strip()
+        if len(result) > 1 and result[0] in '"\u00ab\u201c\'' and result[-1] in '"\u00bb\u201d\'':
+            result = result[1:-1].strip()
+        result = result.replace('**', '').replace('__', '')
+
+        # ── Обрезаем «простыни» ──
+        # Модели вроде gpt-oss любят отвечать разбором с таблицами и списками.
+        # Для комментария это мгновенный признак бота, поэтому берём только
+        # связный текст и ограничиваем длину.
+        lines = []
+        for raw_line in result.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                if lines:
+                    break          # первый абзац закончился — дальше не нужно
+                continue
+            # таблицы, заголовки, списки, нумерация — мусор для комментария
+            if line.startswith('|') or set(line) <= set('|-: '):
+                break
+            if line.startswith('#') or line.startswith('---'):
+                break
+            if re.match(r'^([-*•]|\d+[.)])\s+', line):
+                break
+            lines.append(line)
+        if lines:
+            result = ' '.join(lines).strip()
+
+        limit = AccountSessionManager.MAX_COMMENT_CHARS
+        if len(result) > limit:
+            cut = result[:limit]
+            # обрезаем по границе предложения, иначе по последнему пробелу
+            marks = [cut.rfind(m) for m in ('. ', '! ', '? ', '…')]
+            best = max(marks)
+            if best > limit * 0.4:
+                result = cut[:best + 1]
+            else:
+                sp = cut.rfind(' ')
+                result = (cut[:sp] if sp > limit * 0.4 else cut).rstrip(' ,;:—-') + '…'
+        return result.strip()
+
+    # ==================== TELEGRAM CALL GUARD (FloodWait & bans) ====================
+    async def tg_call(self, factory, *, account_id: int = None, bot=None, user_id: int = None,
+                      description: str = '', max_retries: int = 3,
+                      notify: bool = True, raise_on_skip: bool = False):
+        """Выполняет вызов Telegram API с обработкой FloodWait и банов.
+
+        factory — функция без аргументов, возвращающая корутину. Именно функция,
+        а не готовая корутина: при повторе нужно создать вызов заново
+        (корутину нельзя переиспользовать после await).
+
+        Поведение:
+          • FloodWait/SlowmodeWait  — ждём указанное время (+джиттер) и повторяем;
+            если ждать дольше MAX_FLOOD_WAIT — ставим аккаунт на паузу и прерываем задачу;
+          • PeerFlood / бан в канале — AccountBlockedError(kind='restricted'), задача встаёт;
+          • мёртвая сессия          — AccountBlockedError(kind='banned');
+          • проблема конкретного чата — TargetSkipError (или None, если raise_on_skip=False).
+
+        Возвращает результат вызова либо None, если цель пропущена.
+        """
+        label = description or 'telegram call'
+        last_err = None
+
+        for attempt in range(1, max_retries + 1):
             try:
-                import json as json_mod
-                
-                # Актуальные модели Groq на 2026-09
-                groq_models = ['llama-3.1-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it']
-                groq_model = AI_MODEL if AI_MODEL in groq_models else 'llama-3.1-70b-versatile'
-                
-                def _groq_request_urllib():
-                    import urllib.request
-                    req_data = {"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
-                    req = urllib.request.Request(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        data=json_mod.dumps(req_data).encode('utf-8'),
-                        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                        method='POST'
-                    )
-                    with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        body = resp.read().decode('utf-8')
-                        if resp.status != 200:
-                            logging.error(f"❌ Groq HTTP {resp.status}: {body[:300]}")
-                            return None
-                        resp_data = json_mod.loads(body)
-                        return resp_data["choices"][0]["message"]["content"].strip()
-                
-                try:
-                    import httpx
-                    # httpx предпочтительнее (async нативно)
-                    async def _groq_request_httpx():
-                        async with httpx.AsyncClient(timeout=30.0) as client:
-                            response = await client.post(
-                                "https://api.groq.com/openai/v1/chat/completions",
-                                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                                json={"model": groq_model, "messages": messages, "max_tokens": 150, "temperature": 0.7}
-                            )
-                            if response.status_code != 200:
-                                logging.error(f"❌ Groq HTTP {response.status_code}: {response.text[:300]}")
-                                return None
-                            response.raise_for_status()
-                            data = response.json()
-                            return data["choices"][0]["message"]["content"].strip()
-                    
-                    result = await _groq_request_httpx()
-                except ImportError:
-                    # httpx недоступен, используем urllib в потоке
-                    result = await asyncio.to_thread(_groq_request_urllib)
-                
-                if result:
-                    logging.info(f"🤖 Generated comment via Groq ({len(result)} chars): {result[:100]}...")
-                    return result
-            except Exception as e:
-                logging.error(f"❌ Groq API error: {type(e).__name__}: {e}")
+                result = await factory()
+                # Успешный вызов после флуда — снимаем пометку кулдауна
+                if account_id and attempt > 1:
+                    try:
+                        db.clear_account_health(account_id)
+                    except Exception:
+                        pass
+                return result
 
-        # 2. Google Gemini API (бесплатный, 1500 RPM)
-        if GEMINI_API_KEY:
+            except asyncio.CancelledError:
+                raise
+
+            except FLOOD_ERRORS as e:
+                wait = int(getattr(e, 'value', None) or getattr(e, 'x', None) or 60)
+                last_err = e
+                if account_id:
+                    try:
+                        db.record_flood_wait(account_id, wait)
+                    except Exception:
+                        pass
+
+                if wait > MAX_FLOOD_WAIT:
+                    msg = (f"FloodWait {wait} сек. ({wait // 60} мин.) — это дольше лимита "
+                           f"{MAX_FLOOD_WAIT} сек., задача остановлена.")
+                    logging.error(f"🛑 [acc {account_id}] {label}: {msg}")
+                    if notify and bot and user_id:
+                        await self._safe_bot_message(
+                            bot, user_id,
+                            f"🛑 Аккаунт #{account_id} получил длительное ограничение Telegram "
+                            f"({wait // 60} мин.).\n\nЗадача остановлена. Дайте аккаунту отдохнуть "
+                            f"и увеличьте интервалы между сообщениями."
+                        )
+                    raise AccountBlockedError(msg, kind='restricted')
+
+                sleep_for = wait + random.uniform(1.0, 3.0)
+                logging.warning(
+                    f"⏳ [acc {account_id}] {label}: FloodWait {wait}s "
+                    f"(попытка {attempt}/{max_retries}), жду {sleep_for:.0f}s"
+                )
+                if notify and bot and user_id and wait >= 60:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"⏳ Telegram просит подождать {wait} сек. (аккаунт #{account_id}). "
+                        f"Задача продолжится автоматически."
+                    )
+                await asyncio.sleep(sleep_for)
+                continue
+
+            except SPAMBLOCK_ERRORS as e:
+                msg = f"{type(e).__name__}: аккаунт ограничен Telegram за спам"
+                logging.error(f"🚫 [acc {account_id}] {label}: {msg}")
+                if account_id:
+                    try:
+                        db.set_account_health(account_id, db.HEALTH_RESTRICTED, msg)
+                    except Exception:
+                        pass
+                if notify and bot and user_id:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"🚫 <b>Аккаунт #{account_id} получил спам-блок Telegram.</b>\n\n"
+                        f"Все задачи по нему остановлены, чтобы не усугубить ограничение.\n\n"
+                        f"Что делать:\n"
+                        f"• не запускайте рассылки на этом аккаунте 24–48 часов;\n"
+                        f"• напишите @SpamBot и запросите снятие ограничения;\n"
+                        f"• увеличьте задержки и используйте разный текст (спинтакс)."
+                    )
+                raise AccountBlockedError(msg, kind='restricted')
+
+            except DEAD_SESSION_ERRORS as e:
+                msg = f"{type(e).__name__}: сессия недействительна"
+                logging.error(f"💀 [acc {account_id}] {label}: {msg}")
+                if account_id:
+                    try:
+                        db.set_account_health(account_id, db.HEALTH_BANNED, msg)
+                        db.update_account_status(account_id, 'banned')
+                    except Exception:
+                        pass
+                if notify and bot and user_id:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"💀 <b>Аккаунт #{account_id} недоступен.</b>\n\n"
+                        f"Причина: {type(e).__name__}. Сессия отозвана или аккаунт заблокирован "
+                        f"Telegram — требуется переподключение."
+                    )
+                raise AccountBlockedError(msg, kind='banned')
+
+            except SKIP_TARGET_ERRORS as e:
+                logging.info(f"⏭ [acc {account_id}] {label}: {type(e).__name__} — цель пропущена")
+                if raise_on_skip:
+                    raise TargetSkipError(f"{type(e).__name__}") from e
+                return None
+
+            except (AccountBlockedError, TargetSkipError):
+                raise
+
+            except (ValueError, KeyError) as e:
+                # «Peer id invalid» / «ID not found»: чат не в локальном кэше
+                # пиров — обычная ситуация, а не сбой. Уровень INFO, чтобы
+                # не заливать лог ошибками при обходе сотен чатов.
+                txt = str(e)
+                if 'Peer id invalid' in txt or 'ID not found' in txt:
+                    logging.info(f"⏭ [acc {account_id}] {label}: пир неизвестен — пропуск")
+                    if raise_on_skip:
+                        raise TargetSkipError(txt) from e
+                    return None
+                logging.error(f"❌ [acc {account_id}] {label}: {type(e).__name__}: {txt[:200]}")
+                raise
+
+            except Exception as e:
+                last_err = e
+                # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
+                transient = isinstance(e, (asyncio.TimeoutError, ConnectionError, OSError))
+                if transient and attempt < max_retries:
+                    backoff = min(30, 2 ** attempt) + random.uniform(0, 1.5)
+                    logging.warning(
+                        f"🔁 [acc {account_id}] {label}: {type(e).__name__}: {str(e)[:120]} — "
+                        f"повтор через {backoff:.1f}s ({attempt}/{max_retries})"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logging.error(f"❌ [acc {account_id}] {label}: {type(e).__name__}: {str(e)[:200]}")
+                raise
+
+        if last_err:
+            raise last_err
+        return None
+
+    async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
+        """Генерирует комментарий. Перебирает провайдеров, пока кто-то не ответит."""
+        messages = self.build_comment_messages(prompt, post_text)
+        logging.info(f"🤖 AI comment | model={AI_MODEL} | instruction_len={len(prompt or '')} | post_len={len(post_text)}")
+
+        errors = []
+
+        # ── 1. Groq (быстрый, щедрый бесплатный лимит) ───────────────
+        if GROQ_API_KEY and not GROQ_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
+            # Подменяем снятые с обслуживания модели на актуальные
+            requested = GROQ_DECOMMISSIONED.get(AI_MODEL, AI_MODEL)
+            if AI_MODEL in GROQ_DECOMMISSIONED:
+                logging.warning(
+                    f"⚠️ Модель Groq '{AI_MODEL}' снята с обслуживания, использую '{requested}'. "
+                    f"Обновите MODEL в config.ini."
+                )
+            candidates = [requested] + [m for m in GROQ_MODELS if m != requested]
+            for groq_model in candidates[:3]:
+                try:
+                    result = await self._groq_chat(groq_model, messages)
+                    if result:
+                        cleaned = self._clean_ai_output(result)
+                        if cleaned:
+                            logging.info(f"🤖 Groq:{groq_model} → {cleaned[:80]}")
+                            return cleaned
+                except _ModelGoneError as e:
+                    logging.warning(f"⚠️ Groq модель {groq_model} недоступна: {e}; пробую следующую")
+                    errors.append(f"groq:{groq_model}")
+                    continue
+                except Exception as e:
+                    logging.error(f"❌ Groq {groq_model}: {type(e).__name__}: {str(e)[:200]}")
+                    errors.append(f"groq:{groq_model}")
+                    break
+
+        # ── 2. Google Gemini ─────────────────────────────────────────
+        if GEMINI_API_KEY and not GEMINI_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=GEMINI_API_KEY)
-                model_name = AI_MODEL if 'gemini' in AI_MODEL.lower() else 'gemini-1.5-flash'
+                model_name = AI_MODEL if 'gemini' in AI_MODEL.lower() else 'gemini-2.0-flash'
                 model = genai.GenerativeModel(model_name)
                 full_prompt = "\n\n".join([m['content'] for m in messages])
                 response = await asyncio.to_thread(
                     model.generate_content,
                     full_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=150,
-                        temperature=0.7
-                    )
+                    generation_config=genai.types.GenerationConfig(max_output_tokens=200, temperature=0.8)
                 )
-                result = response.text.strip()
-                logging.info(f"🤖 Generated comment via Gemini ({len(result)} chars): {result[:100]}...")
-                return result
+                cleaned = self._clean_ai_output(response.text)
+                if cleaned:
+                    logging.info(f"🤖 Gemini → {cleaned[:80]}")
+                    return cleaned
             except Exception as e:
-                logging.error(f"❌ Gemini API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ Gemini: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('gemini')
 
-        # 3. OpenRouter API (есть бесплатные модели)
-        if OPENROUTER_API_KEY:
+        # ── 3. OpenRouter ────────────────────────────────────────────
+        if OPENROUTER_API_KEY and not OPENROUTER_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
                 import httpx
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.post(
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    response = await http_client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={
                             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                             "Content-Type": "application/json",
                             "HTTP-Referer": "https://t.me/poster_bot",
-                            "X-Title": "Poster Bot"
+                            "X-Title": "PostDrive"
                         },
-                        json={
-                            "model": AI_MODEL,
-                            "messages": messages,
-                            "max_tokens": 150,
-                            "temperature": 0.7
-                        }
+                        json={"model": AI_MODEL, "messages": messages, "max_tokens": 160, "temperature": 0.9}
                     )
                     response.raise_for_status()
                     data = response.json()
-                    result = data["choices"][0]["message"]["content"].strip()
-                    logging.info(f"🤖 Generated comment via OpenRouter ({len(result)} chars): {result[:100]}...")
-                    return result
+                    cleaned = self._clean_ai_output(data["choices"][0]["message"]["content"])
+                    if cleaned:
+                        logging.info(f"🤖 OpenRouter → {cleaned[:80]}")
+                        return cleaned
             except Exception as e:
-                logging.error(f"❌ OpenRouter API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ OpenRouter: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('openrouter')
 
-        # 4. OpenAI API (если есть ключ)
-        if OPENAI_API_KEY and AI_MODEL.startswith('gpt'):
+        # ── 4. OpenAI ────────────────────────────────────────────────
+        if OPENAI_API_KEY and not OPENAI_API_KEY.startswith(('ЗАМЕНИТЕ', 'REPLACE')):
             try:
-                from openai import OpenAI
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                response = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    model=AI_MODEL,
-                    messages=messages,
-                    max_tokens=150,
-                    temperature=0.7
+                from openai import AsyncOpenAI
+                oai = AsyncOpenAI(api_key=OPENAI_API_KEY)
+                model_name = AI_MODEL if AI_MODEL.startswith('gpt') else 'gpt-4o-mini'
+                response = await oai.chat.completions.create(
+                    model=model_name, messages=messages, max_tokens=160, temperature=0.9
                 )
-                result = response.choices[0].message.content.strip()
-                logging.info(f"🤖 Generated comment via OpenAI ({len(result)} chars): {result[:100]}...")
-                return result
+                cleaned = self._clean_ai_output(response.choices[0].message.content)
+                if cleaned:
+                    logging.info(f"🤖 OpenAI → {cleaned[:80]}")
+                    return cleaned
             except Exception as e:
-                logging.error(f"❌ OpenAI API error: {type(e).__name__}: {e}")
+                logging.error(f"❌ OpenAI: {type(e).__name__}: {str(e)[:200]}")
+                errors.append('openai')
 
-        # 5. g4f fallback (бесплатно, но может быть нестабильным)
+        # ── 5. g4f (бесплатно, без ключей, но нестабильно) ───────────
+        if G4F_ENABLED:
+            cleaned = await self._g4f_chat(messages)
+            if cleaned:
+                return cleaned
+            errors.append('g4f')
+
+        logging.warning(
+            f"⚠️ Все AI-провайдеры недоступны ({', '.join(errors) or 'нет провайдеров'}). "
+            f"Добавьте GROQ_API_KEY в config.ini — это бесплатно и надёжнее g4f."
+        )
+        return ""
+
+    async def _groq_chat(self, model: str, messages: list) -> Optional[str]:
+        """Один запрос к Groq. Бросает _ModelGoneError, если модель снята с обслуживания."""
+        import json as json_mod
+        payload = {"model": model, "messages": messages, "max_tokens": 160, "temperature": 0.9}
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
         try:
-            from g4f.client import Client
-            client = Client(api_key=G4F_API_KEY) if G4F_API_KEY and not G4F_API_KEY.startswith('ЗАМЕНИТЕ') else Client()
-            logging.info(f"🤖 Trying g4f (free providers)")
-            # Новые модели g4f: gpt-4.1, deepseek-v3, gpt-4o
-            fallback_models = ['gpt-4.1', 'deepseek-v3', 'gpt-4o', 'gpt-4o-mini', 'llama-3.1-70b', 'qwen-2.5-72b']
-            for fallback_model in fallback_models:
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                resp = await http_client.post(url, headers=headers, json=payload)
+                if resp.status_code == 200:
+                    return resp.json()["choices"][0]["message"]["content"]
+                body = resp.text[:300]
+                if resp.status_code in (400, 404) and ('decommission' in body or 'does not exist' in body):
+                    raise _ModelGoneError(body)
+                if resp.status_code == 429:
+                    raise RuntimeError(f"rate limit: {body}")
+                raise RuntimeError(f"HTTP {resp.status_code}: {body}")
+        except ImportError:
+            def _urllib_request():
+                import urllib.request, urllib.error
+                req = urllib.request.Request(
+                    url, data=json_mod.dumps(payload).encode('utf-8'), headers=headers, method='POST'
+                )
                 try:
-                    logging.info(f"🔄 Trying g4f model: {fallback_model}")
-                    response = await asyncio.to_thread(
-                        client.chat.completions.create,
-                        model=fallback_model,
-                        messages=messages,
-                        max_tokens=150
-                    )
-                    result = response.choices[0].message.content.strip()
-                    logging.info(f"🤖 Generated comment via g4f:{fallback_model} ({len(result)} chars): {result[:100]}...")
-                    return result
-                except Exception as fallback_e:
-                    logging.warning(f"⚠️ g4f {fallback_model} failed: {fallback_e}")
-        except Exception as e:
-            logging.error(f"❌ g4f failed: {type(e).__name__}: {e}")
+                    with urllib.request.urlopen(req, timeout=30.0) as r:
+                        return json_mod.loads(r.read().decode('utf-8'))["choices"][0]["message"]["content"]
+                except urllib.error.HTTPError as he:
+                    body = he.read().decode('utf-8', 'ignore')[:300]
+                    if he.code in (400, 404) and ('decommission' in body or 'does not exist' in body):
+                        raise _ModelGoneError(body)
+                    raise RuntimeError(f"HTTP {he.code}: {body}")
+            return await asyncio.to_thread(_urllib_request)
 
-        logging.warning(f"⚠️ All AI providers failed or not configured. Add GROQ_API_KEY or GEMINI_API_KEY to config.ini")
+    _g4f_provider_cache = None
+    # Провайдеры, которые начали требовать оплату (402 / credits / proof-of-work).
+    # Пополняется на лету и больше не опрашивается до перезапуска бота.
+    _g4f_paid = set()
+
+    # Провайдеры, заведомо требующие ключ/оплату или проксирующие платные API.
+    # Держим отдельным списком, чтобы не тратить на них попытки.
+    G4F_PAID_PROVIDERS = {
+        'PollinationsAI', 'Pollinations', 'PollinationsImage', 'PollinationsAudio',
+        'OpenaiChat', 'OpenaiAccount', 'OpenAIFM', 'Copilot', 'CopilotApp',
+        'MetaAI', 'Gemini', 'GeminiPro', 'Claude', 'Perplexity', 'Groq',
+        'Nvidia', 'HuggingSpace', 'LMArena', 'OpenRouterFree', 'Custom',
+    }
+
+    @staticmethod
+    def _is_paid_error(e) -> bool:
+        """Похоже ли исключение на требование оплаты/регистрации."""
+        name = type(e).__name__
+        if name in ('PaymentRequiredError', 'MissingAuthError', 'ModelNotAllowedError'):
+            return True
+        txt = str(e).lower()
+        markers = ('402', 'payment required', 'no cake credits', 'proof-of-work',
+                   'credits', 'sign up', 'api key', 'unauthorized', '401',
+                   'quota', 'subscription', 'insufficient')
+        return any(m in txt for m in markers)
+
+
+    @classmethod
+    def _g4f_providers(cls):
+        """Список (класс_провайдера, имя) для перебора.
+
+        g4f НЕ требует API-ключа — это обёртка над публичными провайдерами.
+        Имена классов меняются от версии к версии (в 8.5.1 больше нет Blackbox,
+        DDG, ChatGptEs, Free2GPT, Liaobots), поэтому:
+          1) берём из конфига только реально существующие классы;
+          2) если не осталось ничего — сканируем пакет и находим все рабочие
+             провайдеры, не требующие авторизации.
+
+        Сканирование идёт по подмодулям напрямую: обращение к некоторым
+        атрибутам g4f.Provider дёргает загрузку манифеста с g4f.dev, и при
+        недоступности домена падает вся генерация.
+        """
+        if cls._g4f_provider_cache is not None:
+            return cls._g4f_provider_cache
+
+        import g4f.Provider as G4FProviders
+        found = []
+
+        for name in G4F_PROVIDERS:
+            if name in cls.G4F_PAID_PROVIDERS or name in cls._g4f_paid:
+                continue
+            try:
+                provider = getattr(G4FProviders, name, None)
+            except Exception:
+                provider = None
+            if provider is not None and getattr(provider, 'working', False):
+                found.append((provider, name))
+
+        if not found:
+            logging.warning(
+                "⚠️ g4f: провайдеры из config.ini не найдены в установленной "
+                "версии g4f — ищу доступные автоматически"
+            )
+            try:
+                import importlib, pkgutil, inspect
+                seen = set()
+                for mod_info in pkgutil.iter_modules(G4FProviders.__path__):
+                    if mod_info.name.startswith('_'):
+                        continue
+                    try:
+                        mod = importlib.import_module(f"g4f.Provider.{mod_info.name}")
+                    except Exception:
+                        continue
+                    for cname, cls_ in inspect.getmembers(mod, inspect.isclass):
+                        if cname.startswith('_') or cname in seen:
+                            continue
+                        if not cls_.__module__.startswith('g4f.'):
+                            continue
+                        if not (getattr(cls_, 'working', False) and not getattr(cls_, 'needs_auth', False)):
+                            continue
+                        # Отсеиваем картиночные/аудио и поисковые провайдеры —
+                        # для генерации текста они непригодны
+                        low = cname.lower()
+                        if any(k in low for k in (
+                            'image', 'flux', 'audio', 'sd35', 'stability',
+                            'search', 'cached', 'custom', 'ollama'
+                        )):
+                            continue
+                        if cname in ('provider', 'Provider', 'BaseProvider'):
+                            continue
+                        # платные/требующие регистрации — мимо
+                        if cname in cls.G4F_PAID_PROVIDERS or cname in cls._g4f_paid:
+                            continue
+                        seen.add(cname)
+                        found.append((cls_, cname))
+            except Exception as e:
+                logging.warning(f"⚠️ g4f: автопоиск провайдеров не удался: {e}")
+
+        if found:
+            logging.info(f"🤖 g4f: доступно провайдеров — {len(found)}: "
+                         f"{', '.join(n for _, n in found[:8])}")
+        cls._g4f_provider_cache = found
+        return found
+
+    async def _g4f_chat(self, messages: list) -> str:
+        """g4f-фолбэк. Ключ не нужен: это доступ к публичным провайдерам.
+
+        В g4f 8.x клиент при первом вызове тянет список провайдеров с g4f.dev.
+        Если сети до него нет (или домен лежит), падает вся генерация — поэтому
+        работаем через прямой перебор провайдеров и жёсткий таймаут.
+        """
+        try:
+            import g4f
+            from g4f.client import Client as G4FClient
+        except ImportError:
+            logging.warning("⚠️ g4f не установлен (pip install -U g4f)")
+            return ""
+
+        try:
+            g4f.debug.logging = False
+            g4f.check_version = False   # не ходить в сеть за версией
+        except Exception:
+            pass
+
+        def _sync_call(provider, model):
+            kwargs = {"messages": messages, "max_tokens": 160}
+            if model:
+                kwargs["model"] = model
+            client = G4FClient(provider=provider) if provider else G4FClient()
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content
+
+        attempts = list(self._g4f_providers())
+        if not attempts:
+            logging.error("❌ g4f: не найдено ни одного рабочего провайдера")
+            return ""
+
+        for provider, label in attempts:
+            if label in self._g4f_paid:
+                continue          # уже просил денег — не тратим время
+            # Если модели в конфиге не заданы — берём default_model провайдера
+            models = G4F_MODELS or [getattr(provider, 'default_model', None) or None]
+            for model in models:
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(_sync_call, provider, model),
+                        timeout=G4F_TIMEOUT
+                    )
+                    cleaned = self._clean_ai_output(result)
+                    if cleaned:
+                        logging.info(f"🤖 g4f:{label}/{model or 'default'} → {cleaned[:80]}")
+                        return cleaned
+                except asyncio.TimeoutError:
+                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: таймаут {G4F_TIMEOUT}s")
+                except Exception as e:
+                    if self._is_paid_error(e):
+                        # Провайдер перешёл на платную модель (402 / credits /
+                        # proof-of-work). Бесплатным он уже не станет — исключаем
+                        # его до перезапуска, чтобы не долбиться в стену.
+                        self._g4f_paid.add(label)
+                        logging.warning(
+                            f"💰 g4f {label}: требует оплату — исключён из бесплатного пула"
+                        )
+                        break
+                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: "
+                                    f"{type(e).__name__}: {str(e)[:120]}")
+        if self._g4f_paid:
+            logging.error(
+                "❌ g4f: бесплатные провайдеры не ответили "
+                f"(платные, исключены: {', '.join(sorted(self._g4f_paid))}). "
+                "Для стабильной работы добавьте бесплатный GROQ_API_KEY в config.ini."
+            )
+        else:
+            logging.error("❌ g4f: все провайдеры недоступны")
         return ""
 
     async def start_neurocomment(self, account_id: int, bot, user_id: int):
@@ -1237,6 +1829,10 @@ class AccountSessionManager:
         if not account:
             logging.error(f"❌ Account {account_id} not found")
             return False, "Аккаунт не найден"
+        usable, reason = db.is_account_usable(account_id)
+        if not usable:
+            logging.warning(f"⛔ Account {account_id} unusable: {reason}")
+            return False, reason
         nc = db.get_neurocomment_settings(account_id)
         logging.info(f"📊 Neurocomment settings: {nc}")
         if not nc or not nc.get('enabled'):
@@ -1330,16 +1926,25 @@ class AccountSessionManager:
             valid_channels = []
             channel_cache = {}  # ⭐ КЕШ ДЛЯ ОБЪЕКТОВ КАНАЛОВ
             
+            discussion_cache = {}  # channel -> discussion_chat_id
             for channel in target_channels:
                 try:
                     chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
                     logging.info(f"🔍 [{acc_name}] Checking channel: {channel} (chat_id={chat_id})")
+                    # Если аккаунт не в канале — вступаем; также вступаем в чат комментариев
+                    ok_access, discussion_id, access_msg = await self.ensure_channel_access(account_id, channel)
+                    if not ok_access:
+                        logging.warning(f"⚠️ [{acc_name}] {channel}: {access_msg}")
+                        if bot and not notifications_hidden:
+                            await bot.send_message(user_id, f"⚠️ [{acc_name}] {channel}: {access_msg}")
+                        continue
                     chat = await client.get_chat(chat_id)
                     valid_channels.append(channel)
                     channel_cache[channel] = chat  # ⭐ СОХРАНЯЕМ В КЕШ
-                    logging.info(f"✅ [{acc_name}] Channel {channel} is accessible (id={chat.id}, title={getattr(chat, 'title', 'N/A')})")
+                    discussion_cache[channel] = discussion_id
+                    logging.info(f"✅ [{acc_name}] Channel {channel} ok (id={chat.id}, discussion={discussion_id})")
                     if bot and not notifications_hidden:
-                        await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен")
+                        await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен (комментарии: {discussion_id})")
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}")
                     if bot and not notifications_hidden:
@@ -1441,6 +2046,21 @@ class AccountSessionManager:
                             logging.info(f"💬 [{acc_name}] Found new post in {channel}: {post_text[:100]}...")
                             channel_posts_found += 1
                             
+                            # ── Проверка дневной квоты AI (только для AI-режимов) ──
+                            if mode in ('prompt', 'post_prompt'):
+                                ok_quota, used_q, limit_q = db.consume_ai_quota(user_id, amount=1)
+                                if not ok_quota:
+                                    logging.warning(f"🚫 [{acc_name}] AI-квота исчерпана: {used_q}/{limit_q}")
+                                    self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                    if bot and not notifications_hidden:
+                                        await bot.send_message(
+                                            user_id,
+                                            f"🚫 [{acc_name}] Дневной лимит AI-комментариев исчерпан "
+                                            f"({used_q}/{limit_q}).\n\nПовысьте тариф или докупите AI-пакет "
+                                            f"в разделе «💳 Подписка»."
+                                        )
+                                    continue
+
                             comment_text = ""
                             if mode == 'prompt':
                                 logging.debug(f"🧠 [{acc_name}] Generating prompt-based comment for {channel}")
@@ -1478,50 +2098,20 @@ class AccountSessionManager:
                             
                             try:
                                 comment_sent = False
-                                discussion_chat_id = None
                                 chat_username = getattr(chat_obj, 'username', None)
-                                
-                                # ⭐ ПОИСК ЧАТА ОБСУЖДЕНИЙ
-                                try:
-                                    # 1. Pyrogram linked_chat property (возвращает Chat объект)
-                                    if hasattr(chat_obj, 'linked_chat') and chat_obj.linked_chat:
-                                        discussion_chat_id = chat_obj.linked_chat.id
-                                        logging.info(f"🔗 [{acc_name}] Found discussion chat via linked_chat: {discussion_chat_id}")
-                                    # 2. Прямые атрибуты
-                                    elif hasattr(chat_obj, 'linked_chat_id') and chat_obj.linked_chat_id:
-                                        discussion_chat_id = chat_obj.linked_chat_id
-                                    elif hasattr(chat_obj, 'discussion_chat_id') and chat_obj.discussion_chat_id:
-                                        discussion_chat_id = chat_obj.discussion_chat_id
-                                    
-                                    # 3. Если не нашли - через GetFullChannel
-                                    if not discussion_chat_id:
-                                        try:
-                                            from pyrogram.raw import functions as raw_functions
-                                            peer = await client.resolve_peer(chat_id)
-                                            channel_full = await client.invoke(
-                                                raw_functions.channels.GetFullChannel(channel=peer)
-                                            )
-                                            if hasattr(channel_full, 'full_chat'):
-                                                if hasattr(channel_full.full_chat, 'linked_chat_id'):
-                                                    discussion_chat_id = channel_full.full_chat.linked_chat_id
-                                        except Exception as e:
-                                            logging.debug(f"⚠️ [{acc_name}] GetFullChannel failed: {e}")
-                                except Exception as e:
-                                    logging.debug(f"⚠️ [{acc_name}] Failed to get discussion chat: {e}")
-                                
+
+                                # ⭐ ЧАТ ОБСУЖДЕНИЙ (берём из кеша, иначе ищем и вступаем)
+                                discussion_chat_id = discussion_cache.get(channel)
                                 if not discussion_chat_id:
-                                    logging.warning(f"⚠️ [{acc_name}] No discussion chat found for {channel}")
-                                    if bot and not notifications_hidden:
-                                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
-                                    continue
-                                
-                                # ⭐ ВСТУПАЕМ В ЧАТ ОБСУЖДЕНИЙ
-                                try:
-                                    await client.join_chat(discussion_chat_id)
-                                    logging.info(f"🔗 [{acc_name}] Joined discussion chat {discussion_chat_id}")
-                                except Exception as join_err:
-                                    logging.debug(f"⚠️ [{acc_name}] Already in discussion chat or join failed: {join_err}")
-                                
+                                    ok_access, discussion_chat_id, access_msg = await self.ensure_channel_access(account_id, channel)
+                                    if ok_access and discussion_chat_id:
+                                        discussion_cache[channel] = discussion_chat_id
+                                    else:
+                                        logging.warning(f"⚠️ [{acc_name}] No discussion chat for {channel}: {access_msg}")
+                                        if bot and not notifications_hidden:
+                                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
+                                        continue
+
                                 # ⭐ КЛЮЧЕВОЙ МОМЕНТ: НОРМАЛИЗУЕМ ID КАНАЛА НА ИСХОДЕ ИЗ chat_obj.id (а не channel string)
                                 normalized_channel_id = normalize_chat_id(chat_obj.id)
                                 logging.debug(f"🔍 [{acc_name}] chat_obj.id={chat_obj.id}, normalized={normalized_channel_id}, channel={channel}, chat_id={chat_id}")
@@ -1547,14 +2137,26 @@ class AccountSessionManager:
                                                     normalized_fwd_id = normalize_chat_id(fwd_chat_id_val)
                                                     if normalized_fwd_id == normalized_channel_id:
                                                         logging.info(f"🔍 [{acc_name}] Found matching forward (by id): fwd.id={fwd.id}, channel_msg_id={msg.id}")
-                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                         comment_sent = True
                                                         logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd msg_id={fwd.id})")
                                                         break
                                                 elif chat_username and fwd_chat_username and fwd_chat.username:
                                                     if fwd_chat.username.lower() == chat_username.lower():
                                                         logging.info(f"🔍 [{acc_name}] Found matching forward (by username): fwd.id={fwd.id}")
-                                                        await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                        await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                         comment_sent = True
                                                         logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by username)")
                                                         break
@@ -1562,7 +2164,13 @@ class AccountSessionManager:
                                             # Метод 2: сравнение по forward_from_message_id (совпадение с msg.id канала)
                                             if not comment_sent and fwd_msg_id and hasattr(msg, 'id') and fwd_msg_id == msg.id:
                                                 logging.info(f"🔍 [{acc_name}] Found matching forward (by msg_id={msg.id}): fwd.id={fwd.id}")
-                                                await client.send_message(discussion_chat_id, comment_text, reply_to_message_id=fwd.id)
+                                                await self.tg_call(
+                                                            lambda: client.send_message(
+                                                                discussion_chat_id, comment_text,
+                                                                reply_to_message_id=fwd.id),
+                                                            account_id=account_id, bot=bot, user_id=user_id,
+                                                            description=f'comment -> {channel}',
+                                                            notify=not notifications_hidden)
                                                 comment_sent = True
                                                 logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by msg_id)")
                                                 break
@@ -1594,6 +2202,8 @@ class AccountSessionManager:
         
         except asyncio.CancelledError:
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
+        except AccountBlockedError as e:
+            logging.error(f"🚫 [{acc_name}] Нейрокомментинг остановлен: {e}")
         except Exception as e:
             logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}")
             if bot and not notifications_hidden:
@@ -1610,6 +2220,193 @@ class AccountSessionManager:
                 db.finish_task(task_id, status='finished')
             self.active_comment_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
+
+    # ==================== NEUROCOMMENT: CHANNEL DISCOVERY & ACCESS ====================
+    async def get_channel_discussion_id(self, client, chat_obj, chat_ref=None):
+        """Возвращает id чата обсуждений (комментариев) канала или None."""
+        try:
+            linked = getattr(chat_obj, 'linked_chat', None)
+            if linked is not None and getattr(linked, 'id', None):
+                return linked.id
+            for attr in ('linked_chat_id', 'discussion_chat_id'):
+                val = getattr(chat_obj, attr, None)
+                if val:
+                    return val
+        except Exception:
+            pass
+        try:
+            from pyrogram.raw import functions as raw_functions
+            peer = await client.resolve_peer(chat_ref if chat_ref is not None else chat_obj.id)
+            full = await client.invoke(raw_functions.channels.GetFullChannel(channel=peer))
+            linked_id = getattr(getattr(full, 'full_chat', None), 'linked_chat_id', None)
+            if linked_id:
+                from pyrogram import utils as pyro_utils
+                return pyro_utils.get_channel_id(linked_id)
+        except Exception as e:
+            logging.debug(f"GetFullChannel failed for discussion lookup: {e}")
+        return None
+
+    async def ensure_channel_access(self, account_id: int, channel: str) -> Tuple[bool, Optional[int], str]:
+        """Гарантирует доступ аккаунта к каналу и его чату комментариев.
+
+        Если аккаунт не состоит в канале — пробует вступить. Затем находит связанный
+        чат обсуждений и вступает в него (без этого комментировать нельзя).
+
+        Возвращает (успех, discussion_chat_id, сообщение).
+        """
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return False, None, f"Ошибка подключения: {err}"
+
+        ref = channel.strip()
+        if ref.startswith('https://t.me/') or ref.startswith('t.me/'):
+            ref = ref.split('t.me/')[-1].strip('/')
+            if not ref.startswith('+') and not ref.startswith('joinchat'):
+                ref = '@' + ref.lstrip('@')
+        chat_ref = int(ref) if ref.lstrip('-').isdigit() else ref
+
+        chat_obj = None
+        try:
+            chat_obj = await client.get_chat(chat_ref)
+        except Exception as e:
+            # Не состоим в канале / не резолвится — пробуем вступить
+            logging.info(f"🔐 [acc {account_id}] No access to {channel} ({type(e).__name__}), trying to join")
+            try:
+                chat_obj = await self.tg_call(
+                    lambda: client.join_chat(chat_ref),
+                    account_id=account_id, description=f"join {channel}",
+                    notify=False, max_retries=2
+                )
+                if chat_obj is None:
+                    return False, None, f"Канал {channel} недоступен для вступления"
+            except AccountBlockedError as join_err:
+                return False, None, str(join_err)
+            except Exception as join_err:
+                return False, None, f"Не удалось вступить в {channel}: {str(join_err)[:120]}"
+
+        # Если состоим только как «превью» — join всё равно безопасен (уже участник → исключение игнорируем)
+        try:
+            if not getattr(chat_obj, 'is_member', True):
+                await client.join_chat(chat_ref)
+                chat_obj = await client.get_chat(chat_ref)
+        except Exception:
+            pass
+
+        discussion_id = await self.get_channel_discussion_id(client, chat_obj, chat_ref)
+        if not discussion_id:
+            return False, None, f"У канала {channel} нет открытых комментариев"
+
+        try:
+            await self.tg_call(
+                lambda: client.join_chat(discussion_id),
+                account_id=account_id, description=f"join discussion {discussion_id}",
+                notify=False, max_retries=2
+            )
+            logging.info(f"✅ [acc {account_id}] Joined discussion chat {discussion_id} of {channel}")
+        except Exception as e:
+            # USER_ALREADY_PARTICIPANT и подобное — не ошибка
+            logging.debug(f"ℹ️ [acc {account_id}] join discussion {discussion_id}: {e}")
+
+        return True, discussion_id, "OK"
+
+    async def list_commentable_channels(self, account_id: int, refresh: bool = False) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Каналы аккаунта, у которых открыты комментарии.
+
+        Раньше на каждый канал делался get_chat — при сотне каналов это сотня
+        запросов, Telegram отвечал FloodWait, и поиск растягивался на минуты.
+        Теперь каналы запрашиваются пачками по 100 через raw channels.GetChannels
+        (1 запрос вместо 100), а признак обсуждений берётся из флага has_link.
+        """
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return [], f"Ошибка подключения: {err}"
+
+        if refresh or not db.get_account_chats(account_id, chat_types=('channel',)):
+            await self.fetch_and_sync_chats(account_id)
+
+        channels = db.get_account_chats(account_id, chat_types=('channel',))
+        if not channels:
+            return [], None
+
+        from pyrogram.raw import functions as raw_functions
+        from pyrogram.raw import types as raw_types
+
+        # 1. Собираем InputChannel из сохранённых access_hash — без сетевых вызовов
+        wanted = {}
+        need_resolve = []
+        for ch in channels:
+            cid = ch['chat_id']
+            if not cid.lstrip('-').isdigit():
+                continue
+            raw_id = utils.get_channel_id(int(cid)) if int(cid) < 0 else int(cid)
+            ah = (ch.get('access_hash') or '').strip()
+            wanted[cid] = ch
+            if ah:
+                try:
+                    need_resolve.append((cid, raw_types.InputChannel(
+                        channel_id=abs(int(raw_id)), access_hash=int(ah))))
+                    continue
+                except (ValueError, TypeError):
+                    pass
+            need_resolve.append((cid, None))
+
+        result = []
+        CHUNK = 100
+
+        async def _fetch_chunk(pairs):
+            """Один GetChannels на пачку каналов."""
+            inputs, ids = [], []
+            for cid, inp in pairs:
+                if inp is None:
+                    # access_hash нет — пробуем через resolve_peer (из локального кэша)
+                    try:
+                        inp = await client.resolve_peer(int(cid))
+                    except Exception as e:
+                        logging.debug(f"resolve_peer {cid}: {type(e).__name__}: {e}")
+                        continue
+                inputs.append(inp)
+                ids.append(cid)
+            if not inputs:
+                return []
+            try:
+                res = await self.tg_call(
+                    lambda: client.invoke(raw_functions.channels.GetChannels(id=inputs)),
+                    account_id=account_id,
+                    description=f"GetChannels x{len(inputs)}",
+                    notify=False, max_retries=2
+                )
+            except AccountBlockedError:
+                raise
+            except Exception as e:
+                logging.warning(f"GetChannels chunk failed: {type(e).__name__}: {e}")
+                return []
+            return list(getattr(res, 'chats', []) or []) if res else []
+
+        try:
+            for i in range(0, len(need_resolve), CHUNK):
+                chunk = need_resolve[i:i + CHUNK]
+                for ch_obj in await _fetch_chunk(chunk):
+                    if not getattr(ch_obj, 'broadcast', False):
+                        continue          # супергруппы тут не нужны
+                    # has_link = к каналу привязан чат обсуждений
+                    if not getattr(ch_obj, 'has_link', False):
+                        continue
+                    cid = str(utils.get_channel_id(ch_obj.id))
+                    meta = wanted.get(cid) or {}
+                    result.append({
+                        'chat_id': cid,
+                        'title': getattr(ch_obj, 'title', None) or meta.get('chat_title') or cid,
+                        'username': getattr(ch_obj, 'username', None) or meta.get('chat_username') or '',
+                        # реальный id обсуждения выясняем лениво, при вступлении
+                        'discussion_id': None,
+                    })
+                await asyncio.sleep(0.3)   # мягкая пауза между пачками
+        except AccountBlockedError as e:
+            return [], str(e)
+
+        result.sort(key=lambda c: (c['title'] or '').lower())
+        logging.info(f"[acc {account_id}] каналов с комментариями: {len(result)} из {len(channels)}")
+        return result, None
 
     # ==================== CHAT LIST & SYNC ====================
     async def fetch_and_sync_chats(self, account_id: int) -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -1659,11 +2456,17 @@ class AccountSessionManager:
                         full_id = str(utils.get_channel_id(ch.id))
                         title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
                         username = getattr(ch, 'username', None) or ""
+                        # megagroup / gigagroup = супергруппа (чат), иначе broadcast-канал
+                        is_group = bool(getattr(ch, 'megagroup', False) or getattr(ch, 'gigagroup', False))
                         chats_map[full_id] = {
                             'id': full_id,
                             'title': title,
                             'username': username,
-                            'chat_type': 'channel'
+                            'chat_type': 'group' if is_group else 'channel',
+                            # access_hash — чтобы потом не дёргать get_chat на каждый канал
+                            'access_hash': getattr(ch, 'access_hash', '') or '',
+                            # has_link = у канала есть привязанный чат обсуждений
+                            'has_link': bool(getattr(ch, 'has_link', False)),
                         }
                     elif isinstance(ch, Chat):
                         full_id = str(-ch.id)
@@ -1682,7 +2485,7 @@ class AccountSessionManager:
                         if hasattr(peer, 'user_id'):
                             user_id = peer.user_id
                             user_obj = next((u for u in res.users if getattr(u, 'id', None) == user_id), None)
-                            if user_obj and not getattr(user_obj, 'bot', False):
+                            if user_obj:
                                 full_id = str(user_id)
                                 title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
                                 username = getattr(user_obj, 'username', None) or ""
@@ -1690,7 +2493,7 @@ class AccountSessionManager:
                                     'id': full_id,
                                     'title': title,
                                     'username': username,
-                                    'chat_type': 'private'
+                                    'chat_type': 'bot' if getattr(user_obj, 'bot', False) else 'private'
                                 }
 
                 if not hasattr(res, 'dialogs') or not res.dialogs or len(res.dialogs) < limit:
@@ -1744,7 +2547,10 @@ class AccountSessionManager:
                             full_id = str(utils.get_channel_id(ch.id))
                             title = ch.title or (f"@{ch.username}" if getattr(ch, 'username', None) else f"Канал/Чат {ch.id}")
                             username = getattr(ch, 'username', None) or ""
-                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'channel'}
+                            is_group = bool(getattr(ch, 'megagroup', False) or getattr(ch, 'gigagroup', False))
+                            chats_map[full_id] = {'id': full_id, 'title': title, 'username': username,
+                                                  'chat_type': 'group' if is_group else 'channel',
+                                                  'access_hash': getattr(ch, 'access_hash', '') or ''}
                         elif isinstance(ch, Chat):
                             full_id = str(-ch.id)
                             title = ch.title or f"Группа {ch.id}"
@@ -1756,11 +2562,11 @@ class AccountSessionManager:
                         if hasattr(peer, 'user_id'):
                             user_id = peer.user_id
                             user_obj = next((u for u in res_arch.users if getattr(u, 'id', None) == user_id), None)
-                            if user_obj and not getattr(user_obj, 'bot', False):
+                            if user_obj:
                                 full_id = str(user_id)
                                 title = f"{user_obj.first_name or ''} {user_obj.last_name or ''}".strip() or f"User {user_id}"
                                 username = getattr(user_obj, 'username', None) or ""
-                                chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'private'}
+                                chats_map[full_id] = {'id': full_id, 'title': title, 'username': username, 'chat_type': 'bot' if getattr(user_obj, 'bot', False) else 'private'}
             except Exception:
                 pass
 
@@ -1783,8 +2589,10 @@ class AccountSessionManager:
                             chat_type = 'private'
                         elif chat.type == enums.ChatType.BOT:
                             chat_type = 'bot'
-                        elif chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.GROUP, enums.ChatType.CHANNEL]:
-                            chat_type = 'channel' if chat.type == enums.ChatType.CHANNEL else 'group'
+                        elif chat.type in [enums.ChatType.SUPERGROUP, enums.ChatType.GROUP]:
+                            chat_type = 'group'
+                        elif chat.type == enums.ChatType.CHANNEL:
+                            chat_type = 'channel'
                         chat_list.append({
                             'id': str(chat.id),
                             'title': chat.title or str(chat.id),
@@ -1983,6 +2791,9 @@ class AccountSessionManager:
     async def start_account_spam(self, account_id: int, bot, user_id: int):
         if self.is_account_spamming(account_id):
             return True, "Рассылка уже запущена"
+        usable, reason = db.is_account_usable(account_id)
+        if not usable:
+            return False, reason
         if not await self._acquire_user_quota(user_id):
             return False, f"Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER}). Дождитесь завершения или отмените другие задачи."
         if self._running_tasks >= self._max_concurrent_tasks:
@@ -2053,11 +2864,12 @@ class AccountSessionManager:
                     break
 
                 # Get only enabled chats
-                spam_chats = db.get_account_chats(account_id, spam_only=True)
+                # Постинг по чатам = только группы/супергруппы (каналы, боты и ЛС исключены)
+                spam_chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
                 if not spam_chats:
                     # Try syncing if empty
-                    spam_chats, _ = await self.fetch_and_sync_chats(account_id)
-                    spam_chats = [c for c in spam_chats if c.get('spam_enabled') == 1]
+                    await self.fetch_and_sync_chats(account_id)
+                    spam_chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
 
                 if not spam_chats:
                     db.set_account_spam_status(account_id, 0)
@@ -2085,11 +2897,22 @@ class AccountSessionManager:
                     mention_msg = None
                     try:
                         me = await client.get_me()
-                        async for hist in client.get_chat_history(chat_id_val, limit=15):
-                            if hist.from_user and hist.from_user.id != me.id:
-                                mention_msg = hist
-                                break
-                    except Exception as e:
+
+                        async def _scan_history():
+                            async for hist in client.get_chat_history(chat_id_val, limit=15):
+                                if hist.from_user and hist.from_user.id != me.id:
+                                    return hist
+                            return None
+
+                        mention_msg = await self.tg_call(
+                            _scan_history,
+                            account_id=account_id, bot=bot, user_id=user_id,
+                            description=f"get_chat_history {chat_title}",
+                            notify=False, max_retries=2
+                        )
+                    except AccountBlockedError:
+                        raise
+                    except Exception:
                         pass
 
                     entities = []
@@ -2132,18 +2955,39 @@ class AccountSessionManager:
                     # Send post - только entities, без parse_mode
                     try:
                         if post_photo and os.path.exists(post_photo):
-                            await client.send_photo(
-                                chat_id_val,
-                                post_photo,
-                                caption=full_text,
-                                caption_entities=entities if entities else None
+                            _sent = await self.tg_call(
+                                lambda: client.send_photo(
+                                    chat_id_val,
+                                    post_photo,
+                                    caption=full_text,
+                                    caption_entities=entities if entities else None
+                                ),
+                                account_id=account_id, bot=bot, user_id=user_id,
+                                description=f"send_photo -> {chat_title}",
+                                notify=not notifications_hidden
                             )
                         else:
-                            await client.send_message(
-                                chat_id_val,
-                                full_text,
-                                entities=entities if entities else None
+                            _sent = await self.tg_call(
+                                lambda: client.send_message(
+                                    chat_id_val,
+                                    full_text,
+                                    entities=entities if entities else None
+                                ),
+                                account_id=account_id, bot=bot, user_id=user_id,
+                                description=f"send_message -> {chat_title}",
+                                notify=not notifications_hidden
                             )
+                        if _sent is None:
+                            # Чат недоступен для записи — фиксируем и идём дальше
+                            print(f"⏭ [{acc_name}] Пропущен {chat_title} (нет доступа на запись)")
+                            if chat_id_val not in chats_added:
+                                db.add_report_chat(report_id, str(chat_id_val), chat_title,
+                                                   error='Нет доступа на запись')
+                                chats_added.add(chat_id_val)
+                            else:
+                                db.update_report_stats(report_id, error_delta=1)
+                            await asyncio.sleep(random.randint(5, 12))
+                            continue
                         print(f"✅ [{acc_name}] Отправлено в {chat_title}")
                         if bot and not notifications_hidden:
                             await bot.send_message(user_id, f"✅ [{acc_name}] Отправлено в {chat_title}")
@@ -2176,6 +3020,10 @@ class AccountSessionManager:
 
         except asyncio.CancelledError:
             print(f"🛑 Задача спама [{acc_name}] отменена")
+        except AccountBlockedError as e:
+            # Аккаунт ограничен/забанен — пользователь уже уведомлён в tg_call
+            print(f"🚫 Рассылка [{acc_name}] остановлена: {e}")
+            db.set_account_spam_status(account_id, 0)
         except Exception as e:
             print(f"❌ Критическая ошибка спама [{acc_name}]: {e}")
             if bot:
@@ -2191,7 +3039,16 @@ class AccountSessionManager:
             self.active_spam_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
 
-    async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int, limit: int = 10000, progress_callback=None):
+    async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int,
+                               limit: int = 10000, progress_callback=None,
+                               history_limit: int = 5000, include_members: bool = True):
+        """Парсинг участников чата.
+
+        limit           — максимум пользователей, которых нужно собрать.
+        history_limit   — сколько сообщений истории просканировать (для групп со скрытыми участниками).
+        include_members — сначала попытаться взять открытый список участников (быстро),
+                          затем добрать из истории сообщений.
+        """
         account = db.get_account(account_id)
         if not account:
             return None, "Аккаунт не найден"
@@ -2204,125 +3061,148 @@ class AccountSessionManager:
         users = []
         seen_ids = set()
         seen_usernames = set()
+
+        def _add_user(u, username_override=None):
+            """Добавляет пользователя в результат. Возвращает True, если он новый."""
+            username = username_override
+            user_id_val = 0
+            first_name = last_name = phone = ''
+            if u is not None:
+                if getattr(u, 'is_bot', False):
+                    return False
+                if getattr(u, 'is_self', False):
+                    return False
+                if getattr(u, 'is_deleted', False):
+                    return False
+                user_id_val = getattr(u, 'id', 0) or 0
+                first_name = getattr(u, 'first_name', '') or ''
+                last_name = getattr(u, 'last_name', '') or ''
+                phone = getattr(u, 'phone_number', '') or ''
+                username = username or getattr(u, 'username', None)
+            if not username and not user_id_val:
+                return False
+            key_u = username.lower() if username else None
+            if key_u and key_u in seen_usernames:
+                return False
+            if user_id_val and user_id_val in seen_ids:
+                return False
+            if key_u:
+                seen_usernames.add(key_u)
+            if user_id_val:
+                seen_ids.add(user_id_val)
+            users.append({
+                'id': user_id_val,
+                'username': username or '',
+                'first_name': first_name,
+                'last_name': last_name,
+                'phone': phone
+            })
+            return True
+
+        stats = {'members': 0, 'from_history': 0, 'scanned': 0, 'mentions': 0}
         try:
-            target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
-            
+            target = int(chat_id) if chat_id.lstrip('-').isdigit() else chat_id
+
             try:
                 chat = await client.get_chat(target)
                 chat_id_resolved = chat.id
-                logging.info(f"📥 [{acc_name}] parse_chat_users chat={chat_id_resolved} title={getattr(chat, 'title', chat_id)} limit={limit}")
+                logging.info(f"📥 [{acc_name}] parse_chat_users chat={chat_id_resolved} "
+                             f"title={getattr(chat, 'title', chat_id)} limit={limit} history_limit={history_limit}")
             except Exception as e:
                 logging.error(f"❌ [{acc_name}] parse_chat_users get_chat failed: {e}")
                 return None, f"Не удалось открыть чат: {e}"
-            
-            scanned = 0
-            skipped_bot = 0
-            skipped_self = 0
-            skipped_no_user = 0
-            skipped_no_username = 0
-            skipped_duplicate = 0
-            
-            fetch_limit = min(max(limit, 200), 10000)
-            offset = 0
-            batch = 100
-            
-            while len(users) < limit and offset < fetch_limit:
-                batch_size = min(batch, fetch_limit - offset)
-                logging.info(f"📥 [{acc_name}] parse_chat_users fetching batch offset={offset} batch={batch_size}")
-                async for msg in client.get_chat_history(chat_id_resolved, limit=batch_size, offset=offset):
-                    scanned += 1
-                    try:
-                        if not msg:
-                            skipped_no_user += 1
+
+            # ── 1. Открытый список участников (если он доступен) ──────────────
+            if include_members:
+                try:
+                    async for member in client.get_chat_members(chat_id_resolved, limit=limit):
+                        if len(users) >= limit:
+                            break
+                        if _add_user(getattr(member, 'user', None)):
+                            stats['members'] += 1
+                            if progress_callback and len(users) % 50 == 0:
+                                try:
+                                    await progress_callback(len(users))
+                                except Exception:
+                                    pass
+                    logging.info(f"👥 [{acc_name}] members list: {stats['members']} users")
+                except Exception as e:
+                    # ChatAdminRequired / участники скрыты — это нормально, идём в историю
+                    logging.info(f"ℹ️ [{acc_name}] Members list unavailable ({type(e).__name__}), "
+                                 f"parsing message history instead")
+
+            # ── 2. История сообщений (для чатов со скрытыми участниками) ──────
+            if len(users) < limit and history_limit > 0:
+                import re
+                mention_re = re.compile(r'@([a-zA-Z0-9_]{5,32})')
+                try:
+                    async for msg in client.get_chat_history(chat_id_resolved, limit=history_limit):
+                        stats['scanned'] += 1
+                        if len(users) >= limit:
+                            break
+                        try:
+                            u = getattr(msg, 'from_user', None)
+                            if u is not None:
+                                if _add_user(u):
+                                    stats['from_history'] += 1
+                            # Упоминания @username в тексте — тоже потенциальные участники
+                            text = (getattr(msg, 'text', None) or getattr(msg, 'caption', None) or '')
+                            if text and len(users) < limit:
+                                for mention in mention_re.findall(text):
+                                    if len(users) >= limit:
+                                        break
+                                    if _add_user(None, username_override=mention):
+                                        stats['mentions'] += 1
+                            if progress_callback and stats['scanned'] % 200 == 0:
+                                try:
+                                    await progress_callback(len(users), stats['scanned'])
+                                except Exception:
+                                    pass
+                        except Exception:
                             continue
-                        
-                        username = None
-                        user_id_val = 0
-                        first_name = ''
-                        last_name = ''
-                        
-                        u = msg.from_user
-                        if u:
-                            if u.is_bot:
-                                skipped_bot += 1
-                                continue
-                            if getattr(u, 'is_self', False):
-                                skipped_self += 1
-                                continue
-                            user_id_val = u.id
-                            first_name = u.first_name or ''
-                            last_name = u.last_name or ''
-                            if u.username:
-                                username = u.username
-                        
-                        if not username:
-                            text = msg.text or msg.caption or ''
-                            if text:
-                                import re
-                                mentions = re.findall(r'@([a-zA-Z0-9_]{5,32})', text)
-                                if mentions:
-                                    username = mentions[0]
-                        
-                        if not username:
-                            skipped_no_username += 1
-                            continue
-                        
-                        username_lower = username.lower()
-                        if username_lower in seen_usernames:
-                            skipped_duplicate += 1
-                            continue
-                        if user_id_val and user_id_val in seen_ids:
-                            skipped_duplicate += 1
-                            continue
-                        
-                        seen_usernames.add(username_lower)
-                        if user_id_val:
-                            seen_ids.add(user_id_val)
-                        
-                        users.append({
-                            'id': user_id_val,
-                            'username': username,
-                            'first_name': first_name,
-                            'last_name': last_name,
-                            'phone': u.phone_number if u else ''
-                        })
-                        
-                        if progress_callback and len(users) % 20 == 0:
-                            try:
-                                await progress_callback(len(users))
-                            except:
-                                pass
-                    except Exception:
-                        continue
-                
-                if scanned >= fetch_limit:
-                    break
-                offset += batch_size
-                if offset >= fetch_limit:
-                    break
-            
-            logging.info(f"📊 [{acc_name}] parse_chat_users done: scanned={scanned} users={len(users)} skipped_bot={skipped_bot} skipped_self={skipped_self} skipped_no_user={skipped_no_user} skipped_no_username={skipped_no_username} skipped_duplicate={skipped_duplicate}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as hist_err:
+                    logging.warning(f"⚠️ [{acc_name}] History parse error: {hist_err}")
+
+            logging.info(
+                f"📊 [{acc_name}] parse done: total={len(users)} members={stats['members']} "
+                f"history={stats['from_history']} mentions={stats['mentions']} scanned={stats['scanned']}"
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logging.error(f"❌ [{acc_name}] parse_chat_users error: {e}")
             return None, f"Ошибка парсинга: {e}"
 
         if not users:
-            return [], "Нет пользователей в истории"
+            return [], "Пользователей не найдено (участники скрыты и в истории нет отправителей)"
 
         try:
             db.clear_parsed_users(account_id, user_id)
-            db.save_parsed_users(account_id, user_id, users)
+            db.save_parsed_users(account_id, user_id, users, source_chat_id=str(chat_id))
         except Exception as save_err:
             logging.error(f"❌ [{acc_name}] Failed to save parsed users: {save_err}")
             return users, f"Найдено {len(users)} пользователей (ошибка сохранения: {save_err})"
-        
-        return users, f"Найдено {len(users)} пользователей"
 
-    async def parse_chat_users_background(self, account_id: int, chat_id: str, bot, user_id: int, progress_callback=None, limit: int = 10000):
+        return users, (
+            f"Найдено {len(users)} пользователей\n"
+            f"• из списка участников: {stats['members']}\n"
+            f"• из истории сообщений: {stats['from_history']}\n"
+            f"• из упоминаний: {stats['mentions']}\n"
+            f"• просканировано сообщений: {stats['scanned']}"
+        )
+
+    async def parse_chat_users_background(self, account_id: int, chat_id: str, bot, user_id: int,
+                                          progress_callback=None, limit: int = 10000,
+                                          history_limit: int = 5000, include_members: bool = True):
         task = asyncio.current_task()
         self.active_parse_tasks[account_id] = task
         try:
-            users, msg = await self.parse_chat_users(account_id, chat_id, bot, user_id, limit, progress_callback)
+            users, msg = await self.parse_chat_users(
+                account_id, chat_id, bot, user_id, limit, progress_callback,
+                history_limit=history_limit, include_members=include_members
+            )
             if users is None:
                 try:
                     await bot.send_message(user_id, f"❌ Парсинг завершен с ошибкой: {msg}")
@@ -2333,7 +3213,10 @@ class AccountSessionManager:
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 markup = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📋 Показать список", callback_data=f"parsed_users_page_{account_id}_0")],
-                    [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")],
+                    [
+                        InlineKeyboardButton(text="🌐 Скачать HTML", callback_data=f"download_parsed_html_{account_id}"),
+                        InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")
+                    ],
                     [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
                 ])
                 await bot.send_message(user_id, f"✅ Парсинг завершен! {msg}", reply_markup=markup)
@@ -2654,12 +3537,20 @@ class AccountSessionManager:
             for user_id_val in added_contacts:
                 try:
                     logging.info(f"📥 [{acc_name}] Inviting user {user_id_val} ({success+1}/{len(added_contacts)})")
-                    await asyncio.wait_for(
-                        client.add_chat_members(chat_id=chat_obj.id, user_ids=[user_id_val]),
-                        timeout=5.0
+                    await self.tg_call(
+                        lambda: asyncio.wait_for(
+                            client.add_chat_members(chat_id=chat_obj.id, user_ids=[user_id_val]),
+                            timeout=5.0
+                        ),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f"invite {user_id_val}",
+                        notify=not notifications_hidden
                     )
                     success += 1
                     logging.info(f"✅ [{acc_name}] Invited user {user_id_val} ({success}/{len(added_contacts)})")
+                except AccountBlockedError as e:
+                    logging.warning(f"🛑 [{acc_name}] Инвайт остановлен: {e}")
+                    break
                 except asyncio.TimeoutError:
                     errors += 1
                     logging.warning(f"⚠️ [{acc_name}] Timeout adding {user_id_val}")

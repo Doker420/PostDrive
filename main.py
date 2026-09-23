@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ── Config with env overrides ─────────────────────────────────────
 config_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'config.ini')
 config = configparser.ConfigParser()
-config.read(config_path)
+config.read(config_path, encoding='utf-8')
 
 TOKEN = os.environ.get('BOT_TOKEN', config['BOT']['TOKEN'])
 ADMIN = int(os.environ.get('BOT_ADMIN', config['BOT']['ADMIN']))

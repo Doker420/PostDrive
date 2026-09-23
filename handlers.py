@@ -8,6 +8,7 @@ import random
 import string
 from datetime import datetime
 from typing import List, Dict, Optional, Any, Tuple
+import html
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
@@ -113,6 +114,9 @@ class InviteStates(StatesGroup):
     SELECTING_CHAT = State()
     WAITING_CUSTOM_CHAT = State()
     WAITING_USERS_FILE = State()
+
+class ParseStates(StatesGroup):
+    WAITING_HISTORY_LIMIT = State()
 
 class NeuroCommentStates(StatesGroup):
     SELECTING_ACCOUNTS = State()
@@ -365,6 +369,50 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     TESTNET = config.get('TESTNET', False)
     account_manager = config.get('account_manager')
     USERNAME = config.get('USERNAME', 'bot')
+    STARS_ENABLED = config.get('STARS_ENABLED', True)
+    STARS_PER_USD = int(config.get('STARS_PER_USD', 50))
+    MINIAPP_ENABLED = config.get('MINIAPP_ENABLED', False)
+    MINIAPP_URL = config.get('MINIAPP_URL', '')
+    TERMS_URL = config.get('TERMS_URL', '')
+    PRIVACY_URL = config.get('PRIVACY_URL', '')
+    SUPPORT_CONTACT = config.get('SUPPORT', '@support')
+
+    DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'documents')
+
+    def _load_doc(filename: str, limit: int = 3500) -> str:
+        """Читает документ из documents/ и готовит его к отправке в Telegram."""
+        path = os.path.join(DOCS_DIR, filename)
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                raw = fh.read()
+        except Exception as e:
+            logger.error(f"Не удалось прочитать {filename}: {e}")
+            return ""
+        import re as _re
+        text = raw
+        text = _re.sub(r'^#{1,6}\s*(.+)$', r'<b>\1</b>', text, flags=_re.MULTILINE)
+        text = _re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        text = _re.sub(r'_(.+?)_', r'<i>\1</i>', text)
+        text = _re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+        text = _re.sub(r'<(https?://[^>]+)>', r'\1', text)
+        text = _re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
+    def _doc_pages(text: str, size: int = 3500) -> list:
+        """Разбивает длинный документ на страницы по границам абзацев."""
+        if not text:
+            return ["Документ недоступен."]
+        pages, current = [], ""
+        for para in text.split('\n\n'):
+            candidate = (current + '\n\n' + para) if current else para
+            if len(candidate) > size and current:
+                pages.append(current)
+                current = para
+            else:
+                current = candidate
+        if current:
+            pages.append(current)
+        return pages or ["Документ недоступен."]
 
     CHATS_PER_PAGE = 8
     user_selected_leave_chats: Dict[int, set] = {}
@@ -494,11 +542,42 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             "• Массовый выход из выбранных чатов\n"
             "• Защита от флуда и поддержка форматирования с медиа"
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions_start_0")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")]
-        ])
+        text += f"\n\n💬 <b>Поддержка:</b> {SUPPORT_CONTACT}"
+        rows = [[InlineKeyboardButton(text="📖 Инструкция", callback_data="instructions_start_0")]]
+        if TERMS_URL:
+            rows.append([InlineKeyboardButton(text="📄 Пользовательское соглашение", url=TERMS_URL)])
+        else:
+            rows.append([InlineKeyboardButton(text="📄 Пользовательское соглашение", callback_data="legal_terms_0")])
+        rows.append([InlineKeyboardButton(text="📋 Правила использования", callback_data="legal_rules_0")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
         await send_photo(message, 'info.jpg', text, markup)
+
+    @dp.callback_query(F.data.startswith('legal_'))
+    async def legal_doc_callback(callback: CallbackQuery):
+        # legal_{terms|rules}_{page}
+        parts = callback.data.split('_')
+        doc = parts[1]
+        page = int(parts[2]) if len(parts) > 2 else 0
+        filename = 'TERMS.md' if doc == 'terms' else 'RULES.md'
+        title = "📄 Пользовательское соглашение" if doc == 'terms' else "📋 Правила использования"
+
+        pages = _doc_pages(_load_doc(filename))
+        page = max(0, min(page, len(pages) - 1))
+
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"legal_{doc}_{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{len(pages)}", callback_data="noop"))
+        if page < len(pages) - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"legal_{doc}_{page+1}"))
+        rows = [nav]
+        other = 'rules' if doc == 'terms' else 'terms'
+        other_label = "📋 Правила использования" if doc == 'terms' else "📄 Пользовательское соглашение"
+        rows.append([InlineKeyboardButton(text=other_label, callback_data=f"legal_{other}_0")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
+
+        await edit_message(callback, f"{title}\n\n{pages[page]}", InlineKeyboardMarkup(inline_keyboard=rows))
 
     INSTRUCTIONS = [
         (
@@ -759,8 +838,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         
         all_chats = []
         for acc_id in account_ids:
-            chats = db.get_account_chats(acc_id)
-            for chat in chats:
+            # Инвайтить можно только в группы/супергруппы
+            for chat in db.get_account_chats(acc_id, chat_types=db.GROUP_CHAT_TYPES):
                 all_chats.append(chat)
         
         total = len(all_chats)
@@ -1292,35 +1371,285 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ Не удалось отправить!")
 
     # ==================== SUBSCRIPTION & CRYPTOBOT ====================
-    @dp.message(F.text == '💳 Подписка')
-    async def subscription_menu(message: Message, state: FSMContext):
-        await state.clear()
-        user_id = message.from_user.id
+    TARIFF_ICONS = {'trial': '🎁', 'starter': '🚀', 'pro': '💼', 'team': '🏢',
+                    'enterprise': '🏆', 'starter_y': '🚀', 'pro_y': '💼', 'team_y': '🏢'}
+
+    def _usd_to_stars(amount_usd: float) -> int:
+        return max(1, int(round(amount_usd * STARS_PER_USD)))
+
+    async def render_subscription(target, user_id: int):
         user = db.get_user(user_id)
         is_admin = (user_id == ADMIN) or (user and user.get('is_admin') == 1)
         is_sub = db.is_user_subscribed(user_id, ADMIN)
+        limits = db.get_user_limits(user_id, ADMIN)
+        used_accounts = db.count_user_accounts(user_id)
+        ai_used = db.get_ai_usage_today(user_id)
 
         status_str = "🟢 Активна" if is_sub else "🔴 Не активна"
         sub_until = format_date(user.get('subscription_until', 0)) if (user and not is_admin) else "Бессрочно (Администратор)"
 
-        tariffs = db.get_tariffs(active_only=True)
-        buttons = []
-        for t in tariffs:
-            buttons.append([InlineKeyboardButton(
-                text=f"🛒 {t['name']} — ${t['price_usd']:.2f} (USDT)",
-                callback_data=f"buy_tariff_{t['id']}"
-            )])
-        buttons.append([InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")])
-
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         text = (
-            f"💳 <b>Управление подпиской</b>\n\n"
+            f"💳 <b>Подписка и тарифы</b>\n\n"
             f"• <b>Статус:</b> {status_str}\n"
-            f"• <b>Действует до:</b> {sub_until}\n\n"
-            f"<b>Доступные тарифные планы:</b>\n"
-            f"<i>Выберите тариф для быстрой оплаты через CryptoBot:</i>"
+            f"• <b>Действует до:</b> {sub_until}\n"
+            f"• <b>Тариф:</b> {limits['tariff_name']}\n\n"
+            f"<b>📊 Ваши лимиты</b>\n"
+            f"• Аккаунтов: <b>{used_accounts}/{limits['max_accounts']}</b>\n"
+            f"• AI-комментариев сегодня: <b>{ai_used}/{limits['ai_per_day']}</b>\n\n"
+            f"<i>Лимиты обновляются ежедневно в 00:00 UTC.</i>"
         )
-        await send_photo(message, 'sub.jpg', text, markup)
+
+        rows = []
+        if MINIAPP_ENABLED and MINIAPP_URL:
+            from aiogram.types import WebAppInfo
+            rows.append([InlineKeyboardButton(
+                text="🛒 Открыть магазин тарифов",
+                web_app=WebAppInfo(url=f"{MINIAPP_URL}?uid={user_id}")
+            )])
+        rows.append([InlineKeyboardButton(text="📦 Тарифные планы", callback_data="show_tariffs")])
+        rows.append([InlineKeyboardButton(text="➕ Докупить слоты / AI", callback_data="show_addons")])
+        rows.append([InlineKeyboardButton(text="💡 Как пополнить баланс", callback_data="howto_pay")])
+        rows.append([InlineKeyboardButton(text="🎁 Ввести промокод", callback_data="enter_promo")])
+
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+        if isinstance(target, CallbackQuery):
+            await edit_message(target, text, markup)
+        else:
+            await send_photo(target, 'sub.jpg', text, markup)
+
+    @dp.message(F.text == '💳 Подписка')
+    async def subscription_menu(message: Message, state: FSMContext):
+        await state.clear()
+        await render_subscription(message, message.from_user.id)
+
+    @dp.callback_query(F.data == "back_to_subscription")
+    async def back_to_subscription_callback(callback: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await render_subscription(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data == "show_tariffs")
+    async def show_tariffs_callback(callback: CallbackQuery):
+        tariffs = db.get_tariffs(active_only=True)
+        tariffs = sorted(tariffs, key=lambda t: (t.get('sort_order') or 0, t.get('price_usd') or 0))
+        rows, lines = [], []
+        for t in tariffs:
+            icon = TARIFF_ICONS.get(t.get('code', ''), '📦')
+            period = "год" if (t.get('duration_days') or 0) >= 365 else f"{t.get('duration_days')} дн."
+            lines.append(
+                f"{icon} <b>{t['name']}</b> — ${t['price_usd']:.0f} / {period}\n"
+                f"    Аккаунтов: {t.get('max_accounts', 1)} · AI/сутки: {t.get('ai_comments_per_day', 0)}"
+            )
+            rows.append([InlineKeyboardButton(
+                text=f"{icon} {t['name']} — ${t['price_usd']:.0f}",
+                callback_data=f"tariff_info_{t['id']}"
+            )])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")])
+        await edit_message(
+            callback,
+            "📦 <b>Тарифные планы</b>\n\n" + "\n\n".join(lines) +
+            "\n\n<i>Выберите тариф, чтобы перейти к оплате.</i>",
+            InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+
+    @dp.callback_query(F.data.startswith('tariff_info_'))
+    async def tariff_info_callback(callback: CallbackQuery):
+        tariff_id = int(callback.data.split('_')[2])
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await callback.answer("❌ Тариф не найден", show_alert=True)
+            return
+        price = float(t['price_usd'])
+        icon = TARIFF_ICONS.get(t.get('code', ''), '📦')
+        period = "1 год" if (t.get('duration_days') or 0) >= 365 else f"{t.get('duration_days')} дней"
+
+        text = (
+            f"{icon} <b>{t['name']}</b>\n\n"
+            f"{t.get('description') or ''}\n\n"
+            f"• <b>Цена:</b> ${price:.2f}\n"
+            f"• <b>Период:</b> {period}\n"
+            f"• <b>Аккаунтов:</b> {t.get('max_accounts', 1)}\n"
+            f"• <b>AI-комментариев в сутки:</b> {t.get('ai_comments_per_day', 0)}\n\n"
+            f"<b>Выберите способ оплаты:</b>"
+        )
+        rows = []
+        if price > 0:
+            rows.append([InlineKeyboardButton(text=f"💎 CryptoBot — ${price:.2f} USDT",
+                                              callback_data=f"buy_tariff_{tariff_id}")])
+            if STARS_ENABLED:
+                rows.append([InlineKeyboardButton(text=f"⭐ Telegram Stars — {_usd_to_stars(price)} ⭐",
+                                                  callback_data=f"buy_stars_{tariff_id}")])
+        else:
+            rows.append([InlineKeyboardButton(text="🎁 Активировать бесплатно",
+                                              callback_data=f"activate_trial_{tariff_id}")])
+        rows.append([InlineKeyboardButton(text="💡 Как пополнить", callback_data="howto_pay")])
+        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="show_tariffs")])
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('activate_trial_'))
+    async def activate_trial_callback(callback: CallbackQuery):
+        tariff_id = int(callback.data.split('_')[2])
+        user_id = callback.from_user.id
+        t = db.get_tariff(tariff_id)
+        if not t or float(t['price_usd']) > 0:
+            await callback.answer("❌ Недоступно", show_alert=True)
+            return
+        ent = db.get_user_entitlements(user_id)
+        if ent.get('tariff_code'):
+            await callback.answer("🎁 Пробный период уже активировался ранее.", show_alert=True)
+            return
+        db.add_subscription_days(user_id, int(t['duration_days']))
+        db.set_user_tariff(user_id, t.get('code') or 'trial')
+        await callback.answer("🎉 Пробный доступ активирован!", show_alert=True)
+        await render_subscription(callback, user_id)
+
+    @dp.callback_query(F.data == "show_addons")
+    async def show_addons_callback(callback: CallbackQuery):
+        text = (
+            "➕ <b>Дополнительные пакеты</b>\n\n"
+            f"🔹 <b>Слот аккаунта</b> — ${db.ADDON_ACCOUNT_SLOT_USD:.0f}/мес\n"
+            "   +1 аккаунт сверх лимита тарифа\n\n"
+            f"🔹 <b>AI-пакет</b> — ${db.ADDON_AI_PACK_USD:.0f}\n"
+            f"   +{db.ADDON_AI_PACK_SIZE} комментариев в сутки на 30 дней\n\n"
+            f"🔥 <b>Прогрев аккаунта</b> — ${db.ADDON_WARMUP_USD:.0f} за аккаунт\n"
+            "   Автоматический warmup новой сессии: имитация живой активности,\n"
+            "   постепенный выход на рабочую нагрузку. Снижает риск блокировки.\n\n"
+            "<i>Для покупки выберите пакет — оплата через CryptoBot или Stars.</i>"
+        )
+        rows = [
+            [InlineKeyboardButton(text=f"🔹 +1 слот аккаунта — ${db.ADDON_ACCOUNT_SLOT_USD:.0f}",
+                                  callback_data="addon_slot")],
+            [InlineKeyboardButton(text=f"🔹 AI-пакет {db.ADDON_AI_PACK_SIZE} — ${db.ADDON_AI_PACK_USD:.0f}",
+                                  callback_data="addon_ai")],
+            [InlineKeyboardButton(text=f"🔥 Прогрев аккаунта — ${db.ADDON_WARMUP_USD:.0f}",
+                                  callback_data="addon_warmup")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")]
+        ]
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('addon_'))
+    async def addon_callback(callback: CallbackQuery):
+        kind = callback.data.split('_', 1)[1]
+        if kind == 'warmup':
+            await callback.answer(
+                "🔥 Прогрев аккаунтов скоро будет доступен. "
+                f"Напишите в поддержку {SUPPORT_CONTACT} для ручного подключения.",
+                show_alert=True
+            )
+            return
+        await callback.answer(
+            f"Для покупки пакета напишите в поддержку {SUPPORT_CONTACT}. "
+            "Автооплата пакетов появится в ближайшем обновлении.",
+            show_alert=True
+        )
+
+    @dp.callback_query(F.data == "howto_pay")
+    async def howto_pay_callback(callback: CallbackQuery):
+        text = (
+            "💡 <b>Как оплатить подписку</b>\n\n"
+            "<b>Способ 1. Telegram Stars</b> ⭐ <i>(быстро, прямо в Telegram)</i>\n"
+            "1. Выберите тариф и нажмите «⭐ Telegram Stars».\n"
+            "2. Подтвердите оплату во всплывающем окне Telegram.\n"
+            "3. Подписка активируется <b>мгновенно</b>.\n"
+            "Звёзды пополняются в Telegram: <b>Настройки → Мои звёзды → Пополнить</b> "
+            "(картой или через Apple/Google Pay).\n\n"
+            "<b>Способ 2. Криптовалюта через @CryptoBot</b> 💎\n"
+            "1. Откройте @CryptoBot и пополните баланс USDT:\n"
+            "   • «Кошелёк» → «Пополнить» → выберите USDT;\n"
+            "   • переведите средства с биржи (Binance, Bybit, OKX) или другого кошелька;\n"
+            "   • сеть TRC-20 обычно дешевле по комиссии.\n"
+            "2. Вернитесь сюда, выберите тариф и нажмите «💎 CryptoBot».\n"
+            "3. Оплатите счёт и нажмите «Проверить оплату».\n\n"
+            "<b>Способ 3. Промокод</b> 🎁\n"
+            "Если у вас есть промокод — нажмите «🎁 Ввести промокод».\n\n"
+            f"❓ Возникли сложности? Напишите в поддержку: {SUPPORT_CONTACT}"
+        )
+        rows = [[InlineKeyboardButton(text="📦 К тарифам", callback_data="show_tariffs")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_subscription")]]
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+
+    @dp.callback_query(F.data.startswith('buy_stars_'))
+    async def buy_stars_callback(callback: CallbackQuery):
+        """Оплата через Telegram Stars (XTR) — нативный инвойс Telegram."""
+        if not STARS_ENABLED:
+            await callback.answer("⭐ Оплата звёздами отключена", show_alert=True)
+            return
+        tariff_id = int(callback.data.split('_')[2])
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await callback.answer("❌ Тариф не найден", show_alert=True)
+            return
+        stars = _usd_to_stars(float(t['price_usd']))
+        from aiogram.types import LabeledPrice
+        try:
+            await bot.send_invoice(
+                chat_id=callback.from_user.id,
+                title=f"Подписка {t['name']}",
+                description=(
+                    f"{t.get('description') or 'Доступ к PostDrive'}. "
+                    f"Аккаунтов: {t.get('max_accounts', 1)}, AI/сутки: {t.get('ai_comments_per_day', 0)}."
+                ),
+                payload=f"tariff:{tariff_id}",
+                currency="XTR",                       # Telegram Stars
+                prices=[LabeledPrice(label=t['name'], amount=stars)],
+                provider_token="",                    # для XTR токен не нужен
+                start_parameter="postdrive-sub"
+            )
+            await callback.answer("⭐ Счёт отправлен")
+        except Exception as e:
+            logger.error(f"Stars invoice failed: {e}")
+            await callback.answer(f"❌ Не удалось создать счёт: {str(e)[:150]}", show_alert=True)
+
+    @dp.pre_checkout_query()
+    async def stars_pre_checkout(pre_checkout_query):
+        """Telegram требует ответить на pre_checkout в течение 10 секунд."""
+        try:
+            await pre_checkout_query.answer(ok=True)
+        except Exception as e:
+            logger.error(f"pre_checkout failed: {e}")
+
+    @dp.message(F.successful_payment)
+    async def stars_successful_payment(message: Message):
+        """Звёзды оплачены — начисляем подписку и партнёрскую комиссию."""
+        sp = message.successful_payment
+        user_id = message.from_user.id
+        payload = sp.invoice_payload or ''
+        if not payload.startswith('tariff:'):
+            return
+        try:
+            tariff_id = int(payload.split(':')[1])
+        except (IndexError, ValueError):
+            return
+        t = db.get_tariff(tariff_id)
+        if not t:
+            await message.answer("⚠️ Платёж получен, но тариф не найден. Напишите в поддержку.")
+            return
+
+        db.add_subscription_days(user_id, int(t['duration_days']))
+        if t.get('code'):
+            db.set_user_tariff(user_id, t['code'])
+
+        # Партнёрская комиссия: 30% с первого платежа
+        try:
+            partner = db.get_partner_by_referral_user(user_id)
+            if partner:
+                commission = float(t['price_usd']) * 0.30
+                db.add_partner_earning(partner['user_id'], commission,
+                                       f"Комиссия 30% (Stars) от реферала {user_id}")
+                await bot.send_message(
+                    partner['user_id'],
+                    f"💰 <b>Партнёрское вознаграждение!</b>\n\nНачислено: <b>${commission:.2f}</b>"
+                )
+        except Exception as e:
+            logger.error(f"partner commission (stars) failed: {e}")
+
+        user = db.get_user(user_id)
+        await message.answer(
+            f"🎉 <b>Оплата прошла успешно!</b>\n\n"
+            f"Тариф: <b>{t['name']}</b>\n"
+            f"Списано: <b>{sp.total_amount} ⭐</b>\n"
+            f"Подписка активна до: <b>{format_date(user.get('subscription_until', 0))}</b>",
+            reply_markup=main_menu_keyboard(user_id, admin_id=ADMIN)
+        )
 
     @dp.callback_query(F.data == "enter_promo")
     async def enter_promo_callback(callback: CallbackQuery, state: FSMContext):
@@ -1437,22 +1766,40 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         accounts = db.get_user_accounts(user_id)
         buttons = []
+        warned = 0
         for acc in accounts:
             spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
             status_icon = "🟢" if acc['status'] == 'active' else "🔴"
+            health = (acc.get('health') or 'ok')
+            if health == 'cooldown':
+                status_icon, spam_icon, warned = "⏳", "Пауза (FloodWait)", warned + 1
+            elif health == 'restricted':
+                status_icon, spam_icon, warned = "⚠️", "Ограничен Telegram", warned + 1
+            elif health == 'banned':
+                status_icon, spam_icon, warned = "🚫", "Сессия недействительна", warned + 1
             name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
             phone = f"({acc['phone']})" if acc.get('phone') else ""
             buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} | {spam_icon}", callback_data=f"manage_acc_{acc['id']}")])
 
         buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await send_photo(message, 'acc.jpg', f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})", markup)
+        _title = f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})"
+        if warned:
+            _title += f"\n\n⚠️ Требуют внимания: {warned}. Откройте аккаунт, чтобы увидеть причину."
+        await send_photo(message, 'acc.jpg', _title, markup)
 
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
             await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            return
+        allowed, reason, limits = db.can_add_account(user_id, ADMIN)
+        if not allowed:
+            await callback.answer(
+                f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
+                show_alert=True
+            )
             return
         await state.set_state(AddAccountStates.WAITING_PROXY)
         markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -1532,6 +1879,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1549,6 +1901,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Неверный пароль: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1571,6 +1928,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or "User"
         phone = info.get('phone', '')
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1627,6 +1989,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                         await state.clear()
                         return
                     acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
+                    _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+                    if not _allowed:
+                        await status_msg.edit_text(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+                        await state.clear()
+                        return
                     db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
                     await state.clear()
                     await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен через QR!")
@@ -1659,6 +2026,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подложен через QR!")
@@ -1692,6 +2064,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
             await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            return
+        allowed, reason, limits = db.can_add_account(user_id, ADMIN)
+        if not allowed:
+            await callback.answer(
+                f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
+                show_alert=True
+            )
             return
         await state.set_state(AddAccountStates.WAITING_PROXY)
         markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -1771,6 +2150,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Ошибка: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1788,6 +2172,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status_msg.edit_text(f"❌ Неверный пароль: {err}")
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or phone
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1810,6 +2199,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         acc_name = f"{info['first_name']} {info['last_name']}".strip() or info['username'] or "User"
         phone = info.get('phone', '')
+        _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+        if not _allowed:
+            await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+            await state.clear()
+            return
         db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
@@ -1831,8 +2225,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             InlineKeyboardButton(text="🚀 Запустить спам", callback_data=f"start_spam_{account_id}")
         )
 
-        chats = db.get_account_chats(account_id)
-        enabled_chats_count = sum(1 for c in chats if c.get('spam_enabled') == 1)
+        total_groups = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES)
+        enabled_chats_count = db.count_account_chats(account_id, chat_types=db.GROUP_CHAT_TYPES, spam_only=True)
 
         notifications_hidden = account.get('notifications_hidden', 0) == 1
         notif_btn = (
@@ -1845,7 +2239,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [spam_btn],
             [InlineKeyboardButton(text="📝 Настройки поста", callback_data=f"acc_post_{account_id}"),
              InlineKeyboardButton(text="⏱ Интервал", callback_data=f"acc_timeout_{account_id}")],
-            [InlineKeyboardButton(text=f"💬 Выбор чатов ({enabled_chats_count}/{len(chats)})", callback_data=f"acc_chats_{account_id}_0"),
+            [InlineKeyboardButton(text=f"💬 Выбор групп ({enabled_chats_count}/{total_groups})", callback_data=f"acc_chats_{account_id}_0"),
              InlineKeyboardButton(text="🚪 Массовый выход", callback_data=f"acc_massleave_{account_id}_0")],
             [InlineKeyboardButton(text="📥 Вступить в чаты", callback_data=f"acc_join_{account_id}"),
              InlineKeyboardButton(text="📦 Вступить из пака", callback_data=f"acc_join_pack_{account_id}")],
@@ -1860,6 +2254,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"acc_del_{account_id}")],
             [InlineKeyboardButton(text="◀️ Назад к аккаунтам", callback_data="back_to_accounts")]
         ]
+        if (account.get('health') or 'ok') != 'ok':
+            buttons.insert(1, [InlineKeyboardButton(
+                text="♻️ Сбросить статус ограничения",
+                callback_data=f"acc_health_reset_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
@@ -1874,10 +2272,37 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Телефон:</b> <code>{phone}</code>\n"
             f"• <b>Прокси:</b> <code>{proxy_str}</code>\n"
             f"• <b>Интервал цикла:</b> {account.get('timeout', 5)} мин\n"
-            f"• <b>Чатов всего:</b> {len(chats)} (выбрано для спама: {enabled_chats_count})\n"
+            f"• <b>Групп всего:</b> {total_groups} (выбрано для рассылки: {enabled_chats_count})\n"
             f"• <b>Текст поста:</b> {post_text_preview}\n"
             f"• <b>Медиа:</b> {has_photo}"
         )
+
+        # ── Здоровье аккаунта (FloodWait / ограничения) ──
+        health = account.get('health') or 'ok'
+        if health != 'ok':
+            reason = account.get('health_reason') or ''
+            until = account.get('restricted_until') or 0
+            if health == 'cooldown':
+                left = max(0, int(until - time.time()))
+                text += (f"\n\n⏳ <b>Пауза из-за FloodWait</b>\n"
+                         f"Telegram просит подождать. Осталось: <b>{left // 60} мин {left % 60} сек</b>.\n"
+                         f"<i>Рассылка продолжится автоматически.</i>")
+            elif health == 'restricted':
+                text += (f"\n\n⚠️ <b>Аккаунт ограничен Telegram</b>\n"
+                         f"{reason[:200]}\n\n"
+                         f"Что делать:\n"
+                         f"1. Напишите @SpamBot и запросите снятие ограничения\n"
+                         f"2. Дайте аккаунту отдохнуть 24–48 часов\n"
+                         f"3. Увеличьте интервал рассылки и уменьшите число чатов")
+            elif health == 'banned':
+                text += (f"\n\n🚫 <b>Сессия недействительна</b>\n"
+                         f"{reason[:200]}\n\n"
+                         f"Аккаунт нужно подключить заново (удалите и добавьте снова).")
+
+        fc = account.get('flood_count') or 0
+        if fc:
+            fs = account.get('flood_total_seconds') or 0
+            text += f"\n\n📉 <b>Лимиты Telegram:</b> {fc} раз, суммарно {fs // 60} мин ожидания"
 
         if isinstance(message_or_callback, CallbackQuery):
             try:
@@ -1886,6 +2311,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 pass
         else:
             await message_or_callback.answer(text, reply_markup=markup)
+
+    @dp.callback_query(F.data.startswith('acc_health_reset_'))
+    async def acc_health_reset_callback(callback: CallbackQuery):
+        account_id = int(callback.data.rsplit('_', 1)[1])
+        account = db.get_account(account_id)
+        if not account or account['user_id'] != callback.from_user.id:
+            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            return
+        db.clear_account_health(account_id)
+        if account.get('status') == 'banned':
+            db.update_account_status(account_id, 'active')
+        await callback.answer(
+            "♻️ Статус сброшен. Если ограничение ещё действует, Telegram выдаст его снова.",
+            show_alert=True
+        )
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('manage_acc_'))
     async def manage_acc_callback(callback: CallbackQuery, state: FSMContext):
@@ -1921,12 +2362,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not account or not account.get('post_text'):
             await callback.answer("⚠️ Сначала настройте текст поста!", show_alert=True)
             return
-        chats = db.get_account_chats(account_id, spam_only=True)
+        chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
-            chats, _ = await account_manager.fetch_and_sync_chats(account_id)
-            chats = [c for c in chats if c.get('spam_enabled') == 1]
+            await account_manager.fetch_and_sync_chats(account_id)
+            chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
-            await callback.answer("⚠️ Нет чатов для рассылки!", show_alert=True)
+            await callback.answer("⚠️ Нет выбранных групп для рассылки!", show_alert=True)
             return
         ok, msg = await account_manager.start_account_spam(account_id, bot, user_id)
         await callback.answer(msg, show_alert=True)
@@ -2021,68 +2462,604 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         file = BufferedInputFile(output.getvalue().encode('utf-8'), filename=f"report_{report_id}.csv")
         await callback.message.answer_document(file, caption=f"📊 Отчет #{report_id}")
 
+def generate_parsed_users_html(users: List[Dict[str, Any]], account_name: str = '', account_id: int = 0) -> str:
+    total = len(users)
+    with_usernames = sum(1 for u in users if u.get('username'))
+    with_ids = sum(1 for u in users if u.get('user_id_val'))
+    with_phones = sum(1 for u in users if u.get('phone'))
+    acc_title = html.escape(account_name or f"Аккаунт #{account_id}")
+    gen_time = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+    rows_html = []
+    for idx, u in enumerate(users, 1):
+        uid = str(u.get('user_id_val') or '').strip()
+        uname = str(u.get('username') or '').strip().lstrip('@')
+        fname = str(u.get('first_name') or '').strip()
+        lname = str(u.get('last_name') or '').strip()
+        full_name = html.escape(f"{fname} {lname}".strip() or "—")
+        phone = html.escape(str(u.get('phone') or '').strip() or "—")
+        
+        uid_escaped = html.escape(uid) if uid and uid != '0' else "—"
+        uname_escaped = html.escape(uname)
+        
+        if uname:
+            uname_cell = f'<a href="https://t.me/{uname_escaped}" target="_blank" class="user-badge">@{uname_escaped}</a>'
+            action_btn = f'<a href="https://t.me/{uname_escaped}" target="_blank" class="btn btn-chat">Написать</a>'
+        elif uid and uid != '0':
+            uname_cell = '<span class="empty-val">—</span>'
+            action_btn = f'<a href="tg://user?id={uid_escaped}" class="btn btn-chat">Профиль</a>'
+        else:
+            uname_cell = '<span class="empty-val">—</span>'
+            action_btn = '<span class="empty-val">—</span>'
+            
+        rows_html.append(
+            f'<tr data-idx="{idx}" data-username="{uname_escaped}" data-id="{uid_escaped}">'
+            f'<td class="text-center idx-cell">{idx}</td>'
+            f'<td><code class="code-box">{uid_escaped}</code></td>'
+            f'<td>{uname_cell}</td>'
+            f'<td class="name-cell">{full_name}</td>'
+            f'<td><span class="phone-cell">{phone}</span></td>'
+            f'<td class="text-center">{action_btn}</td>'
+            f'</tr>'
+        )
+
+    table_rows = "\n".join(rows_html)
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Спарсенные пользователи — {acc_title}</title>
+<style>
+  :root {{
+    --bg: #0b0f19;
+    --card-bg: #131b2e;
+    --card-border: #1e293b;
+    --text-main: #f1f5f9;
+    --text-muted: #94a3b8;
+    --accent: #38bdf8;
+    --accent-hover: #0ea5e9;
+    --accent-glow: rgba(56, 189, 248, 0.15);
+    --border: #243048;
+    --row-hover: #19243d;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background-color: var(--bg);
+    color: var(--text-main);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding: 24px;
+    line-height: 1.5;
+  }}
+  .container {{ max-width: 1200px; margin: 0 auto; }}
+  .header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 24px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }}
+  .header h1 {{
+    font-size: 24px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .header .meta {{
+    font-size: 13px;
+    color: var(--text-muted);
+  }}
+  .stats-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }}
+  .stat-card {{
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }}
+  .stat-card .label {{
+    font-size: 13px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+  }}
+  .stat-card .value {{
+    font-size: 28px;
+    font-weight: 800;
+    color: var(--accent);
+  }}
+  .toolbar {{
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 20px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+  }}
+  .search-box {{
+    flex: 1;
+    min-width: 260px;
+  }}
+  .search-box input {{
+    width: 100%;
+    background: #090d16;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: #fff;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.2s;
+  }}
+  .search-box input:focus {{
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }}
+  .actions-group {{
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }}
+  .btn {{
+    background: #1e293b;
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 9px 15px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }}
+  .btn:hover {{
+    background: #283750;
+    border-color: var(--accent);
+  }}
+  .btn-primary {{
+    background: var(--accent);
+    color: #0b0f19;
+    border-color: var(--accent);
+  }}
+  .btn-primary:hover {{
+    background: var(--accent-hover);
+    color: #0b0f19;
+  }}
+  .btn-chat {{
+    padding: 5px 12px;
+    font-size: 12px;
+    background: #1e293b;
+    color: var(--accent);
+    border-color: var(--accent);
+  }}
+  .btn-chat:hover {{
+    background: var(--accent);
+    color: #0b0f19;
+  }}
+  .table-card {{
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    overflow-x: auto;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+    text-align: left;
+  }}
+  th {{
+    background: #162035;
+    color: var(--text-muted);
+    font-weight: 600;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }}
+  td {{
+    padding: 12px 16px;
+    border-bottom: 1px solid #1a2336;
+  }}
+  tr:last-child td {{ border-bottom: none; }}
+  tr:hover td {{ background: var(--row-hover); }}
+  .idx-cell {{ color: var(--text-muted); width: 50px; font-weight: 600; }}
+  .code-box {{
+    background: #090d16;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-family: monospace;
+    font-size: 13px;
+    color: #38bdf8;
+  }}
+  .user-badge {{
+    display: inline-block;
+    background: rgba(56, 189, 248, 0.12);
+    color: #38bdf8;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+    text-decoration: none;
+    font-size: 13px;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    transition: all 0.2s;
+  }}
+  .user-badge:hover {{
+    background: var(--accent);
+    color: #0b0f19;
+  }}
+  .name-cell {{ font-weight: 500; color: #fff; }}
+  .phone-cell {{ color: #cbd5e1; font-family: monospace; font-size: 13px; }}
+  .empty-val {{ color: #64748b; }}
+  .text-center {{ text-align: center; }}
+  .toast {{
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: #10b981;
+    color: #fff;
+    padding: 12px 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+    opacity: 0;
+    transform: translateY(20px);
+    transition: all 0.3s;
+    pointer-events: none;
+    z-index: 1000;
+  }}
+  .toast.show {{ opacity: 1; transform: translateY(0); }}
+  #counterBadge {{
+    font-size: 13px;
+    color: var(--text-muted);
+    font-weight: 500;
+  }}
+  #counterBadge b {{ color: var(--text-main); }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>👥 База спарсенных пользователей</h1>
+      <div class="meta">{acc_title} &bull; Выгружено: {gen_time}</div>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">Всего пользователей</div>
+      <div class="value">{total}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">С юзернеймами</div>
+      <div class="value">{with_usernames}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">С Telegram ID</div>
+      <div class="value">{with_ids}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">С телефонами</div>
+      <div class="value">{with_phones}</div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <div class="search-box">
+      <input type="text" id="searchInput" placeholder="🔍 Поиск по ID, username, имени, телефону..." oninput="filterTable()">
+    </div>
+    <div class="actions-group">
+      <span id="counterBadge">Показано: <b id="visibleCount">{total}</b> из <b>{total}</b></span>
+      <button class="btn btn-primary" onclick="copyUsernames()">📋 Копировать @username</button>
+      <button class="btn" onclick="copyIds()">🆔 Копировать ID</button>
+      <button class="btn" onclick="downloadTxt()">💾 Скачать TXT</button>
+    </div>
+  </div>
+
+  <div class="table-card">
+    <table id="usersTable">
+      <thead>
+        <tr>
+          <th class="text-center">#</th>
+          <th>Telegram ID</th>
+          <th>Username</th>
+          <th>Имя и Фамилия</th>
+          <th>Телефон</th>
+          <th class="text-center">Профиль</th>
+        </tr>
+      </thead>
+      <tbody>
+        {table_rows}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div id="toast" class="toast">Скопировано в буфер обмена!</div>
+
+<script>
+function showToast(msg) {{
+  const t = document.getElementById('toast');
+  t.textContent = msg || 'Скопировано в буфер обмена!';
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}}
+
+function filterTable() {{
+  const query = document.getElementById('searchInput').value.toLowerCase().trim();
+  const rows = document.querySelectorAll('#usersTable tbody tr');
+  let count = 0;
+  rows.forEach(r => {{
+    const text = r.textContent.toLowerCase();
+    if (!query || text.includes(query)) {{
+      r.style.display = '';
+      count++;
+    }} else {{
+      r.style.display = 'none';
+    }}
+  }});
+  document.getElementById('visibleCount').textContent = count;
+}}
+
+function getVisibleRows() {{
+  return Array.from(document.querySelectorAll('#usersTable tbody tr')).filter(r => r.style.display !== 'none');
+}}
+
+function copyUsernames() {{
+  const rows = getVisibleRows();
+  const list = [];
+  rows.forEach(r => {{
+    const u = r.getAttribute('data-username');
+    if (u && u !== '—') list.push('@' + u);
+  }});
+  if (list.length === 0) {{
+    showToast('Нет пользователей с username для копирования');
+    return;
+  }}
+  navigator.clipboard.writeText(list.join('\\n')).then(() => {{
+    showToast(`Скопировано ${{list.length}} юзернеймов!`);
+  }});
+}}
+
+function copyIds() {{
+  const rows = getVisibleRows();
+  const list = [];
+  rows.forEach(r => {{
+    const id = r.getAttribute('data-id');
+    if (id && id !== '—' && id !== '0') list.push(id);
+  }});
+  if (list.length === 0) {{
+    showToast('Нет ID для копирования');
+    return;
+  }}
+  navigator.clipboard.writeText(list.join('\\n')).then(() => {{
+    showToast(`Скопировано ${{list.length}} ID!`);
+  }});
+}}
+
+function downloadTxt() {{
+  const rows = getVisibleRows();
+  const list = [];
+  rows.forEach(r => {{
+    const u = r.getAttribute('data-username');
+    if (u && u !== '—') list.push('@' + u);
+  }});
+  if (list.length === 0) {{
+    showToast('Нет юзернеймов для скачивания');
+    return;
+  }}
+  const blob = new Blob([list.join('\\n')], {{ type: 'text/plain;charset=utf-8' }});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'usernames_{account_id}.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('TXT файл скачан!');
+}}
+</script>
+</body>
+</html>"""
+
+    PARSE_DEPTH_OPTIONS = [500, 1000, 5000, 10000, 50000]
+
     @dp.callback_query(F.data.startswith('acc_parse_'))
     async def acc_parse_callback(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
-        per_page = 20
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
+        per_page = 10
+        # Парсинг участников имеет смысл только для групп
+        page_chats, total = db.get_account_chats_paginated(
+            account_id, page=page, per_page=per_page, chat_types=db.GROUP_CHAT_TYPES
+        )
+        if total == 0:
+            await callback.answer("💬 Групп не найдено. Синхронизируйте чаты!", show_alert=True)
             return
-        total = len(chats)
-        start = page * per_page
-        end = start + per_page
-        page_chats = chats[start:end]
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(
+                account_id, page=page, per_page=per_page, chat_types=db.GROUP_CHAT_TYPES
+            )
         buttons = []
+
+        parsed_count = db.get_parsed_users_count(account_id, callback.from_user.id)
+        if parsed_count > 0:
+            buttons.append([
+                InlineKeyboardButton(text=f"📋 Спарсенные пользователи ({parsed_count})", callback_data=f"parsed_users_page_{account_id}_0")
+            ])
+            buttons.append([
+                InlineKeyboardButton(text="🌐 Скачать HTML", callback_data=f"download_parsed_html_{account_id}"),
+                InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")
+            ])
+
         for chat in page_chats:
             title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"👥 {title[:35]}", callback_data=f"parse_chat_{account_id}_{chat['chat_id']}")])
+            buttons.append([InlineKeyboardButton(
+                text=f"👥 {title[:35]}",
+                callback_data=f"parsecfg_{account_id}_{page}_{chat['chat_id']}"
+            )])
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_parse_{account_id}_{page-1}"))
-        if end < total:
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_parse_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
+        buttons.append(nav_buttons)
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"👥 <b>Выберите чат для парсинга пользователей</b> (стр. {page+1}, всего: {total})", markup)
+        await edit_message(
+            callback,
+            f"👥 <b>Парсинг пользователей</b>\n\nВыберите группу (всего: {total}, стр. {page+1}/{total_pages})",
+            markup
+        )
 
-    @dp.callback_query(F.data.startswith('parse_chat_'))
-    async def parse_chat_callback(callback: CallbackQuery, state: FSMContext):
+    @dp.callback_query(F.data.startswith('parsecfg_'))
+    async def parse_config_callback(callback: CallbackQuery, state: FSMContext):
+        # parsecfg_{account_id}_{page}_{chat_id}
         parts = callback.data.split('_')
-        account_id = int(parts[2])
+        account_id = int(parts[1])
+        page = int(parts[2])
         chat_id = '_'.join(parts[3:])
-        user_id = callback.from_user.id
-        
-        if account_id in account_manager.active_parse_tasks:
-            await callback.answer("⏳ Парсинг уже выполняется!", show_alert=True)
-            return
-        
-        chat_title = chat_id
-        for c in db.get_account_chats(account_id):
-            if c['chat_id'] == chat_id:
-                chat_title = c.get('chat_title') or chat_id
-                break
-        
-        buttons = [
-            [InlineKeyboardButton(text="🛑 Отменить парсинг", callback_data=f"cancel_parse_{account_id}")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"acc_parse_{account_id}")]
-        ]
+        await state.update_data(parse_account_id=account_id, parse_chat_id=chat_id, parse_page=page)
+
+        chat = db.get_account_chat(account_id, chat_id)
+        chat_title = (chat.get('chat_title') if chat else None) or chat_id
+
+        buttons = []
+        row = []
+        for depth in PARSE_DEPTH_OPTIONS:
+            row.append(InlineKeyboardButton(text=f"{depth}", callback_data=f"parsego_{account_id}_{depth}_{chat_id}"))
+            if len(row) == 3:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton(text="✍️ Своё число сообщений", callback_data=f"parsecustom_{account_id}_{chat_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"acc_parse_{account_id}_{page}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        progress_msg = await callback.message.answer("⏳ <b>Парсинг пользователей...</b>\n\nПрогресс: 0/200")
-        
-        async def update_progress(found):
+        await edit_message(
+            callback,
+            f"👥 <b>Парсинг: {chat_title[:40]}</b>\n\n"
+            f"Если список участников группы скрыт, пользователи собираются из истории сообщений.\n\n"
+            f"<b>Сколько сообщений истории просканировать?</b>\n"
+            f"Чем больше — тем больше пользователей, но тем дольше парсинг.",
+            markup
+        )
+
+    @dp.callback_query(F.data.startswith('parsecustom_'))
+    async def parse_custom_depth_callback(callback: CallbackQuery, state: FSMContext):
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        chat_id = '_'.join(parts[2:])
+        await state.update_data(parse_account_id=account_id, parse_chat_id=chat_id)
+        await state.set_state(ParseStates.WAITING_HISTORY_LIMIT)
+        await edit_message(
+            callback,
+            "✍️ Введите количество сообщений истории для сканирования (от 100 до 200000):",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(ParseStates.WAITING_HISTORY_LIMIT)
+    async def process_parse_history_limit(message: Message, state: FSMContext):
+        data = await state.get_data()
+        account_id = data.get('parse_account_id')
+        chat_id = data.get('parse_chat_id')
+        try:
+            history_limit = int(message.text.strip())
+        except (TypeError, ValueError):
+            await message.answer("❌ Введите число!")
+            return
+        if not (100 <= history_limit <= 200000):
+            await message.answer("❌ Значение должно быть от 100 до 200000!")
+            return
+        await state.clear()
+        await start_parse_task(message, account_id, chat_id, history_limit, message.from_user.id)
+
+    async def start_parse_task(target, account_id: int, chat_id: str, history_limit: int, user_id: int):
+        if account_id in account_manager.active_parse_tasks:
+            if isinstance(target, CallbackQuery):
+                await target.answer("⏳ Парсинг уже выполняется!", show_alert=True)
+            else:
+                await target.answer("⏳ Парсинг уже выполняется!")
+            return
+
+        chat = db.get_account_chat(account_id, chat_id)
+        chat_title = (chat.get('chat_title') if chat else None) or chat_id
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Отменить парсинг", callback_data=f"cancel_parse_{account_id}")]
+        ])
+        base_msg = target.message if isinstance(target, CallbackQuery) else target
+        progress_msg = await base_msg.answer(
+            f"⏳ <b>Парсинг: {chat_title[:40]}</b>\n\n"
+            f"Глубина истории: {history_limit} сообщений\n"
+            f"Найдено пользователей: 0",
+            reply_markup=markup
+        )
+
+        last_edit = {'t': 0.0}
+
+        async def update_progress(found, scanned=0):
+            # Троттлинг правок, чтобы не ловить flood-limit Telegram
+            now = time.time()
+            if now - last_edit['t'] < 3:
+                return
+            last_edit['t'] = now
             try:
-                text = f"⏳ <b>Парсинг пользователей...</b>\n\nПрогресс: {min(found, 200)}/200"
-                await progress_msg.edit_text(text)
-            except:
+                await progress_msg.edit_text(
+                    f"⏳ <b>Парсинг: {chat_title[:40]}</b>\n\n"
+                    f"Глубина истории: {history_limit} сообщений\n"
+                    f"Просканировано: {scanned}\n"
+                    f"Найдено пользователей: {found}",
+                    reply_markup=markup
+                )
+            except Exception:
                 pass
-        
-        asyncio.create_task(account_manager.run_limited(account_manager.parse_chat_users_background(account_id, chat_id, bot, user_id, update_progress)))
+
+        asyncio.create_task(account_manager.run_limited(
+            account_manager.parse_chat_users_background(
+                account_id, chat_id, bot, user_id, update_progress,
+                limit=100000, history_limit=history_limit
+            )
+        ))
+
+    @dp.callback_query(F.data.startswith('parsego_'))
+    async def parse_go_callback(callback: CallbackQuery, state: FSMContext):
+        # parsego_{account_id}_{depth}_{chat_id}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        history_limit = int(parts[2])
+        chat_id = '_'.join(parts[3:])
+        await state.clear()
+        await callback.answer("🚀 Запускаю парсинг...")
+        await start_parse_task(callback, account_id, chat_id, history_limit, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('cancel_parse_'))
     async def cancel_parse_callback(callback: CallbackQuery):
@@ -2092,7 +3069,32 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             await callback.answer("❌ Нет активного парсинга", show_alert=True)
 
-    @dp.callback_query(F.data.startswith('download_parsed_'))
+    @dp.callback_query(F.data == 'noop')
+    async def noop_callback(callback: CallbackQuery):
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith('download_parsed_html_'))
+    async def download_parsed_html_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[3])
+        user_id = callback.from_user.id
+        users = db.get_parsed_users(account_id, user_id)
+        if not users:
+            await callback.answer("📊 Нет данных для выгрузки!", show_alert=True)
+            return
+        
+        account = db.get_account(account_id)
+        acc_name = account.get('account_name') if account else f"Аккаунт #{account_id}"
+        
+        from aiogram.types import BufferedInputFile
+        html_content = generate_parsed_users_html(users, account_name=acc_name, account_id=account_id)
+        file = BufferedInputFile(html_content.encode('utf-8'), filename=f"parsed_users_{account_id}.html")
+        await callback.message.answer_document(
+            file, 
+            caption=f"🌐 <b>Интерактивная HTML таблица</b> ({acc_name})\n👥 Всего пользователей: <b>{len(users)}</b>\n💡 <i>Откройте файл в любом браузере для быстрого поиска и копирования @username!</i>"
+        )
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith('download_parsed_') & ~F.data.startswith('download_parsed_html_'))
     async def download_parsed_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
         user_id = callback.from_user.id
@@ -2100,17 +3102,31 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not users:
             await callback.answer("📊 Нет данных!", show_alert=True)
             return
+        
+        account = db.get_account(account_id)
+        acc_name = account.get('account_name') if account else f"Аккаунт #{account_id}"
+
         import csv
         import io
         output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['ID', 'Username', 'First Name', 'Last Name', 'Phone'])
-        for u in users:
-            writer.writerow([u['user_id'], u['username'], u['first_name'], u['last_name'], u['phone']])
-        output.seek(0)
+        writer = csv.writer(output, delimiter=';', dialect='excel')
+        writer.writerow(['№', 'Telegram ID', 'Username', 'First Name', 'Last Name', 'Phone', 'Telegram Link'])
+        for idx, u in enumerate(users, 1):
+            uid = str(u.get('user_id_val') or '').strip()
+            uname = str(u.get('username') or '').strip().lstrip('@')
+            fname = str(u.get('first_name') or '').strip()
+            lname = str(u.get('last_name') or '').strip()
+            phone = str(u.get('phone') or '').strip()
+            link = f"https://t.me/{uname}" if uname else (f"tg://user?id={uid}" if uid and uid != '0' else '')
+            writer.writerow([idx, uid, uname, fname, lname, phone, link])
+        
         from aiogram.types import BufferedInputFile
-        file = BufferedInputFile(output.getvalue().encode('utf-8'), filename=f"parsed_users_{account_id}.csv")
-        await callback.message.answer_document(file, caption=f"👥 Парсинг #{account_id}")
+        file = BufferedInputFile(output.getvalue().encode('utf-8-sig'), filename=f"parsed_users_{account_id}.csv")
+        await callback.message.answer_document(
+            file, 
+            caption=f"📥 <b>Выгрузка CSV</b> ({acc_name})\n👥 Всего пользователей: <b>{len(users)}</b>\n💡 <i>Файл с поддержкой Excel (UTF-8 BOM и разделитель ';').</i>"
+        )
+        await callback.answer()
 
     @dp.callback_query(F.data.startswith('parsed_users_page_'))
     async def parsed_users_page_callback(callback: CallbackQuery):
@@ -2118,29 +3134,62 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(parts[3])
         page = int(parts[4])
         user_id = callback.from_user.id
+        per_page = 20
         
-        users, total = db.get_parsed_users_paginated(account_id, user_id, page=page, per_page=20)
+        total = db.get_parsed_users_count(account_id, user_id)
+        if total == 0:
+            await callback.answer("📭 Список спарсенных пользователей пуст!", show_alert=True)
+            return
+        
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        # Carousel cyclic wrap around
+        if page < 0:
+            page = total_pages - 1
+        elif page >= total_pages:
+            page = 0
+            
+        users, _ = db.get_parsed_users_paginated(account_id, user_id, page=page, per_page=per_page)
         if not users:
             await callback.answer("📭 Пусто!", show_alert=True)
             return
         
-        total_pages = max(1, (total + 20 - 1) // 20)
-        text = f"👥 <b>Спарсено пользователей:</b> {total}\n\n"
-        for u in users:
-            text += f"• {u['first_name']} {u['last_name']} @{u['username']} ID:{u['user_id_val']}\n"
+        account = db.get_account(account_id)
+        acc_name = html.escape(account.get('account_name') if account else f"Аккаунт #{account_id}")
+        
+        start_idx = page * per_page + 1
+        end_idx = min(start_idx + len(users) - 1, total)
+        
+        text = (
+            f"👥 <b>Спарсенные пользователи</b>: <b>{acc_name}</b>\n"
+            f"📊 Всего: <b>{total}</b> | Страница: <b>{page + 1}/{total_pages}</b> (показано {start_idx}–{end_idx})\n\n"
+        )
+        for i, u in enumerate(users, 1):
+            idx = page * per_page + i
+            uname = u.get('username', '').strip().lstrip('@')
+            uid = u.get('user_id_val') or ''
+            fname = u.get('first_name') or ''
+            lname = u.get('last_name') or ''
+            full_name = html.escape(f"{fname} {lname}".strip() or "Без имени")
+            
+            uname_part = f"@{html.escape(uname)}" if uname else "<i>(нет @username)</i>"
+            id_part = f"<code>{uid}</code>" if uid and uid != '0' else "—"
+            text += f"<b>{idx}.</b> {full_name} — {uname_part} | ID: {id_part}\n"
         
         buttons = []
-        if total > 20:
-            nav_buttons = []
-            if page > 0:
-                nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"parsed_users_page_{account_id}_{page-1}"))
-            if page < total_pages - 1:
-                nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"parsed_users_page_{account_id}_{page+1}"))
-            if nav_buttons:
-                buttons.append(nav_buttons)
+        if total_pages > 1:
+            prev_page = (page - 1) % total_pages
+            next_page = (page + 1) % total_pages
+            buttons.append([
+                InlineKeyboardButton(text="⬅️ Назад", callback_data=f"parsed_users_page_{account_id}_{prev_page}"),
+                InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"parsed_users_page_{account_id}_{next_page}")
+            ])
         
-        buttons.append([InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
+        buttons.append([
+            InlineKeyboardButton(text="🌐 Скачать HTML", callback_data=f"download_parsed_html_{account_id}"),
+            InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_parsed_{account_id}")
+        ])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад в меню парсинга", callback_data=f"acc_parse_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await edit_message(callback, text, markup)
 
@@ -2224,6 +3273,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         ])
         await edit_message(callback, text, markup)
 
+    NC_PROMPT_HELP = (
+        "Опишите <b>тематику и что должен сделать комментарий</b>. Это не текст комментария, "
+        "а указание для нейросети — она учтёт его как требование и напишет живой текст по посту.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <code>Тематика: крипта. Дополнительно призыв глянуть профиль или био!</code>\n"
+        "• <code>Пиши по теме поста, в конце ненавязчиво позови в личку</code>\n"
+        "• <code>Коротко согласись с автором и намекни, что подробности у меня в профиле</code>\n"
+        "• <code>Задай уточняющий вопрос по теме поста</code>\n\n"
+        "💡 Можно добавлять любые свои указания — они попадут в блок требований к нейросети."
+    )
+
     @dp.callback_query(F.data.startswith('nc_mode_prompt_'))
     async def nc_mode_prompt_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[3])
@@ -2231,25 +3291,88 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.set_state(NeuroCommentStates.WAITING_PROMPT)
         nc = db.get_neurocomment_settings(account_id)
         current = nc.get('prompt', '') if nc else ''
+        buttons = []
+        if current:
+            buttons.append([InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_prompt")])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"nc_acc_{account_id}")])
         await edit_message(callback,
             f"✏️ <b>Режим: По промту</b>\n\n"
-            f"Текущий промт: {current[:100] or 'Не задан'}\n\n"
-            f"Введите промт для генерации комментария:",
-            reply_markup=cancel_inline_keyboard()
+            f"<b>Текущий промт:</b>\n<code>{(current[:300] or 'Не задан')}</code>\n\n"
+            f"{NC_PROMPT_HELP}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
 
     @dp.message(NeuroCommentStates.WAITING_PROMPT)
     async def process_nc_prompt(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('nc_account_id')
-        prompt = message.text.strip()
+        prompt = (message.text or '').strip()
+        if not prompt:
+            await message.answer("❌ Промт не может быть пустым!")
+            return
         nc = db.get_neurocomment_settings(account_id)
         if not nc:
             db.create_neurocomment_settings(account_id, message.from_user.id, mode='prompt', prompt=prompt)
         else:
             db.update_neurocomment_settings(account_id, mode='prompt', prompt=prompt)
         await state.clear()
-        await message.answer("✅ Промт для нейрокомментинга сохранён!", reply_markup=main_menu_keyboard(message.from_user.id))
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_prompt")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data=f"nc_acc_{account_id}")]
+        ])
+        await message.answer(
+            "✅ Промт сохранён!\n\nНажмите «Тест генерации», чтобы проверить, "
+            "как нейросеть выполнит ваши указания.",
+            reply_markup=markup
+        )
+
+    @dp.callback_query(F.data.startswith('nctest_'))
+    async def nc_test_generation_callback(callback: CallbackQuery):
+        """Прогоняет промт через AI на демо-посте, чтобы пользователь увидел результат до запуска."""
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        which = parts[2] if len(parts) > 2 else 'prompt'
+        nc = db.get_neurocomment_settings(account_id)
+        if not nc:
+            await callback.answer("❌ Сначала задайте промт!", show_alert=True)
+            return
+        instruction = nc.get('post_prompt' if which == 'post_prompt' else 'prompt', '') or ''
+        if not instruction.strip():
+            await callback.answer("❌ Промт пуст!", show_alert=True)
+            return
+
+        await callback.answer("⏳ Генерирую...")
+        demo_post = (
+            "Сегодня рынок снова удивил: основные активы прибавили около 5% за сутки. "
+            "Аналитики спорят, коррекция это или начало нового тренда."
+        )
+        try:
+            result = await account_manager.generate_ai_comment(instruction, demo_post)
+        except Exception as e:
+            result = ""
+            logger.error(f"nc test generation failed: {e}")
+
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Ещё раз", callback_data=f"nctest_{account_id}_{which}")],
+            [InlineKeyboardButton(text="◀️ К настройкам", callback_data=f"nc_acc_{account_id}")]
+        ])
+        if result:
+            text = (
+                f"🧪 <b>Тест генерации</b>\n\n"
+                f"<b>Ваш промт:</b>\n<code>{instruction[:200]}</code>\n\n"
+                f"<b>Демо-пост:</b>\n<i>{demo_post[:150]}</i>\n\n"
+                f"<b>Результат:</b>\n{result}"
+            )
+        else:
+            text = (
+                f"⚠️ <b>Не удалось сгенерировать комментарий</b>\n\n"
+                f"Ни один AI-провайдер не ответил. Проверьте:\n"
+                f"• указан ли <code>GROQ_API_KEY</code> в config.ini (бесплатно, самый надёжный вариант);\n"
+                f"• доступен ли интернет с сервера;\n"
+                f"• бесплатный g4f часто лежит — на него нельзя полагаться в проде.\n\n"
+                f"Подробности — в <code>bot_debug.log</code>."
+            )
+        await edit_message(callback, text, markup)
 
     @dp.callback_query(F.data.startswith('nc_mode_custom_'))
     async def nc_mode_custom_callback(callback: CallbackQuery, state: FSMContext):
@@ -2290,11 +3413,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.set_state(NeuroCommentStates.WAITING_POST_PROMPT)
         nc = db.get_neurocomment_settings(account_id)
         current = nc.get('post_prompt', '') if nc else ''
+        buttons = []
+        if current:
+            buttons.append([InlineKeyboardButton(text="🧪 Тест генерации", callback_data=f"nctest_{account_id}_post_prompt")])
+        buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"nc_acc_{account_id}")])
         await edit_message(callback,
             f"📰 <b>Режим: Промт нового поста</b>\n\n"
-            f"Текущий промт: {current[:100] or 'Не задан'}\n\n"
-            f"Введите промт для генерации комментария на основе текста нового поста:",
-            reply_markup=cancel_inline_keyboard()
+            f"<b>Текущий промт:</b>\n<code>{(current[:300] or 'Не задан')}</code>\n\n"
+            f"{NC_PROMPT_HELP}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
 
     @dp.message(NeuroCommentStates.WAITING_POST_PROMPT)
@@ -2310,46 +3437,235 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         await message.answer("✅ Промт для отслеживания постов сохранён!", reply_markup=main_menu_keyboard(message.from_user.id))
 
+    def _nc_channel_list(account_id: int) -> list:
+        nc = db.get_neurocomment_settings(account_id)
+        current = nc.get('target_channels', '') if nc else ''
+        return [c.strip() for c in (current or '').split(',') if c.strip()]
+
+    def _nc_save_channels(account_id: int, user_id: int, channels: list):
+        channels_str = ', '.join(dict.fromkeys(channels))
+        if not db.get_neurocomment_settings(account_id):
+            db.create_neurocomment_settings(account_id, user_id, target_channels=channels_str)
+        else:
+            db.update_neurocomment_settings(account_id, target_channels=channels_str)
+
     @dp.callback_query(F.data.startswith('nc_channels_'))
     async def nc_channels_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[2])
         await state.update_data(nc_account_id=account_id)
-        await state.set_state(NeuroCommentStates.WAITING_TARGET_CHANNELS)
-        nc = db.get_neurocomment_settings(account_id)
-        current = nc.get('target_channels', '') if nc else ''
-        current_list = [c.strip() for c in current.split(',') if c.strip()] if current else []
+        current_list = _nc_channel_list(account_id)
         preview = '\n'.join([f"{i+1}. {c}" for i, c in enumerate(current_list[:10])]) if current_list else 'Не заданы'
+        if len(current_list) > 10:
+            preview += f"\n… и ещё {len(current_list) - 10}"
+        buttons = [
+            [InlineKeyboardButton(text="📢 Выбрать из моих каналов с комментариями", callback_data=f"nccl_{account_id}_0")],
+            [InlineKeyboardButton(text="✍️ Ввести свой список", callback_data=f"ncman_{account_id}")],
+            [InlineKeyboardButton(text="🗑 Очистить список", callback_data=f"ncclr_{account_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"nc_acc_{account_id}")]
+        ]
         await edit_message(callback,
             f"🎯 <b>Целевые каналы</b>\n\n"
-            f"Текущие каналы:\n{preview}\n\n"
-            f"Введите список каналов через запятую или с новой строки:\n"
-            f"Примеры:\n"
-            f"@channel1, @channel2, -100123456789",
+            f"Выбрано: {len(current_list)}\n{preview}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    @dp.callback_query(F.data.startswith('ncman_'))
+    async def nc_manual_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        await state.update_data(nc_account_id=account_id)
+        await state.set_state(NeuroCommentStates.WAITING_TARGET_CHANNELS)
+        await edit_message(callback,
+            "✍️ <b>Свой список каналов</b>\n\n"
+            "Введите каналы через запятую или с новой строки:\n"
+            "<code>@channel1, @channel2, -100123456789, https://t.me/channel3</code>\n\n"
+            "Если аккаунт не состоит в канале — бот попробует вступить в канал "
+            "и в его чат комментариев автоматически.",
             reply_markup=cancel_inline_keyboard()
         )
+
+    @dp.callback_query(F.data.startswith('ncclr_'))
+    async def nc_clear_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        _nc_save_channels(account_id, callback.from_user.id, [])
+        await callback.answer("🗑 Список очищен")
+        await nc_channels_callback(callback, state)
+
+    _nc_scanning = set()
+
+    async def _load_nc_channels(callback: CallbackQuery, state: FSMContext,
+                                account_id: int, refresh: bool = False):
+        """Поиск каналов с комментариями. Предупреждает, что это долго,
+        и не даёт запустить два сканирования одновременно."""
+        cache_key = f"nc_channels_cache_{account_id}"
+
+        if account_id in _nc_scanning:
+            await callback.answer(
+                "⏳ Поиск каналов уже идёт.\n\n"
+                "Дождитесь окончания — не нажимайте кнопки.",
+                show_alert=True
+            )
+            return None, "busy"
+
+        _nc_scanning.add(account_id)
+        try:
+            await callback.answer("⏳ Начинаю поиск...")
+            total_channels = db.count_account_chats(account_id, chat_types=('channel',))
+            # Каналы запрашиваются пачками по 100 (1 запрос на пачку)
+            eta = max(5, int((total_channels / 100 + 1) * 3))
+            try:
+                await edit_message(
+                    callback,
+                    "🔍 <b>Ищу каналы с открытыми комментариями</b>\n\n"
+                    f"Каналов для проверки: <b>{total_channels or '?'}</b>\n"
+                    f"Примерное время: <b>~{eta} сек</b>\n\n"
+                    "⚠️ <b>Не нажимайте кнопки</b> до появления списка.\n\n"
+                    "<i>Список появится автоматически.</i>",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
+
+            cached, err = await account_manager.list_commentable_channels(
+                account_id, refresh=refresh
+            )
+            if err:
+                try:
+                    await edit_message(callback, f"❌ {err}", reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[[InlineKeyboardButton(
+                            text="◀️ Назад", callback_data=f"nc_channels_{account_id}")]]))
+                except Exception:
+                    await callback.answer(f"❌ {err}", show_alert=True)
+                return None, err
+            await state.update_data(**{cache_key: cached, 'nc_account_id': account_id})
+            return cached, None
+        finally:
+            _nc_scanning.discard(account_id)
+
+    async def _render_nc_channels(callback: CallbackQuery, state: FSMContext,
+                                  account_id: int, page: int = 0,
+                                  cached=None, notice: str = ""):
+        """Отрисовка списка каналов.
+
+        Параметры передаются явно — CallbackQuery у pydantic v2 заморожен,
+        присваивание callback.data роняет обработчик (frozen_instance).
+        """
+        per_page = 8
+        cache_key = f"nc_channels_cache_{account_id}"
+        if cached is None:
+            data = await state.get_data()
+            cached = data.get(cache_key)
+        if not cached:
+            cached, err = await _load_nc_channels(callback, state, account_id)
+            if err:
+                return
+
+        if not cached:
+            await callback.answer(
+                "📢 Каналов с открытыми комментариями не найдено. "
+                "Синхронизируйте чаты или добавьте каналы вручную.",
+                show_alert=True
+            )
+            return
+
+        selected = set(_nc_channel_list(account_id))
+        total = len(cached)
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        page_items = cached[page * per_page:(page + 1) * per_page]
+
+        buttons = []
+        for ch in page_items:
+            ref = f"@{ch['username']}" if ch.get('username') else ch['chat_id']
+            icon = "☑️" if ref in selected or ch['chat_id'] in selected else "⬜"
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {ch['title'][:32]}",
+                callback_data=f"nctg_{account_id}_{page}_{ch['chat_id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"nccl_{account_id}_{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nccl_{account_id}_{page+1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="🔄 Обновить список", callback_data=f"ncrf_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"nc_channels_{account_id}")])
+        await edit_message(callback,
+            f"📢 <b>Каналы с открытыми комментариями</b>\n\n"
+            f"Найдено: {total} | Выбрано: {len(selected)}\n"
+            f"Страница {page+1}/{total_pages}" + (f"\n\n{notice}" if notice else ""),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    @dp.callback_query(F.data.startswith('nccl_'))
+    async def nc_channel_list_callback(callback: CallbackQuery, state: FSMContext):
+        # nccl_{account_id}_{page}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        page = int(parts[2]) if len(parts) > 2 else 0
+        await _render_nc_channels(callback, state, account_id, page)
+
+    @dp.callback_query(F.data.startswith('ncrf_'))
+    async def nc_refresh_channels_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.split('_')[1])
+        cached, err = await _load_nc_channels(callback, state, account_id, refresh=True)
+        if err:
+            return
+        await _render_nc_channels(callback, state, account_id, 0, cached=cached)
+
+    @dp.callback_query(F.data.startswith('nctg_'))
+    async def nc_toggle_channel_callback(callback: CallbackQuery, state: FSMContext):
+        # nctg_{account_id}_{page}_{chat_id}
+        parts = callback.data.split('_')
+        account_id = int(parts[1])
+        page = int(parts[2])
+        chat_id = '_'.join(parts[3:])
+
+        data = await state.get_data()
+        cached = data.get(f"nc_channels_cache_{account_id}", [])
+        if not cached:
+            # FSM-состояние потеряно (перезапуск бота) — список нужно искать заново
+            await callback.answer(
+                "⚠️ Список устарел. Нажмите «🔄 Обновить список».", show_alert=True
+            )
+            return
+        entry = next((c for c in cached if c['chat_id'] == chat_id), None)
+        ref = f"@{entry['username']}" if entry and entry.get('username') else chat_id
+
+        channels = _nc_channel_list(account_id)
+        if ref in channels:
+            channels.remove(ref)
+        elif chat_id in channels:
+            channels.remove(chat_id)
+        else:
+            channels.append(ref)
+        _nc_save_channels(account_id, callback.from_user.id, channels)
+        await callback.answer("☑️ Выбран" if ref in channels else "⬜ Снят")
+        await _render_nc_channels(callback, state, account_id, page, cached=cached)
 
     @dp.message(NeuroCommentStates.WAITING_TARGET_CHANNELS)
     async def process_nc_channels(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('nc_account_id')
-        text = message.text.strip()
+        text = (message.text or '').strip()
         lines = [l.strip() for l in text.replace(',', '\n').split('\n') if l.strip()]
         channels = []
         for line in lines:
-            if line.startswith('@'):
-                channels.append(line)
-            elif line.startswith('-') or line.startswith('https://t.me/'):
+            if line.startswith('https://t.me/') or line.startswith('t.me/'):
+                slug = line.split('t.me/')[-1].strip('/')
+                channels.append(slug if slug.startswith('+') else f"@{slug.lstrip('@')}")
+            elif line.startswith('@') or line.lstrip('-').isdigit():
                 channels.append(line)
             else:
-                channels.append(f"@{line}")
-        channels_str = ', '.join(channels)
-        nc = db.get_neurocomment_settings(account_id)
-        if not nc:
-            db.create_neurocomment_settings(account_id, message.from_user.id, target_channels=channels_str)
-        else:
-            db.update_neurocomment_settings(account_id, target_channels=channels_str)
+                channels.append(f"@{line.lstrip('@')}")
+        existing = _nc_channel_list(account_id)
+        merged = list(dict.fromkeys(existing + channels))
+        _nc_save_channels(account_id, message.from_user.id, merged)
         await state.clear()
-        await message.answer(f"✅ Сохранено {len(channels)} каналов!")
+        await message.answer(
+            f"✅ Добавлено {len(channels)} каналов. Всего в списке: {len(merged)}.\n\n"
+            f"При запуске бот автоматически вступит в каналы и чаты комментариев, если аккаунт в них не состоит."
+        )
 
     @dp.callback_query(F.data.startswith('nc_delay_'))
     async def nc_delay_callback(callback: CallbackQuery, state: FSMContext):
@@ -3669,31 +4985,66 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ Введите число!")
 
     # ==================== CHAT MANAGEMENT (Selective & Mass Leave) ====================
+    GROUP_TYPES = db.GROUP_CHAT_TYPES
+
     async def render_acc_chats(callback: CallbackQuery, account_id: int, page: int = 0):
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
+        # Для постинга по чатам нужны ТОЛЬКО группы/супергруппы — каналы, боты и ЛС исключены
+        page_chats, total = db.get_account_chats_paginated(
+            account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+        )
+        if total == 0:
+            total_any = db.count_account_chats(account_id)
+            if total_any:
+                await callback.answer(
+                    "💬 Групп не найдено. Нажмите «Синхронизировать чаты» — старые записи без типа нужно обновить.",
+                    show_alert=True
+                )
+            else:
+                await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
             return
-        start = page * CHATS_PER_PAGE
-        end = start + CHATS_PER_PAGE
-        page_chats = chats[start:end]
+
+        total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(
+                account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+            )
+
+        enabled_count = db.count_account_chats(account_id, chat_types=GROUP_TYPES, spam_only=True)
+
         buttons = []
         for chat in page_chats:
-            icon = "✅" if chat['spam_enabled'] == 1 else "❌"
+            icon = "✅" if chat.get('spam_enabled') == 1 else "❌"
             title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"{icon} {title[:30]}", callback_data=f"toggle_chat_{account_id}_{chat['chat_id']}")])
+            # page передаём в callback, чтобы после переключения остаться на той же странице
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {title[:30]}",
+                callback_data=f"toggle_chat_{account_id}_{page}_{chat['chat_id']}"
+            )])
         nav_buttons = []
         if page > 0:
             nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_chats_{account_id}_{page-1}"))
-        if end < len(chats):
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_chats_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
-        buttons.append([InlineKeyboardButton(text="✅ Включить все", callback_data=f"enable_all_chats_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="❌ Отключить все", callback_data=f"disable_all_chats_{account_id}")])
+        buttons.append(nav_buttons)
+        buttons.append([
+            InlineKeyboardButton(text="✅ Включить все", callback_data=f"enable_all_chats_{account_id}_{page}"),
+            InlineKeyboardButton(text="❌ Отключить все", callback_data=f"disable_all_chats_{account_id}_{page}")
+        ])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"💬 <b>Выбор чатов</b> (стр. {page+1})", reply_markup=markup)
+        await edit_message(
+            callback,
+            f"💬 <b>Выбор групп для постинга</b>\n\n"
+            f"Групп всего: {total} | Выбрано: {enabled_count}\n"
+            f"Страница {page+1}/{total_pages}",
+            reply_markup=markup
+        )
+
+    @dp.callback_query(F.data == "noop")
+    async def noop_callback(callback: CallbackQuery):
+        await callback.answer()
 
     @dp.callback_query(F.data.startswith('acc_chats_'))
     async def acc_chats_callback(callback: CallbackQuery):
@@ -3704,73 +5055,95 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('toggle_chat_'))
     async def toggle_chat_callback(callback: CallbackQuery):
+        # toggle_chat_{account_id}_{page}_{chat_id}
         parts = callback.data.split('_')
         account_id = int(parts[2])
-        chat_id = parts[3]
+        try:
+            page = int(parts[3])
+            chat_id = '_'.join(parts[4:])
+        except (ValueError, IndexError):
+            page = 0
+            chat_id = '_'.join(parts[3:])
         new_state = db.toggle_chat_spam(account_id, chat_id)
         await callback.answer(f"{'✅ Включен' if new_state == 1 else '❌ Отключен'}!", show_alert=False)
-        await render_acc_chats(callback, account_id, 0)
+        # Остаёмся на текущей странице
+        await render_acc_chats(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('enable_all_chats_'))
     async def enable_all_chats_callback(callback: CallbackQuery):
-        account_id = int(callback.data.split('_')[3])
-        db.set_all_chats_spam(account_id, 1)
-        await callback.answer("✅ Все чаты включены!", show_alert=True)
-        await render_acc_chats(callback, account_id, 0)
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        db.set_all_chats_spam(account_id, 1, chat_types=GROUP_TYPES)
+        await callback.answer("✅ Все группы включены!", show_alert=False)
+        await render_acc_chats(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('disable_all_chats_'))
     async def disable_all_chats_callback(callback: CallbackQuery):
-        account_id = int(callback.data.split('_')[3])
-        db.set_all_chats_spam(account_id, 0)
-        await callback.answer("❌ Все чаты отключены!", show_alert=True)
-        await render_acc_chats(callback, account_id, 0)
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        db.set_all_chats_spam(account_id, 0, chat_types=GROUP_TYPES)
+        await callback.answer("❌ Все группы отключены!", show_alert=False)
+        await render_acc_chats(callback, account_id, page)
+
+    async def render_massleave(callback: CallbackQuery, account_id: int, page: int = 0):
+        page_chats, total = db.get_account_chats_paginated(account_id, page=page, per_page=CHATS_PER_PAGE)
+        if total == 0:
+            await callback.answer("💬 Нет чатов для выхода!", show_alert=True)
+            return
+        total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+        if page >= total_pages:
+            page = total_pages - 1
+            page_chats, total = db.get_account_chats_paginated(account_id, page=page, per_page=CHATS_PER_PAGE)
+        user_id = callback.from_user.id
+        selected = user_selected_leave_chats.setdefault(user_id, set())
+        buttons = []
+        for chat in page_chats:
+            icon = "☑️" if chat['chat_id'] in selected else "⬜"
+            title = chat.get('chat_title') or chat['chat_id']
+            type_icon = {'group': '👥', 'channel': '📢', 'private': '👤', 'bot': '🤖'}.get(chat.get('chat_type'), '💬')
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {type_icon} {title[:28]}",
+                callback_data=f"select_leave_{account_id}_{page}_{chat['chat_id']}"
+            )])
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_massleave_{account_id}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_massleave_{account_id}_{page+1}"))
+        buttons.append(nav_buttons)
+        buttons.append([InlineKeyboardButton(text=f"🚪 Выйти из выбранных ({len(selected)})", callback_data=f"confirm_leave_{account_id}")])
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await edit_message(callback, f"🚪 <b>Массовый выход из чатов</b>\n\nВсего: {total} | Страница {page+1}/{total_pages}", reply_markup=markup)
 
     @dp.callback_query(F.data.startswith('acc_massleave_'))
     async def acc_massleave_callback(callback: CallbackQuery):
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
-        chats = db.get_account_chats(account_id)
-        if not chats:
-            await callback.answer("💬 Нет чатов для выхода!", show_alert=True)
-            return
-        start = page * CHATS_PER_PAGE
-        end = start + CHATS_PER_PAGE
-        page_chats = chats[start:end]
-        user_id = callback.from_user.id
-        if user_id not in user_selected_leave_chats:
-            user_selected_leave_chats[user_id] = set()
-        buttons = []
-        for chat in page_chats:
-            icon = "☑️" if chat['chat_id'] in user_selected_leave_chats[user_id] else "⬜"
-            title = chat.get('chat_title') or chat['chat_id']
-            buttons.append([InlineKeyboardButton(text=f"{icon} {title[:30]}", callback_data=f"select_leave_{account_id}_{chat['chat_id']}")])
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"acc_massleave_{account_id}_{page-1}"))
-        if end < len(chats):
-            nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"acc_massleave_{account_id}_{page+1}"))
-        if nav_buttons:
-            buttons.append(nav_buttons)
-        selected_count = len(user_selected_leave_chats[user_id])
-        buttons.append([InlineKeyboardButton(text=f"🚪 Выйти из выбранных ({selected_count})", callback_data=f"confirm_leave_{account_id}")])
-        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"🚪 <b>Массовый выход из чатов</b> (стр. {page+1})\n\nВыберите чаты для выхода:", reply_markup=markup)
+        await render_massleave(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('select_leave_'))
     async def select_leave_callback(callback: CallbackQuery):
         parts = callback.data.split('_')
         account_id = int(parts[2])
-        chat_id = parts[3]
+        try:
+            page = int(parts[3])
+            chat_id = '_'.join(parts[4:])
+        except (ValueError, IndexError):
+            page = 0
+            chat_id = '_'.join(parts[3:])
         user_id = callback.from_user.id
-        if user_id not in user_selected_leave_chats:
-            user_selected_leave_chats[user_id] = set()
-        if chat_id in user_selected_leave_chats[user_id]:
-            user_selected_leave_chats[user_id].discard(chat_id)
+        selected = user_selected_leave_chats.setdefault(user_id, set())
+        if chat_id in selected:
+            selected.discard(chat_id)
         else:
-            user_selected_leave_chats[user_id].add(chat_id)
-        await acc_massleave_callback(callback)
+            selected.add(chat_id)
+        await callback.answer()
+        await render_massleave(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('confirm_leave_'))
     async def confirm_leave_callback(callback: CallbackQuery):
