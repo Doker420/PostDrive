@@ -3622,6 +3622,41 @@ class AccountSessionManager:
         except Exception as e:
             logging.error(f"❌ invite_users unhandled exception for account {account_id}: {type(e).__name__}: {e}", exc_info=True)
 
+    async def get_account_contacts(self, account_id: int) -> Tuple[List[dict], str]:
+        """Контакты аккаунта — цели для рассылки «по контактам».
+
+        Возвращает (список словарей, сообщение об ошибке). Боты, удалённые
+        аккаунты и сам владелец отфильтровываются.
+        """
+        client, err = await self.get_or_start_client(account_id)
+        if not client:
+            return [], f"Ошибка подключения: {err}"
+        try:
+            me = await client.get_me()
+            contacts = await self.tg_call(lambda: client.get_contacts(),
+                                          account_id=account_id, notify=False,
+                                          description='get_contacts')
+            result = []
+            for u in contacts or []:
+                if getattr(u, 'is_bot', False) or getattr(u, 'is_deleted', False):
+                    continue
+                if me and u.id == me.id:
+                    continue
+                result.append({
+                    'user_id': u.id,
+                    'username': u.username or '',
+                    'first_name': u.first_name or '',
+                    'last_name': u.last_name or '',
+                    'phone': getattr(u, 'phone_number', '') or '',
+                })
+            logging.info(f"📇 [acc {account_id}] контактов получено: {len(result)}")
+            return result, ''
+        except AccountBlockedError as e:
+            return [], str(e)
+        except Exception as e:
+            logging.error(f"❌ [acc {account_id}] get_contacts: {type(e).__name__}: {e}")
+            return [], f"{type(e).__name__}: {str(e)[:120]}"
+
     async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int, mode: str = 'post', custom_text: str = '', custom_entities: str = None):
         account = db.get_account(account_id)
         if not account:
@@ -3672,26 +3707,42 @@ class AccountSessionManager:
                 else:
                     continue
                 
+                # Рандомизация текста для каждого получателя:
+                #   {привет|здравствуйте} — случайный вариант (спинтакс)
+                #   {rand}               — случайная строка (антиспам)
+                # Раньше для своего текста работал только {rand}, хотя в
+                # подсказке обещался полноценный спинтакс.
                 text_to_send = post_text
-                if mode == 'custom' and '{rand}' in post_text:
+                entities_to_send = entities
+                if '{rand}' in text_to_send:
                     import string
                     def rand_str(length=6):
                         return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
-                    text_to_send = post_text.replace('{rand}', rand_str())
+                    text_to_send = re.sub(r'\{rand\}', lambda _m: rand_str(), text_to_send)
+                if '{' in text_to_send and '|' in text_to_send:
+                    text_to_send = re.sub(
+                        r'\{([^{}]*\|[^{}]*)\}',
+                        lambda m: random.choice(m.group(1).split('|')),
+                        text_to_send)
+                if entities_to_send and len(text_to_send) != len(post_text):
+                    # Смещения entity после подстановки становятся неверными —
+                    # лучше отправить без форматирования, чем с «поехавшим»
+                    logging.warning(f"[{acc_name}] Рандомизация изменила длину текста — форматирование снято")
+                    entities_to_send = None
                 
                 if post_photo and os.path.exists(post_photo) and mode == 'post':
                     await client.send_photo(
                         peer, 
                         post_photo, 
                         caption=text_to_send,
-                        caption_entities=entities if entities else None,
+                        caption_entities=entities_to_send if entities_to_send else None,
                         parse_mode=None if entities else None
                     )
                 else:
                     await client.send_message(
                         peer, 
                         text_to_send,
-                        entities=entities if entities else None,
+                        entities=entities_to_send if entities_to_send else None,
                         parse_mode=None if entities else None
                     )
                 success += 1

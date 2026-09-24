@@ -941,9 +941,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"Отправьте:\n"
             f"• TXT файл с ID юзеров или username (@username или без)\n"
             f"• Или ссылки формата https://t.me/username\n"
-            f"• Или список в сообщении (по одному на строку)"
+            f"• Или список в сообщении (по одному на строку)\n"
+            f"• Или нажмите «📇 По контактам аккаунтов» — цели возьмутся "
+            f"из адресной книги выбранных аккаунтов"
         )
         buttons = [
+            [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ]
@@ -1083,7 +1086,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data == "spam_mode_custom")
     async def spam_mode_custom_callback(callback: CallbackQuery, state: FSMContext):
         await state.update_data(spam_mode='custom')
-        await edit_message(callback, "✏️ <b>Свой текст рассылки</b>\n\nВведите текст сообщения (можно с рандомизацией через {var}):", reply_markup=cancel_inline_keyboard())
+        await edit_message(
+            callback,
+            "✏️ <b>Свой текст рассылки</b>\n\n"
+            "Отправьте текст сообщения. Для каждого получателя бот подставит "
+            "случайные варианты — так рассылка меньше похожа на спам.\n\n"
+            "<b>Синтаксис</b>\n"
+            "• <code>{вариант1|вариант2|вариант3}</code> — случайный вариант\n"
+            "• <code>{rand}</code> — случайный набор символов\n"
+            "• вложенные скобки не поддерживаются\n\n"
+            "<b>Пример</b>\n"
+            "<code>{Привет|Здравствуйте|Добрый день}! {Есть минутка?|Пишу по делу.}\n"
+            "Меня зовут Артём, {помогаю|занимаюсь} продвижением Telegram-каналов.\n"
+            "{Если интересно|Если актуально} — напишите, {скину|пришлю} пример. "
+            "#{rand}</code>\n\n"
+            "<i>Из этого получится, например:</i>\n"
+            "<i>«Добрый день! Пишу по делу. Меня зовут Артём, занимаюсь продвижением "
+            "Telegram-каналов. Если актуально — напишите, пришлю пример. #a7Kq2p»</i>",
+            reply_markup=cancel_inline_keyboard())
         await state.set_state(MassActionStates.WAITING_CUSTOM_TEXT)
 
     @dp.message(MassActionStates.WAITING_CUSTOM_TEXT)
@@ -1237,38 +1257,86 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ Не удалось распознать цели!")
             return
         
+        await _start_spam_distribution(message, state, user_id, parsed_targets, data)
+
+    async def _start_spam_distribution(answer_to, state: FSMContext, user_id: int,
+                                       parsed_targets: list, data: dict):
+        """Общий запуск рассылки: и для списка целей, и для рассылки по контактам."""
+        account_ids = data.get('spam_account_ids', [])
         mode = data.get('spam_mode', 'post')
         custom_text = data.get('custom_spam_text', '')
         custom_entities = data.get('custom_spam_entities', None)
-        
+
         await state.clear()
-        
         unique_targets = list(dict.fromkeys(parsed_targets))
-        
         if len(unique_targets) < len(parsed_targets):
-            await message.answer(f"ℹ️ Убрано дубликатов: {len(parsed_targets) - len(unique_targets)}. Итого уникальных: {len(unique_targets)}")
-        
-        await message.answer(f"🚀 Запускаю рассылку на {len(unique_targets)} уникальных целей из {len(account_ids)} аккаунтов...")
-        
-        targets_per_account = len(unique_targets) // len(account_ids) if account_ids else 0
+            await answer_to.answer(
+                f"ℹ️ Убрано дубликатов: {len(parsed_targets) - len(unique_targets)}. "
+                f"Итого уникальных: {len(unique_targets)}")
+
+        account_ids = [a for a in account_ids if a]
+        if not account_ids:
+            await answer_to.answer("❌ Не выбрано ни одного аккаунта.")
+            return
+
+        await answer_to.answer(
+            f"🚀 Запускаю рассылку на {len(unique_targets)} уникальных целей "
+            f"из {len(account_ids)} аккаунтов...")
+
+        per_account = len(unique_targets) // len(account_ids)
         remainder = len(unique_targets) % len(account_ids)
-        
         start_idx = 0
         for i, account_id in enumerate(account_ids):
-            if not account_id:
-                continue
-            end_idx = start_idx + targets_per_account + (1 if i < remainder else 0)
+            end_idx = start_idx + per_account + (1 if i < remainder else 0)
             account_targets = unique_targets[start_idx:end_idx]
             start_idx = end_idx
-            
             if account_targets:
-                asyncio.create_task(account_manager.run_limited(account_manager.spam_to_users(account_id, account_targets, bot, user_id, mode=mode, custom_text=custom_text, custom_entities=custom_entities)))
-        
-        await state.clear()
-        await message.answer(
+                asyncio.create_task(account_manager.run_limited(
+                    account_manager.spam_to_users(
+                        account_id, account_targets, bot, user_id,
+                        mode=mode, custom_text=custom_text,
+                        custom_entities=custom_entities)))
+
+        await answer_to.answer(
             "✅ Рассылка запущена в фоне. Вы получите уведомления о прогрессе и результате.",
-            reply_markup=main_menu_keyboard(user_id)
-        )
+            reply_markup=main_menu_keyboard(user_id))
+
+    @dp.callback_query(F.data == "spam_targets_contacts", MassActionStates.WAITING_TARGETS)
+    async def spam_targets_contacts_callback(callback: CallbackQuery, state: FSMContext):
+        """Рассылка по адресной книге выбранных аккаунтов."""
+        user_id = callback.from_user.id
+        data = await state.get_data()
+        account_ids = [a for a in data.get('spam_account_ids', []) if a]
+        if not account_ids:
+            await callback.answer("❌ Сначала выберите аккаунты.", show_alert=True)
+            return
+        await callback.answer("📇 Собираю контакты…")
+        status = await callback.message.answer("📇 Загружаю контакты аккаунтов…")
+
+        targets, problems, per_acc = [], [], []
+        for acc_id in account_ids:
+            contacts, err = await account_manager.get_account_contacts(acc_id)
+            acc = db.get_account(acc_id) or {}
+            name = acc.get('account_name') or f"#{acc_id}"
+            if err:
+                problems.append(f"• {name}: {err}")
+                continue
+            per_acc.append(f"• {name}: {len(contacts)}")
+            for c in contacts:
+                targets.append(int(c['user_id']))
+
+        if not targets:
+            msg = "❌ Контакты не найдены."
+            if problems:
+                msg += "\n\n" + "\n".join(problems)
+            await status.edit_text(msg)
+            return
+
+        report = "📇 <b>Контакты собраны</b>\n\n" + "\n".join(per_acc)
+        if problems:
+            report += "\n\n⚠️ Проблемы:\n" + "\n".join(problems)
+        await status.edit_text(report)
+        await _start_spam_distribution(callback.message, state, user_id, targets, data)
 
     @dp.callback_query(F.data.startswith('acc_pms_'))
     async def acc_pms_callback(callback: CallbackQuery, state: FSMContext):
