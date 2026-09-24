@@ -1974,14 +1974,17 @@ class AccountSessionManager:
             post_prompt = nc.get('post_prompt', '')
             comment_delay = int(nc.get('comment_delay', 60) or 60)
 
-            # ⭐ ИНИЦИАЛИЗИРУЕМ last_seen ПОСЛЕДНИМИ СООБЩЕНИЯМИ ЧТОБЫ НЕ КОММЕНТИРОВАТЬ СТАРЫЕ ПОСТЫ ПРИ СТАРТЕ
+            # ⭐ ИНИЦИАЛИЗИРУЕМ last_seen: старые посты не трогаем, но САМЫЙ ПОСЛЕДНИЙ
+            # пост считаем «новым», иначе после включения тумблера бот молчит до
+            # следующей публикации, и пользователю кажется, что он не работает.
+            # Повторный комментарий исключён таблицей nc_commented_posts.
             for channel in valid_channels:
                 try:
                     chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
                     async for msg in client.get_chat_history(chat_id, limit=1):
                         if msg:
-                            self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
-                            logging.info(f"🔧 [{acc_name}] Initialized last_seen for {channel} = {msg.id} (no comment on startup)")
+                            self.comment_listeners.setdefault(account_id, {})[str(channel)] = max(msg.id - 1, 0)
+                            logging.info(f"🔧 [{acc_name}] Initialized last_seen for {channel} = {msg.id - 1} (last post {msg.id} eligible once)")
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Failed to initialize last_seen for {channel}: {e}")
             
@@ -2051,6 +2054,13 @@ class AccountSessionManager:
                                 logging.debug(f"✅ [{acc_name}] Already commented on post {msg.id} in {channel}")
                                 continue
                             
+                            # Пост уже комментировали в прошлом запуске — пропускаем
+                            # (и не тратим AI-квоту)
+                            if db.was_post_commented(account_id, channel, msg.id):
+                                logging.info(f"⏭️ [{acc_name}] Post {msg.id} in {channel} already commented earlier")
+                                self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                continue
+
                             logging.info(f"💬 [{acc_name}] Found new post in {channel}: {post_text[:100]}...")
                             channel_posts_found += 1
                             
@@ -2120,78 +2130,23 @@ class AccountSessionManager:
                                             await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
                                         continue
 
-                                # ⭐ КЛЮЧЕВОЙ МОМЕНТ: НОРМАЛИЗУЕМ ID КАНАЛА НА ИСХОДЕ ИЗ chat_obj.id (а не channel string)
-                                normalized_channel_id = normalize_chat_id(chat_obj.id)
-                                logging.debug(f"🔍 [{acc_name}] chat_obj.id={chat_obj.id}, normalized={normalized_channel_id}, channel={channel}, chat_id={chat_id}")
-                                
-                                # ⭐ ИЩЕМ ФОРВАРД ИЗ КАНАЛА
-                                try:
-                                    # Ищем форвард в обсуждениях - увеличиваем лимит до 200
-                                    fwd_count = 0
-                                    async for fwd in client.get_chat_history(discussion_chat_id, limit=200):
-                                        fwd_count += 1
-                                        is_fwd = getattr(fwd, 'forward_date', None)
-                                        fwd_chat = getattr(fwd, 'forward_from_chat', None)
-                                        fwd_msg_id = getattr(fwd, 'forward_from_message_id', None)
-                                        
-                                        if is_fwd:
-                                            # Метод 1: сравнение по chat_id из forward_from_chat
-                                            if fwd_chat:
-                                                fwd_chat_id_val = getattr(fwd_chat, 'id', None)
-                                                fwd_chat_username = getattr(fwd_chat, 'username', None)
-                                                logging.debug(f"🔍 [{acc_name}] Fwd msg_id={fwd.id} from_chat_id={fwd_chat_id_val} username={fwd_chat_username} fwd_from_msg_id={fwd_msg_id}")
-                                                
-                                                if fwd_chat_id_val is not None:
-                                                    normalized_fwd_id = normalize_chat_id(fwd_chat_id_val)
-                                                    if normalized_fwd_id == normalized_channel_id:
-                                                        logging.info(f"🔍 [{acc_name}] Found matching forward (by id): fwd.id={fwd.id}, channel_msg_id={msg.id}")
-                                                        await self.tg_call(
-                                                            lambda: client.send_message(
-                                                                discussion_chat_id, comment_text,
-                                                                reply_to_message_id=fwd.id),
-                                                            account_id=account_id, bot=bot, user_id=user_id,
-                                                            description=f'comment -> {channel}',
-                                                            notify=not notifications_hidden)
-                                                        comment_sent = True
-                                                        logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd msg_id={fwd.id})")
-                                                        break
-                                                elif chat_username and fwd_chat_username and fwd_chat.username:
-                                                    if fwd_chat.username.lower() == chat_username.lower():
-                                                        logging.info(f"🔍 [{acc_name}] Found matching forward (by username): fwd.id={fwd.id}")
-                                                        await self.tg_call(
-                                                            lambda: client.send_message(
-                                                                discussion_chat_id, comment_text,
-                                                                reply_to_message_id=fwd.id),
-                                                            account_id=account_id, bot=bot, user_id=user_id,
-                                                            description=f'comment -> {channel}',
-                                                            notify=not notifications_hidden)
-                                                        comment_sent = True
-                                                        logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by username)")
-                                                        break
-                                            
-                                            # Метод 2: сравнение по forward_from_message_id (совпадение с msg.id канала)
-                                            if not comment_sent and fwd_msg_id and hasattr(msg, 'id') and fwd_msg_id == msg.id:
-                                                logging.info(f"🔍 [{acc_name}] Found matching forward (by msg_id={msg.id}): fwd.id={fwd.id}")
-                                                await self.tg_call(
-                                                            lambda: client.send_message(
-                                                                discussion_chat_id, comment_text,
-                                                                reply_to_message_id=fwd.id),
-                                                            account_id=account_id, bot=bot, user_id=user_id,
-                                                            description=f'comment -> {channel}',
-                                                            notify=not notifications_hidden)
-                                                comment_sent = True
-                                                logging.info(f"✅ [{acc_name}] Comment sent to discussion chat {discussion_chat_id} (reply to fwd by msg_id)")
-                                                break
-                                    
-                                    logging.debug(f"🔍 [{acc_name}] Scanned {fwd_count} messages in discussion chat {discussion_chat_id}")
-                                except Exception as disc_err:
-                                    logging.warning(f"⚠️ [{acc_name}] Discussion chat error: {disc_err}")
-
+                                # Отправка комментария: сначала штатный API
+                                # get_discussion_message (мгновенно и точно),
+                                # затем — поиск форварда в чате обсуждений.
+                                comment_sent = await self._send_post_comment(
+                                    client=client, account_id=account_id, acc_name=acc_name,
+                                    channel=channel, chat_obj=chat_obj, post_msg_id=msg.id,
+                                    discussion_chat_id=discussion_chat_id, comment_text=comment_text,
+                                    normalize_chat_id=normalize_chat_id, bot=bot, user_id=user_id,
+                                    notify=not notifications_hidden)
                                 if not comment_sent:
-                                    logging.warning(f"⚠️ [{acc_name}] Forward from channel not found in discussion chat {discussion_chat_id} - SKIPPING (comment must be reply to forward)")
+                                    logging.warning(f"⚠️ [{acc_name}] Не найден пост в чате обсуждений {discussion_chat_id} — комментарий не отправлен")
+                                    if bot and not notifications_hidden:
+                                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Пост из {channel} ещё не появился в чате комментариев — пропускаю")
                                 
                                 if comment_sent:
                                     self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                    db.mark_post_commented(account_id, channel, msg.id)
                                     if bot and not notifications_hidden:
                                         await bot.send_message(user_id, f"✅ [{acc_name}] Прокомментирован пост в {channel}")
                                 
@@ -2211,7 +2166,18 @@ class AccountSessionManager:
         except asyncio.CancelledError:
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
         except AccountBlockedError as e:
+            # Раньше владелец не получал ничего: задача молча умирала, тумблер
+            # гас, и выглядело это как «нейрокомментинг не работает».
             logging.error(f"🚫 [{acc_name}] Нейрокомментинг остановлен: {e}")
+            if bot and not notifications_hidden:
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🚫 [{acc_name}] Нейрокомментинг остановлен: аккаунт ограничен Telegram.\n\n"
+                        f"{str(e)[:300]}\n\nПроверьте статус в @SpamBot и раздел «Здоровье аккаунта»."
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}")
             if bot and not notifications_hidden:
@@ -2228,6 +2194,77 @@ class AccountSessionManager:
                 db.finish_task(task_id, status='finished')
             self.active_comment_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
+
+    async def _send_post_comment(self, client, account_id, acc_name, channel, chat_obj,
+                                 post_msg_id, discussion_chat_id, comment_text,
+                                 normalize_chat_id, bot=None, user_id=None, notify=True) -> bool:
+        """Оставляет комментарий к посту канала в связанном чате обсуждений.
+
+        Комментарий в Telegram — это ответ на копию поста в чате обсуждений.
+        Раньше копия искалась перебором 200 последних сообщений: это медленно,
+        ломалось на каналах с активным чатом (копия уходит за пределы окна) и
+        на свежих постах (копия появляется не мгновенно). Теперь:
+          1) штатный API get_discussion_message — точная ссылка на копию,
+             с несколькими попытками, пока Telegram её создаёт;
+          2) запасной вариант — старый перебор форвардов.
+        """
+        # ── Способ 1: get_discussion_message (правильный путь) ──
+        for attempt in range(3):
+            try:
+                disc = await client.get_discussion_message(chat_obj.id, post_msg_id)
+                disc_id = getattr(disc, 'id', None)
+                if disc_id:
+                    target_chat = getattr(getattr(disc, 'chat', None), 'id', None) or discussion_chat_id
+                    await self.tg_call(
+                        lambda: client.send_message(target_chat, comment_text,
+                                                    reply_to_message_id=disc_id),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f'comment -> {channel}', notify=notify)
+                    logging.info(f"✅ [{acc_name}] Comment sent via get_discussion_message "
+                                 f"(chat={target_chat}, reply_to={disc_id})")
+                    return True
+            except AccountBlockedError:
+                raise
+            except Exception as e:
+                logging.debug(f"[{acc_name}] get_discussion_message attempt {attempt + 1} failed: "
+                              f"{type(e).__name__}: {e}")
+            await asyncio.sleep(5)
+
+        # ── Способ 2: ищем копию поста среди форвардов чата обсуждений ──
+        try:
+            normalized_channel_id = normalize_chat_id(chat_obj.id)
+            chat_username = getattr(chat_obj, 'username', None)
+            async for fwd in client.get_chat_history(discussion_chat_id, limit=200):
+                if not getattr(fwd, 'forward_date', None):
+                    continue
+                fwd_chat = getattr(fwd, 'forward_from_chat', None)
+                fwd_msg_id = getattr(fwd, 'forward_from_message_id', None)
+                match = False
+                if fwd_chat is not None:
+                    fwd_chat_id_val = getattr(fwd_chat, 'id', None)
+                    fwd_chat_username = getattr(fwd_chat, 'username', None)
+                    if fwd_chat_id_val is not None and \
+                            normalize_chat_id(fwd_chat_id_val) == normalized_channel_id:
+                        # тот же канал — но нужен именно наш пост, если id известен
+                        match = (fwd_msg_id is None) or (fwd_msg_id == post_msg_id)
+                    elif chat_username and fwd_chat_username and \
+                            fwd_chat_username.lower() == chat_username.lower():
+                        match = (fwd_msg_id is None) or (fwd_msg_id == post_msg_id)
+                if not match and fwd_msg_id and fwd_msg_id == post_msg_id:
+                    match = True
+                if match:
+                    await self.tg_call(
+                        lambda: client.send_message(discussion_chat_id, comment_text,
+                                                    reply_to_message_id=fwd.id),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f'comment -> {channel}', notify=notify)
+                    logging.info(f"✅ [{acc_name}] Comment sent via forward scan (reply_to={fwd.id})")
+                    return True
+        except AccountBlockedError:
+            raise
+        except Exception as e:
+            logging.warning(f"⚠️ [{acc_name}] Discussion chat scan error: {type(e).__name__}: {e}")
+        return False
 
     # ==================== NEUROCOMMENT: CHANNEL DISCOVERY & ACCESS ====================
     async def get_channel_discussion_id(self, client, chat_obj, chat_ref=None):

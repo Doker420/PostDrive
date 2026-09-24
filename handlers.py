@@ -3453,6 +3453,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         db.update_neurocomment_settings(account_id, enabled=new_state)
         if new_state == 1:
             ok, msg = await account_manager.start_neurocomment(account_id, bot, callback.from_user.id)
+            if not ok:
+                # Иначе в БД оставался enabled=1: меню показывало 🟢, а воркер не работал
+                db.update_neurocomment_settings(account_id, enabled=0)
+                if 'ограничен' in msg or 'заблокирован' in msg or 'паузе' in msg:
+                    msg += ("\n\nЕсли аккаунт уже разблокирован (проверьте @SpamBot), "
+                            "сбросьте статус кнопкой «♻️ Сбросить статус ограничения» в меню аккаунта.")
+                msg = "❌ " + msg
             await callback.answer(msg, show_alert=True)
         else:
             await account_manager.stop_neurocomment(account_id, callback.from_user.id)

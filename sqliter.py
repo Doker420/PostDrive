@@ -468,6 +468,20 @@ class DBConnection(metaclass=_PoolBoundMeta):
             sort_order INTEGER DEFAULT 0
         )''')
 
+        # Посты, которые уже прокомментированы. Нужны, чтобы после перезапуска
+        # воркера (или повторного включения тумблера) аккаунт не оставил второй
+        # комментарий под тем же постом, и при этом мог прокомментировать
+        # последний уже опубликованный пост сразу после старта.
+        self.c.execute('''CREATE TABLE IF NOT EXISTS nc_commented_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER,
+            channel TEXT,
+            message_id INTEGER,
+            created_at INTEGER,
+            UNIQUE(account_id, channel, message_id)
+        )''')
+        self.c.execute('CREATE INDEX IF NOT EXISTS idx_nc_commented ON nc_commented_posts(account_id, channel)')
+
         # Персональные надбавки к лимитам (докупленные слоты и AI-пакеты)
         self.c.execute('''CREATE TABLE IF NOT EXISTS user_entitlements (
             user_id INTEGER PRIMARY KEY,
@@ -1938,6 +1952,26 @@ class DBConnection(metaclass=_PoolBoundMeta):
         params.append(account_id)
         self.c.execute(f'UPDATE neurocomment_settings SET {", ".join(updates)} WHERE account_id = ?', params)
         self.conn_ctx.commit()
+
+    # ---- дедупликация прокомментированных постов ----
+    def was_post_commented(self, account_id: int, channel: str, message_id: int) -> bool:
+        try:
+            c = self._cursor()
+            c.execute('SELECT 1 FROM nc_commented_posts WHERE account_id = ? AND channel = ? AND message_id = ?',
+                      (account_id, str(channel), int(message_id)))
+            return c.fetchone() is not None
+        except Exception:
+            return False
+
+    def mark_post_commented(self, account_id: int, channel: str, message_id: int):
+        try:
+            c = self._cursor()
+            c.execute('INSERT INTO nc_commented_posts (account_id, channel, message_id, created_at) '
+                      'VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING',
+                      (account_id, str(channel), int(message_id), int(time.time())))
+            self.conn_ctx.commit()
+        except Exception as e:
+            logger.debug(f"mark_post_commented failed: {e}")
 
     def delete_neurocomment_settings(self, account_id: int):
         self.c.execute('DELETE FROM neurocomment_settings WHERE account_id = ?', (account_id,))
