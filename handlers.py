@@ -2942,9 +2942,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     # ==================== NEUROCOMMENTING ====================
     @dp.message(F.text == '🧠 Нейрокомментинг')
-    async def neurocomment_menu_handler(message: Message, state: FSMContext):
+    async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None):
+        # ВАЖНО: при вызове из callback сюда передаётся callback.message — его
+        # from_user это САМ БОТ, а не пользователь. Без явного user_id проверка
+        # подписки выполнялась для id бота и всегда падала с «нет подписки»,
+        # из-за чего меню не перерисовывалось и статус визуально не менялся.
         await state.clear()
-        user_id = message.from_user.id
+        if user_id is None:
+            user_id = message.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
             await message.answer("🔒 Для использования нейрокомментинга требуется активная подписка.")
             return
@@ -3453,12 +3458,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await account_manager.stop_neurocomment(account_id, callback.from_user.id)
             await callback.answer("🛑 Нейрокомментинг остановлен", show_alert=True)
         await state.clear()
-        await neurocomment_menu_handler(callback.message, state)
+        await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
 
     @dp.callback_query(F.data == "back_to_neurocomment")
     async def back_to_neurocomment_callback(callback: CallbackQuery, state: FSMContext):
         await state.clear()
-        await neurocomment_menu_handler(callback.message, state)
+        await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
 
     # ==================== PARTNERS SYSTEM ====================
     @dp.message(F.text == '🤝 Партнеры')

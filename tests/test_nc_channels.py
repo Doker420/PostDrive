@@ -48,7 +48,17 @@ assert 'GetChannels' in block, "поиск каналов не пакетный"
 assert 'client.get_chat(' not in block, "остались поштучные get_chat"
 results.append("поиск каналов пакетный (GetChannels), без get_chat: OK")
 
-# 7. Файл компилируется
+# 8. Меню нейрокомментинга не проверяет подписку по id бота.
+#    callback.message.from_user — это бот, поэтому user_id должен передаваться явно.
+assert 'async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None)' in src, \
+    "neurocomment_menu_handler не принимает явный user_id"
+assert src.count('neurocomment_menu_handler(callback.message, state, callback.from_user.id)') >= 2, \
+    "вызовы из callback не передают callback.from_user.id"
+assert 'neurocomment_menu_handler(callback.message, state)' not in src, \
+    "остался вызов меню без явного user_id (подписка проверится для бота)"
+results.append("меню нейрокомментинга получает реальный user_id: OK")
+
+# 9. Файл компилируется
 import ast
 ast.parse(src)
 results.append("handlers.py компилируется: OK")
