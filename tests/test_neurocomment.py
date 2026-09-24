@@ -64,7 +64,28 @@ assert '_nc_last_comment' in U, "нет паузы между комментар
 assert "getattr(msg, 'service', None)" in U, "сервисные сообщения не отсеиваются"
 results.append("опрос каналов чаще, пачка последних постов, пауза между комментариями: OK")
 
-# 7. Таблица дедупликации реально работает
+# 7. Параллельные задачи не ломают комментинг
+assert 'client, cli_err = await self.get_or_start_client(account_id)' in U, \
+    "воркер по-прежнему держит один и тот же объект клиента"
+assert U.count('client, cli_err = await self.get_or_start_client(account_id)') >= 2, \
+    "рассылка не обновляет клиент в цикле"
+assert 'def active_task_names' in U, "нет списка параллельных задач"
+assert U.count("active_task_names(account_id, exclude=") >= 3, \
+    "нет предупреждений о параллельных задачах"
+results.append("клиент берётся заново каждый цикл + предупреждение о параллели: OK")
+
+# 8. Сторож поднимает упавший воркер
+assert 'async def _restore_stalled_neurocomment' in U, "нет сторожа воркеров"
+assert '_restore_stalled_neurocomment()' in U.split('async def _restore_stalled_neurocomment')[0], \
+    "сторож не вызывается из cleanup-цикла"
+assert 'disable_on_exit' in U, "падение воркера всё ещё гасит настройку"
+seg_fin = U[U.index('Neurocomment worker stopped'):][:600]
+assert 'if disable_on_exit or account_id in self._nc_intentional_stop:' in seg_fin, \
+    "enabled=0 ставится безусловно"
+assert '_nc_intentional_stop.add' in U, "намеренная остановка не помечается"
+results.append("сторож перезапускает упавший нейрокомментинг: OK")
+
+# 9. Таблица дедупликации реально работает
 path = os.path.join(tempfile.mkdtemp(), 'nc.db')
 db = sqliter.DBConnection(path)
 assert db.was_post_commented(1, '@chan', 100) is False
@@ -73,6 +94,14 @@ assert db.was_post_commented(1, '@chan', 100) is True
 db.mark_post_commented(1, '@chan', 100)          # повтор не падает
 assert db.was_post_commented(1, '@chan', 101) is False
 assert db.was_post_commented(2, '@chan', 100) is False
+# сторожу нужен список включённых настроек
+db.get_or_create_user(5, 'u', 'a', 'b', 0)
+aid = db.add_account(5, 'sess', phone='1', account_name='A')
+db.create_neurocomment_settings(aid, 5, comment_delay=60)
+assert db.get_enabled_neurocomment_settings() == [], "выключенная настройка попала в список"
+db.update_neurocomment_settings(aid, enabled=1)
+rows = db.get_enabled_neurocomment_settings()
+assert [(r['account_id'], r['user_id']) for r in rows] == [(aid, 5)], rows
 db.close()
 sqliter.DBConnection(path).close()               # миграция идемпотентна
 results.append("nc_commented_posts: запись/дубль/изоляция по аккаунту: OK")

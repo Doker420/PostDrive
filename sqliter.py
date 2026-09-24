@@ -1937,6 +1937,17 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self.c.execute('SELECT * FROM neurocomment_settings WHERE account_id = ?', (account_id,))
         return self._dict_fetchone()
 
+    def get_enabled_neurocomment_settings(self) -> List[Dict[str, Any]]:
+        """Все включённые настройки нейрокомментинга — для сторожа воркеров."""
+        try:
+            c = self._cursor()
+            c.execute('SELECT * FROM neurocomment_settings WHERE enabled = 1')
+            rows = c.fetchall()
+            return [dict(r) for r in rows] if rows else []
+        except Exception as e:
+            logger.debug(f"get_enabled_neurocomment_settings: {e}")
+            return []
+
     def get_user_neurocomment_settings(self, user_id: int) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM neurocomment_settings WHERE user_id = ?', (user_id,))
         return self._dict_fetchall()

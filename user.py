@@ -541,6 +541,9 @@ class AccountSessionManager:
         # время последнего отправленного комментария по аккаунтам:
         # comment_delay — это пауза МЕЖДУ комментариями, а не период опроса
         self._nc_last_comment: Dict[int, float] = {}
+        # аккаунты, у которых нейрокомментинг остановлен НАМЕРЕННО
+        # (иначе сторож поднимет задачу обратно)
+        self._nc_intentional_stop: set = set()
         self.temp_auth_clients: Dict[int, Dict[str, Any]] = {}
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
@@ -553,6 +556,8 @@ class AccountSessionManager:
         self._user_task_counts: Dict[int, int] = {}  # user_id -> active task count
         self._user_task_lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
+        # Бот для служебных уведомлений сторожа воркеров
+        self._bot = None
 
     def create_client(self, session_string: str, proxy_str: str = "", name: str = "session") -> Client:
         proxy_dict = parse_proxy_string(proxy_str) if proxy_str else None
@@ -606,6 +611,25 @@ class AccountSessionManager:
             current = self._user_task_counts.get(user_id, 0)
             if current > 0:
                 self._user_task_counts[user_id] = current - 1
+
+    TASK_LABELS = {
+        'active_spam_tasks': '📨 рассылка',
+        'active_parse_tasks': '🔍 парсинг',
+        'active_comment_tasks': '🧠 нейрокомментинг',
+        'active_join_tasks': '➕ вступление в чаты',
+        'active_leave_tasks': '➖ выход из чатов',
+    }
+
+    def active_task_names(self, account_id: int, exclude: str = None) -> List[str]:
+        """Какие задачи сейчас крутятся на аккаунте (для предупреждений)."""
+        names = []
+        for attr, label in self.TASK_LABELS.items():
+            if attr == exclude:
+                continue
+            task = getattr(self, attr, {}).get(account_id)
+            if task and not task.done():
+                names.append(label)
+        return names
 
     def _is_account_busy(self, account_id: int) -> bool:
         """Check if an account has active tasks (spam, parse, comment, join, leave)."""
@@ -678,10 +702,47 @@ class AccountSessionManager:
                 cleanup_ar_history()
                 await self._evict_idle_clients()
                 await self._enforce_client_limit()
+                await self._restore_stalled_neurocomment()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Cleanup loop error: {e}")
+
+    async def _restore_stalled_neurocomment(self):
+        """Поднимает нейрокомментинг, который включён в БД, но не работает.
+
+        Задача может умереть по любой причине (сеть, перезапуск сессии,
+        исключение). Раньше тумблер оставался 🟢, а комментариев не было —
+        и владелец узнавал об этом только по жалобам.
+        """
+        try:
+            rows = db.get_enabled_neurocomment_settings()
+        except Exception as e:
+            logger.debug(f"watchdog: не удалось прочитать настройки: {e}")
+            return
+        for nc in rows:
+            account_id = nc.get('account_id')
+            owner = nc.get('user_id')
+            if not account_id:
+                continue
+            task = self.active_comment_tasks.get(account_id)
+            if task and not task.done():
+                continue
+            usable, reason = db.is_account_usable(account_id)
+            if not usable:
+                logger.info(f"watchdog: аккаунт {account_id} недоступен ({reason}), нейрокомментинг не поднимаю")
+                continue
+            logger.warning(f"♻️ watchdog: нейрокомментинг аккаунта {account_id} не работает — перезапускаю")
+            try:
+                ok, msg = await self.start_neurocomment(account_id, self._bot, owner)
+                if ok and self._bot and owner:
+                    await self._safe_bot_message(
+                        self._bot, owner,
+                        f"♻️ Нейрокомментинг аккаунта #{account_id} был перезапущен автоматически.")
+                elif not ok:
+                    logger.warning(f"watchdog: перезапуск {account_id} не удался: {msg}")
+            except Exception as e:
+                logger.error(f"watchdog: ошибка перезапуска {account_id}: {e}")
 
     async def graceful_shutdown(self):
         """Stop all active Pyrogram clients and cancel background tasks."""
@@ -1819,6 +1880,8 @@ class AccountSessionManager:
             return False, f"Достигнут глобальный лимит одновременных задач ({self._max_concurrent_tasks}). Попробуйте позже."
         if not await self._acquire_user_quota(user_id):
             return False, f"Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER}). Дождитесь завершения или отмените другие задачи."
+        self._bot = bot or self._bot
+        self._nc_intentional_stop.discard(account_id)
         logging.info(f"✅ Starting neurocomment for account {account_id} on channels: {channels}")
         self.comment_listeners[account_id] = {}
         task_id = db.register_task(user_id, account_id, 'neurocomment', 'starting')
@@ -1829,6 +1892,7 @@ class AccountSessionManager:
 
     async def stop_neurocomment(self, account_id: int, user_id: int = None):
         # Note: quota is released in _neurocomment_worker's finally block
+        self._nc_intentional_stop.add(account_id)
         task = self.active_comment_tasks.pop(account_id, None)
         task_id = self.active_comment_task_ids.pop(account_id, None)
         if task and not task.done():
@@ -1865,7 +1929,19 @@ class AccountSessionManager:
         acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
         notifications_hidden = account.get('notifications_hidden', 0) == 1
         
+        # Выключать тумблер в БД нужно только при осознанной остановке.
+        # При аварии (сеть, мёртвая сессия, исключение) настройка остаётся
+        # включённой, и сторож поднимет воркер заново.
+        disable_on_exit = False
         logging.info(f"🧠 Starting neurocomment worker for {acc_name} | user_id={user_id} | notifications_hidden={notifications_hidden}")
+
+        parallel = self.active_task_names(account_id, exclude='active_comment_tasks')
+        if parallel and bot and not notifications_hidden:
+            await self._safe_bot_message(
+                bot, user_id,
+                f"ℹ️ [{acc_name}] Параллельно уже работают: {', '.join(parallel)}.\n"
+                f"Задачи делят лимиты Telegram одного аккаунта — возможны паузы "
+                f"из-за FloodWait. Комментинг при этом не останавливается.")
         
         client, err = await self.get_or_start_client(account_id)
         if not client:
@@ -1912,6 +1988,7 @@ class AccountSessionManager:
             logging.info(f"📊 [{acc_name}] Channel validation complete: {len(valid_channels)}/{len(target_channels)} valid")
             
             if not valid_channels:
+                disable_on_exit = True
                 logging.warning(f"⚠️ [{acc_name}] No valid channels found, stopping worker")
                 if bot and not notifications_hidden:
                     await bot.send_message(user_id, f"❌ [{acc_name}] Нет доступных каналов! Проверьте настройки.")
@@ -1939,11 +2016,33 @@ class AccountSessionManager:
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Failed to initialize last_seen for {channel}: {e}")
             
+            client_failures = 0
             while True:
                 loop_count += 1
                 logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} start | channels={len(valid_channels)} | mode={mode} | delay={comment_delay}s")
+
+                # Клиент берём заново каждый цикл. Раньше ссылка захватывалась
+                # один раз на всё время работы: если сессию перезапускала любая
+                # другая задача (парсинг, рассылка, переподключение), воркер
+                # продолжал дёргать мёртвый объект и молча переставал
+                # комментировать.
+                client, cli_err = await self.get_or_start_client(account_id)
+                if not client:
+                    client_failures += 1
+                    logging.warning(f"⚠️ [{acc_name}] Нет клиента ({cli_err}), попытка {client_failures}/5")
+                    if client_failures >= 5:
+                        disable_on_exit = True
+                        if bot and not notifications_hidden:
+                            await self._safe_bot_message(
+                                bot, user_id,
+                                f"❌ [{acc_name}] Нейрокомментинг остановлен: сессия недоступна ({cli_err}).")
+                        break
+                    await asyncio.sleep(30)
+                    continue
+                client_failures = 0
                 
                 if not db.is_user_subscribed(user_id, ADMIN_ID):
+                    disable_on_exit = True
                     logging.warning(f"⚠️ [{acc_name}] Subscription expired for user {user_id}, stopping")
                     await self.stop_neurocomment(account_id)
                     if bot and not notifications_hidden:
@@ -1952,6 +2051,7 @@ class AccountSessionManager:
                 
                 nc_chk = db.get_neurocomment_settings(account_id)
                 if not nc_chk or not nc_chk.get('enabled'):
+                    disable_on_exit = True
                     logging.info(f"🛑 [{acc_name}] Neurocomment disabled in settings, stopping")
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"🛑 [{acc_name}] Нейрокомментинг выключен.")
@@ -2149,6 +2249,7 @@ class AccountSessionManager:
         except AccountBlockedError as e:
             # Раньше владелец не получал ничего: задача молча умирала, тумблер
             # гас, и выглядело это как «нейрокомментинг не работает».
+            disable_on_exit = True
             logging.error(f"🚫 [{acc_name}] Нейрокомментинг остановлен: {e}")
             if bot and not notifications_hidden:
                 try:
@@ -2168,7 +2269,11 @@ class AccountSessionManager:
                     pass
         finally:
             logging.info(f"🧠 [{acc_name}] Neurocomment worker stopped")
-            db.update_neurocomment_settings(account_id, enabled=0)
+            if disable_on_exit or account_id in self._nc_intentional_stop:
+                db.update_neurocomment_settings(account_id, enabled=0)
+            else:
+                logging.warning(f"♻️ [{acc_name}] Воркер упал — настройка оставлена включённой, "
+                                f"сторож перезапустит задачу")
             self.active_comment_tasks.pop(account_id, None)
             self.comment_listeners.pop(account_id, None)
             if task_id:
@@ -2860,12 +2965,28 @@ class AccountSessionManager:
         cycle_count = 0
         report_id = db.create_account_report(account_id, user_id, account.get('post_text', ''), account.get('post_photo', ''))
         chats_added = set()
-        
+        self._bot = bot or self._bot
+
         if bot and not notifications_hidden:
             await bot.send_message(user_id, f"🚀 [{acc_name}] Рассылка запущена!")
+            parallel = self.active_task_names(account_id, exclude='active_spam_tasks')
+            if parallel:
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"ℹ️ [{acc_name}] Параллельно уже работают: {', '.join(parallel)}.\n"
+                    f"Все задачи делят лимиты Telegram одного аккаунта — "
+                    f"возможны паузы из-за FloodWait.")
 
         try:
             while True:
+                # Свежий клиент на каждый цикл: параллельные задачи или
+                # переподключение могли заменить объект сессии
+                client, cli_err = await self.get_or_start_client(account_id)
+                if not client:
+                    logging.warning(f"⚠️ [{acc_name}] Нет клиента для рассылки ({cli_err}), жду 30с")
+                    await asyncio.sleep(30)
+                    continue
+
                 # Re-check subscription & status
                 if not db.is_user_subscribed(user_id, ADMIN_ID):
                     db.set_account_spam_status(account_id, 0)
@@ -3226,6 +3347,14 @@ class AccountSessionManager:
                                           history_limit: int = 5000, include_members: bool = True):
         task = asyncio.current_task()
         self.active_parse_tasks[account_id] = task
+        self._bot = bot or self._bot
+        parallel = self.active_task_names(account_id, exclude='active_parse_tasks')
+        if parallel and bot:
+            await self._safe_bot_message(
+                bot, user_id,
+                f"ℹ️ На аккаунте #{account_id} параллельно работают: {', '.join(parallel)}.\n"
+                f"Парсинг не остановит их, но задачи делят лимиты Telegram — "
+                f"возможны паузы из-за FloodWait.")
         try:
             users, msg = await self.parse_chat_users(
                 account_id, chat_id, bot, user_id, limit, progress_callback,
