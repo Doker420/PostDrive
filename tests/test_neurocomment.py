@@ -52,7 +52,19 @@ seg = seg[:seg.index('back_to_neurocomment')]
 assert 'if not ok:' in seg, "неудачный запуск оставляет статус 🟢"
 results.append("неудачный запуск не оставляет статус включённым: OK")
 
-# 6. Таблица дедупликации реально работает
+# 6. Отслеживание новых постов
+assert 'limit=self.NC_HISTORY_LIMIT' in U, "по-прежнему читается только 1 последний пост"
+assert 'fresh.reverse()' in U, "посты обрабатываются не от старого к новому"
+assert "if mode == 'post_prompt' and not post_text" in U, \
+    "пост без текста пропускается даже в режиме промта по теме"
+assert 'post_age < self.NC_POST_GRACE' in U, "свежесть поста всё ещё сравнивается с comment_delay"
+assert 'sleep_for = max(5, min(comment_delay, self.NC_CHECK_INTERVAL))' in U, \
+    "период опроса всё ещё равен comment_delay"
+assert '_nc_last_comment' in U, "нет паузы между комментариями"
+assert "getattr(msg, 'service', None)" in U, "сервисные сообщения не отсеиваются"
+results.append("опрос каналов чаще, пачка последних постов, пауза между комментариями: OK")
+
+# 7. Таблица дедупликации реально работает
 path = os.path.join(tempfile.mkdtemp(), 'nc.db')
 db = sqliter.DBConnection(path)
 assert db.was_post_commented(1, '@chan', 100) is False

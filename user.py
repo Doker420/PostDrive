@@ -538,6 +538,9 @@ class AccountSessionManager:
         self.active_comment_tasks: Dict[int, asyncio.Task] = {}
         self.active_comment_task_ids: Dict[int, int] = {}  # account_id -> task_id in DB
         self.comment_listeners: Dict[int, Dict[str, int]] = {}
+        # время последнего отправленного комментария по аккаунтам:
+        # comment_delay — это пауза МЕЖДУ комментариями, а не период опроса
+        self._nc_last_comment: Dict[int, float] = {}
         self.temp_auth_clients: Dict[int, Dict[str, Any]] = {}
         self._client_locks: Dict[int, asyncio.Lock] = {}
         self._global_lock = asyncio.Lock()
@@ -1196,6 +1199,13 @@ class AccountSessionManager:
     # Максимальная длина комментария. Живой подписчик не пишет простыни,
     # а длинный текст мгновенно выдаёт бота и ловит бан.
     MAX_COMMENT_CHARS = 320
+
+    # Нейрокомментинг: как часто опрашиваем каналы, сколько последних постов
+    # смотрим за раз и сколько ждём, прежде чем комментировать свежий пост
+    # (копия поста появляется в чате обсуждений с задержкой).
+    NC_CHECK_INTERVAL = 30
+    NC_HISTORY_LIMIT = 5
+    NC_POST_GRACE = 10
 
     AI_SYSTEM_TEMPLATE = (
         "Ты — живой человек, читающий Telegram-канал, а не бот. "
@@ -1970,37 +1980,58 @@ class AccountSessionManager:
                                 logging.warning(f"⚠️ [{acc_name}] Failed to get chat {channel}: {e}")
                                 continue
                         
-                        logging.debug(f"📥 [{acc_name}] Fetching last message from {channel}")
-                        async for msg in client.get_chat_history(chat_id, limit=1):
-                            if not msg:
-                                logging.debug(f"📭 [{acc_name}] No messages in {channel}")
+                        # Смотрим НЕСКОЛЬКО последних постов, а не только один:
+                        # альбомы, сервисные сообщения и посты без текста больше
+                        # не «закрывают» собой новый пост, который нужно
+                        # прокомментировать.
+                        logging.debug(f"📥 [{acc_name}] Fetching recent posts from {channel}")
+                        last_seen = self.comment_listeners.get(account_id, {}).get(str(channel), 0)
+                        fresh = []
+                        async for m in client.get_chat_history(chat_id, limit=self.NC_HISTORY_LIMIT):
+                            if not m or m.id <= last_seen:
                                 continue
-                            
+                            fresh.append(m)
+                        # от старого к новому: комментируем по одному за цикл
+                        fresh.reverse()
+                        logging.info(f"🔎 [{acc_name}] {channel}: last_seen={last_seen}, "
+                                     f"новых постов={len(fresh)}")
+
+                        for msg in fresh:
+                            if getattr(msg, 'service', None):
+                                logging.debug(f"⏭️ [{acc_name}] Service message {msg.id} skipped")
+                                self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                continue
+
                             post_text = msg.text or msg.caption or ''
-                            logging.debug(f"📩 [{acc_name}] Got message id={msg.id} date={msg.date} text_len={len(post_text)} in {channel}")
-                            
-                            if mode != 'custom' and not post_text:
-                                logging.debug(f"⏭️ [{acc_name}] Skipping empty post in {channel} (mode={mode})")
+                            logging.debug(f"📩 [{acc_name}] Post id={msg.id} date={msg.date} text_len={len(post_text)} in {channel}")
+
+                            # Режим 'prompt' пишет по своей теме и не нуждается в
+                            # тексте поста; раньше любой пост-картинка без
+                            # подписи молча пропускался.
+                            if mode == 'post_prompt' and not post_text:
+                                logging.info(f"⏭️ [{acc_name}] Пост {msg.id} без текста — режиму «промт нового поста» нечего анализировать")
+                                self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
                                 continue
-                            
+
+                            # Небольшая пауза, чтобы копия поста успела появиться
+                            # в чате обсуждений (раньше здесь стоял comment_delay:
+                            # при задержке 10 минут бот «не видел» свежие посты).
                             post_age = time.time() - msg.date.timestamp()
-                            if post_age < comment_delay:
-                                logging.debug(f"⏳ [{acc_name}] Post too recent ({post_age:.0f}s < {comment_delay}s) in {channel}")
+                            if post_age < self.NC_POST_GRACE:
+                                logging.info(f"⏳ [{acc_name}] Пост {msg.id} только что опубликован ({post_age:.0f}s), жду следующего цикла")
                                 continue
-                            
-                            last_seen = self.comment_listeners.get(account_id, {}).get(str(channel), 0)
-                            logging.debug(f"🔎 [{acc_name}] last_seen={last_seen} msg.id={msg.id} in {channel}")
-                            
-                            if msg.id <= last_seen:
-                                logging.debug(f"✅ [{acc_name}] Already commented on post {msg.id} in {channel}")
-                                continue
-                            
+
                             # Пост уже комментировали в прошлом запуске — пропускаем
                             # (и не тратим AI-квоту)
                             if db.was_post_commented(account_id, channel, msg.id):
                                 logging.info(f"⏭️ [{acc_name}] Post {msg.id} in {channel} already commented earlier")
                                 self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
                                 continue
+
+                            since_last = time.time() - self._nc_last_comment.get(account_id, 0)
+                            if since_last < comment_delay:
+                                logging.info(f"⏸️ [{acc_name}] До следующего комментария {comment_delay - since_last:.0f}s, пост {msg.id} подождёт")
+                                break
 
                             logging.info(f"💬 [{acc_name}] Found new post in {channel}: {post_text[:100]}...")
                             channel_posts_found += 1
@@ -2088,21 +2119,30 @@ class AccountSessionManager:
                                 if comment_sent:
                                     self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
                                     db.mark_post_commented(account_id, channel, msg.id)
+                                    self._nc_last_comment[account_id] = time.time()
                                     if bot and not notifications_hidden:
                                         await bot.send_message(user_id, f"✅ [{acc_name}] Прокомментирован пост в {channel}")
-                                
+
                             except Exception as send_err:
                                 logging.error(f"❌ [{acc_name}] Failed to send comment to {channel}: {type(send_err).__name__}: {send_err}")
                                 if bot and not notifications_hidden:
                                     await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка отправки в {channel}: {str(send_err)[:100]}")
+                            # не больше одного комментария за цикл — иначе аккаунт
+                            # выстреливает очередь сообщений и ловит спам-блок
+                            break
                     
                     except Exception as e:
                         logging.error(f"❌ [{acc_name}] Error processing channel {channel}: {type(e).__name__}: {e}")
                         if bot and not notifications_hidden:
                             await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка проверки канала {channel}: {str(e)[:100]}")
                 
-                logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} end | posts_found={channel_posts_found} | sleeping {comment_delay}s")
-                await asyncio.sleep(comment_delay)
+                # Опрашиваем каналы часто (не реже раза в NC_CHECK_INTERVAL),
+                # а comment_delay теперь задаёт паузу МЕЖДУ комментариями.
+                # Раньше при задержке 10 минут бот и проверял раз в 10 минут,
+                # и пропускал всё «свежее» — выглядело как «не отслеживает».
+                sleep_for = max(5, min(comment_delay, self.NC_CHECK_INTERVAL))
+                logging.info(f"🔄 [{acc_name}] Cycle #{loop_count} end | posts_found={channel_posts_found} | sleeping {sleep_for}s")
+                await asyncio.sleep(sleep_for)
         
         except asyncio.CancelledError:
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
