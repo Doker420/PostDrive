@@ -52,6 +52,26 @@ assert H.count('_start_spam_distribution(') == 3, "общий запуск ис�
 assert H.count('account_manager.spam_to_users(') == 1, "логика запуска продублирована"
 results.append("общий запуск рассылки для списка и контактов: OK")
 
+# 7. Отправка идёт через tg_call (FloodWait/спам-блок/пропуск цели)
+seg4 = U[U.index('async def spam_to_users'):]
+assert 'await self.tg_call(' in seg4, "рассылка всё ещё шлёт мимо tg_call"
+assert 'client.send_message(' in seg4 and 'await client.send_message(' not in seg4, \
+    "остался прямой await client.send_message"
+assert 'await client.send_photo(' not in seg4, "остался прямой await client.send_photo"
+assert 'except AccountBlockedError' in seg4 and 'except TargetSkipError' in seg4, \
+    "не обработаны блокировка аккаунта и пропуск цели"
+results.append("рассылка через tg_call с обработкой блокировок: OK")
+
+# 8. Выбор скорости с лимитами
+assert 'SPAM_SPEEDS = {' in U, "нет пресетов скорости в user.py"
+assert 'delay_min: int = 30' in U and 'random.randint(lo, hi)' in U, \
+    "задержка не настраивается"
+assert 'SPAM_SPEED_LABELS' in H, "нет описания скоростей в UI"
+assert 'сообщений/час' in H, "в подсказке нет актуальных лимитов Telegram"
+assert 'F.data.startswith("spam_speed_")' in H, "нет обработчика выбора скорости"
+assert 'delay_min=delay_min, delay_max=delay_max' in H, "скорость не доходит до рассылки"
+results.append("выбор скорости рассылки с лимитами Telegram: OK")
+
 ast.parse(H)
 ast.parse(U)
 results.append("handlers.py и user.py компилируются: OK")

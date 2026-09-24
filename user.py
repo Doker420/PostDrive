@@ -3657,7 +3657,18 @@ class AccountSessionManager:
             logging.error(f"❌ [acc {account_id}] get_contacts: {type(e).__name__}: {e}")
             return [], f"{type(e).__name__}: {str(e)[:120]}"
 
-    async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int, mode: str = 'post', custom_text: str = '', custom_entities: str = None):
+    # Пресеты скорости рассылки (секунды между сообщениями).
+    # Ориентир Telegram: безопасно ~20-30 сообщений в час новым контактам,
+    # всё быстрее — прямой путь к PeerFlood.
+    SPAM_SPEEDS = {
+        'slow':   (90, 180),
+        'normal': (30, 90),
+        'fast':   (10, 25),
+    }
+
+    async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int,
+                            mode: str = 'post', custom_text: str = '', custom_entities: str = None,
+                            delay_min: int = 30, delay_max: int = 90):
         account = db.get_account(account_id)
         if not account:
             return
@@ -3730,27 +3741,45 @@ class AccountSessionManager:
                     logging.warning(f"[{acc_name}] Рандомизация изменила длину текста — форматирование снято")
                     entities_to_send = None
                 
+                # Через tg_call: FloodWait переживается с ожиданием, спам-блок
+                # помечает здоровье аккаунта и останавливает задачу, а битая
+                # цель просто пропускается. Раньше сырые client.send_* ничего
+                # этого не делали — аккаунт молча выгорал.
                 if post_photo and os.path.exists(post_photo) and mode == 'post':
-                    await client.send_photo(
-                        peer, 
-                        post_photo, 
-                        caption=text_to_send,
-                        caption_entities=entities_to_send if entities_to_send else None,
-                        parse_mode=None if entities else None
-                    )
+                    await self.tg_call(
+                        lambda: client.send_photo(
+                            peer, post_photo, caption=text_to_send,
+                            caption_entities=entities_to_send if entities_to_send else None,
+                            parse_mode=None),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f'spam -> {peer}', notify=not notifications_hidden)
                 else:
-                    await client.send_message(
-                        peer, 
-                        text_to_send,
-                        entities=entities_to_send if entities_to_send else None,
-                        parse_mode=None if entities else None
-                    )
+                    await self.tg_call(
+                        lambda: client.send_message(
+                            peer, text_to_send,
+                            entities=entities_to_send if entities_to_send else None,
+                            parse_mode=None),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f'spam -> {peer}', notify=not notifications_hidden)
                 success += 1
                 if bot and not notifications_hidden:
                     try:
                         await bot.send_message(user_id, f"✅ [{acc_name}] Отправлено: {peer}")
                     except:
                         pass
+            except AccountBlockedError as e:
+                # Спам-блок / длительный FloodWait — дальше слать нельзя
+                logging.error(f"🚫 [{acc_name}] Рассылка остановлена: {e}")
+                if bot:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"🚫 [{acc_name}] Рассылка остановлена: {str(e)[:200]}\n\n"
+                        f"Отправлено до остановки: {success}. Дайте аккаунту отдохнуть "
+                        f"и увеличьте паузы между сообщениями.")
+                break
+            except TargetSkipError as e:
+                errors += 1
+                logging.info(f"⏭️ [{acc_name}] Цель {peer} пропущена: {e}")
             except Exception as e:
                 errors += 1
                 if bot and not notifications_hidden:
@@ -3758,7 +3787,8 @@ class AccountSessionManager:
                         await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка {peer}: {str(e)[:80]}")
                     except:
                         pass
-            await asyncio.sleep(random.randint(5, 15))
-        
+            lo, hi = sorted((max(1, int(delay_min)), max(1, int(delay_max))))
+            await asyncio.sleep(random.randint(lo, hi))
+
         if bot:
             await bot.send_message(user_id, f"✅ [{acc_name}] Рассылка завершена: {success} отправлено, {errors} ошибок")

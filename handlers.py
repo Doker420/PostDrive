@@ -929,15 +929,27 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             else:
                 await message_or_callback.message.answer(text, reply_markup=markup)
 
+    # Пресеты скорости рассылки. Ориентир Telegram: безопасная норма для
+    # сообщений незнакомым людям — примерно 20-30 в час на аккаунт;
+    # превышение почти гарантированно даёт PeerFlood («спам-блок»).
+    SPAM_SPEED_LABELS = {
+        'slow':   ("🐢 Безопасная", "90–180 сек между сообщениями (~25 сообщений/час)"),
+        'normal': ("🚶 Средняя", "30–90 сек (~60 сообщений/час) — риск умеренный"),
+        'fast':   ("🐇 Быстрая", "10–25 сек (~200 сообщений/час) — высокий риск спам-блока"),
+    }
+
     async def ask_for_spam_targets(message_or_callback, state: FSMContext):
         data = await state.get_data()
         account_ids = data.get('spam_account_ids', [])
         mode = data.get('spam_mode', 'post')
-        
+        speed = data.get('spam_speed', 'normal')
+        speed_label, speed_hint = SPAM_SPEED_LABELS.get(speed, SPAM_SPEED_LABELS['normal'])
+
         text = (
             f"📨 <b>Рассылка</b>\n\n"
             f"Выбрано аккаунтов: {len(account_ids)}\n"
-            f"Режим: {'📝 Текст из поста' if mode == 'post' else '✏️ Свой текст'}\n\n"
+            f"Режим: {'📝 Текст из поста' if mode == 'post' else '✏️ Свой текст'}\n"
+            f"Скорость: {speed_label} — {speed_hint}\n\n"
             f"Отправьте:\n"
             f"• TXT файл с ID юзеров или username (@username или без)\n"
             f"• Или ссылки формата https://t.me/username\n"
@@ -945,7 +957,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• Или нажмите «📇 По контактам аккаунтов» — цели возьмутся "
             f"из адресной книги выбранных аккаунтов"
         )
+        speed_row = []
+        for code, (label, _hint) in SPAM_SPEED_LABELS.items():
+            mark = "✅ " if code == speed else ""
+            speed_row.append(InlineKeyboardButton(text=f"{mark}{label}",
+                                                  callback_data=f"spam_speed_{code}"))
         buttons = [
+            speed_row,
             [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
@@ -1266,6 +1284,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         mode = data.get('spam_mode', 'post')
         custom_text = data.get('custom_spam_text', '')
         custom_entities = data.get('custom_spam_entities', None)
+        speed = data.get('spam_speed', 'normal')
+        delay_min, delay_max = account_manager.SPAM_SPEEDS.get(
+            speed, account_manager.SPAM_SPEEDS['normal'])
 
         await state.clear()
         unique_targets = list(dict.fromkeys(parsed_targets))
@@ -1281,7 +1302,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         await answer_to.answer(
             f"🚀 Запускаю рассылку на {len(unique_targets)} уникальных целей "
-            f"из {len(account_ids)} аккаунтов...")
+            f"из {len(account_ids)} аккаунтов.\n"
+            f"Пауза между сообщениями: {delay_min}–{delay_max} сек.")
 
         per_account = len(unique_targets) // len(account_ids)
         remainder = len(unique_targets) % len(account_ids)
@@ -1295,11 +1317,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     account_manager.spam_to_users(
                         account_id, account_targets, bot, user_id,
                         mode=mode, custom_text=custom_text,
-                        custom_entities=custom_entities)))
+                        custom_entities=custom_entities,
+                        delay_min=delay_min, delay_max=delay_max)))
 
         await answer_to.answer(
             "✅ Рассылка запущена в фоне. Вы получите уведомления о прогрессе и результате.",
             reply_markup=main_menu_keyboard(user_id))
+
+    @dp.callback_query(F.data.startswith("spam_speed_"), MassActionStates.WAITING_TARGETS)
+    async def spam_speed_callback(callback: CallbackQuery, state: FSMContext):
+        code = callback.data.rsplit('_', 1)[-1]
+        if code not in SPAM_SPEED_LABELS:
+            await callback.answer("❌ Неизвестная скорость", show_alert=True)
+            return
+        await state.update_data(spam_speed=code)
+        label, hint = SPAM_SPEED_LABELS[code]
+        await callback.answer(f"{label}: {hint}", show_alert=(code == 'fast'))
+        await ask_for_spam_targets(callback, state)
 
     @dp.callback_query(F.data == "spam_targets_contacts", MassActionStates.WAITING_TARGETS)
     async def spam_targets_contacts_callback(callback: CallbackQuery, state: FSMContext):
