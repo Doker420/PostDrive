@@ -1191,6 +1191,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "cancel_action", StateFilter('*'))
     async def cancel_action_handler(callback: CallbackQuery, state: FSMContext):
+        _stop_qr_poller(callback.from_user.id)
         if account_manager:
             account_manager.cancel_phone_auth(callback.from_user.id)
         await state.clear()
@@ -2061,82 +2062,133 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
 
+    # Активные опросы QR-входа: user_id -> asyncio.Task.
+    # Раньше опрос стартовал ТОЛЬКО по кнопке «Я отсканировал». Пользователь
+    # сканировал код, клиент-бот никогда не вызывал ImportLoginToken, и в
+    # Telegram сессия оставалась в «незавершённых попытках входа», а бот молчал.
+    qr_pollers: Dict[int, asyncio.Task] = {}
+
+    def _stop_qr_poller(user_id: int):
+        task = qr_pollers.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _qr_poll(user_id: int, proxy_str: str, state: FSMContext,
+                       photo_msg, status_msg):
+        """Опрашивает Telegram до подтверждения входа и доводит аккаунт до БД."""
+        try:
+            async for update_msg, is_final in account_manager.finish_qr_login_stream(
+                    user_id, proxy_str, bot):
+                if not is_final:
+                    # Обновлённый QR (токен живёт ~30 секунд) — перерисовываем картинку
+                    try:
+                        await photo_msg.edit_media(media=InputMediaPhoto(
+                            media=BufferedInputFile(update_msg['qr_bytes'], filename='qr.png'),
+                            caption="🔲 Отсканируйте QR-код в Telegram: Настройки → Устройства → Подключить устройство"))
+                    except Exception:
+                        pass
+                    continue
+
+                success, session_str, info, err = update_msg
+                if not success:
+                    if err and ("2FA" in str(err) or "пароль" in str(err).lower()):
+                        await status_msg.edit_text("🔐 Требуется пароль 2FA (Cloud Password). Введите его:")
+                        await state.set_state(AddAccountStates.WAITING_QR_2FA)
+                        await state.update_data(qr_proxy=proxy_str)
+                        return
+                    await status_msg.edit_text(f"❌ Ошибка: {err}")
+                    await state.clear()
+                    return
+
+                acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() \
+                    or info.get('username') or f"ID:{info.get('id')}"
+                _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
+                if not _allowed:
+                    await status_msg.edit_text(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
+                    await state.clear()
+                    return
+                db.add_account(user_id, session_str, phone=info.get('phone', ''),
+                               account_name=acc_name, proxy=proxy_str)
+                await state.clear()
+                await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен через QR!")
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"QR poll error for {user_id}: {type(e).__name__}: {e}")
+            try:
+                await status_msg.edit_text(f"❌ Ошибка QR-входа: {str(e)[:200]}")
+            except Exception:
+                pass
+        finally:
+            qr_pollers.pop(user_id, None)
+
     @dp.callback_query(F.data == "auth_qr", AddAccountStates.WAITING_METHOD)
     async def auth_qr_callback(callback: CallbackQuery, state: FSMContext):
+        user_id = callback.from_user.id
+        _stop_qr_poller(user_id)
+        account_manager.cancel_phone_auth(user_id)     # закрываем прошлую временную сессию
         await state.set_state(AddAccountStates.WAITING_QR_SCAN)
         await edit_message(callback,
             "🔳 <b>Вход по QR-коду</b>\n\n"
             "1. Откройте Telegram → Настройки → Устройства → «Подключить устройство».\n"
-            "2. Отсканируйте QR-код, который будет отправлен следующим сообщением.\n"
-            "3. После сканирования нажмите кнопку «✅ Я отсканировал».",
+            "2. Отсканируйте QR-код из следующего сообщения.\n"
+            "3. Больше ничего нажимать не нужно — бот сам завершит вход.\n\n"
+            "<i>Код обновляется автоматически, сканируйте самый свежий.</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Я отсканировал", callback_data="qr_scanned")],
+                [InlineKeyboardButton(text="🔄 Проверить вход", callback_data="qr_scanned")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
             ])
         )
-        user_id = callback.from_user.id
         data = await state.get_data()
         proxy_str = data.get('proxy', '')
         qr_result = await account_manager.start_qr_login(user_id, proxy_str)
-        if qr_result and qr_result.get('qr_bytes'):
+        if not qr_result or qr_result.get('error'):
+            err = qr_result.get('error') if isinstance(qr_result, dict) else qr_result
+            await callback.message.answer(f"❌ Ошибка запуска QR-входа: {err}")
+            return
+
+        photo_msg = None
+        if qr_result.get('qr_bytes'):
             try:
-                await callback.message.answer_photo(BufferedInputFile(qr_result['qr_bytes'], filename='qr.png'), caption="🔲 Отсканируйте этот QR-коду в Telegram")
+                photo_msg = await callback.message.answer_photo(
+                    BufferedInputFile(qr_result['qr_bytes'], filename='qr.png'),
+                    caption="🔲 Отсканируйте QR-код в Telegram: Настройки → Устройства → Подключить устройство")
             except Exception as e:
                 logger.error(f"❌ Ошибка отправки QR-фото: {e}")
-                if qr_result.get('qr_text'):
-                    await callback.message.answer(f"🔲 QR-код (текст): {qr_result['qr_text']}")
-                else:
-                    await callback.message.answer("⚠️ Не удалось отправить QR-код. Попробуйте ещё раз.")
-        elif qr_result and qr_result.get('qr_text'):
-            await callback.message.answer(f"🔲 QR-код: {qr_result['qr_text']}")
-        else:
-            await callback.message.answer(f"❌ Ошибка запуска QR-входа: {qr_result.get('error') if isinstance(qr_result, dict) else qr_result}")
+        if photo_msg is None:
+            if qr_result.get('qr_text'):
+                photo_msg = await callback.message.answer(f"🔲 Ссылка для входа: {qr_result['qr_text']}")
+            else:
+                await callback.message.answer("⚠️ Не удалось отправить QR-код. Попробуйте ещё раз.")
+                return
 
-    @dp.callback_query(F.data == "qr_scanned", AddAccountStates.WAITING_QR_SCAN)
+        status_msg = await callback.message.answer(
+            "⏳ Жду сканирования QR-кода… Подтвердите вход в приложении Telegram.")
+        # ⭐ Опрос стартует сразу: как только код отсканирован, вход завершится сам
+        qr_pollers[user_id] = asyncio.create_task(
+            _qr_poll(user_id, proxy_str, state, photo_msg, status_msg))
+
+    # Без фильтра по состоянию: если FSM потерялся (перезапуск бота), кнопка
+    # раньше просто проваливалась в пустоту — «на этапе бота тишина».
+    @dp.callback_query(F.data == "qr_scanned")
     async def qr_scanned_callback(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
+        task = qr_pollers.get(user_id)
+        if task and not task.done():
+            await callback.answer("⏳ Уже проверяю вход, подождите — ничего нажимать не нужно.",
+                                  show_alert=True)
+            return
+        if user_id not in account_manager.temp_auth_clients:
+            await callback.answer("⌛ QR-сессия истекла. Запустите добавление аккаунта заново.",
+                                  show_alert=True)
+            return
         data = await state.get_data()
         proxy_str = data.get('proxy', '')
-        status_msg = await callback.message.answer("⏳ Ожидаю подтверждения входа...")
-        qr_update_count = 0
-        try:
-            async for update_msg, is_final in account_manager.finish_qr_login_stream(user_id, proxy_str, callback.bot):
-                if is_final:
-                    success, session_str, info, err = update_msg
-                    if not success:
-                        if err and "2FA" in str(err) or "пароль" in str(err).lower():
-                            await status_msg.edit_text("🔐 Требуется пароль 2FA (Cloud Password). Введите его:")
-                            await state.set_state(AddAccountStates.WAITING_QR_2FA)
-                            await state.update_data(qr_proxy=proxy_str)
-                            return
-                        await status_msg.edit_text(f"❌ Ошибка: {err}")
-                        await state.clear()
-                        return
-                    acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
-                    _allowed, _reason, _ = db.can_add_account(user_id, ADMIN)
-                    if not _allowed:
-                        await status_msg.edit_text(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
-                        await state.clear()
-                        return
-                    db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
-                    await state.clear()
-                    await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен через QR!")
-                    return
-                else:
-                    qr_update_count += 1
-                    try:
-                        from aiogram.types import BufferedInputFile
-                        await status_msg.edit_media(
-                            media=InputMediaPhoto(
-                                media=BufferedInputFile(update_msg['qr_bytes'], filename='qr.png'),
-                                caption="🔲 Отсканируйте этот QR-коду в Telegram"
-                            )
-                        )
-                    except Exception:
-                        await status_msg.edit_text(f"🔲 QR-код: {update_msg.get('qr_text', '')}")
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Ошибка: {e}")
-            await state.clear()
+        status_msg = await callback.message.answer("⏳ Проверяю подтверждение входа…")
+        await callback.answer()
+        qr_pollers[user_id] = asyncio.create_task(
+            _qr_poll(user_id, proxy_str, state, callback.message, status_msg))
 
     @dp.message(AddAccountStates.WAITING_QR_2FA)
     async def process_qr_2fa(message: Message, state: FSMContext):

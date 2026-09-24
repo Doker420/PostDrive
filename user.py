@@ -945,78 +945,15 @@ class AccountSessionManager:
             from pyrogram.raw import types as raw_types
             from pyrogram.errors import SessionPasswordNeeded, AuthTokenExpired, AuthTokenInvalid, AuthKeyUnregistered
 
-            deadline = time.time() + 180
+            # 10 минут: опрос идёт в фоне с момента показа кода, торопить незачем
+            deadline = time.time() + 600
             last_token_bytes = auth_data.get("login_token").token if auth_data.get("login_token") else None
             qr_update_count = 0
-            import_attempted = False
+            # ВАЖНО: ImportLoginToken больше НЕ вызывается «на всякий случай» до
+            # сканирования — неподтверждённый токен так только портится, а вход
+            # зависает в «незавершённых попытках». Признак успеха приходит из
+            # ExportLoginToken (LoginTokenSuccess) или из миграции ниже.
             while time.time() < deadline:
-                if last_token_bytes and not import_attempted:
-                    try:
-                        logger.info(f"QR: пробуем ImportLoginToken для user_id={user_id}")
-                        resp = await asyncio.wait_for(
-                            client.invoke(
-                                functions.auth.ImportLoginToken(token=last_token_bytes)
-                            ),
-                            timeout=15
-                        )
-                        import_attempted = True
-                        if isinstance(resp, raw_types.auth.LoginTokenSuccess):
-                            try:
-                                me = await client.get_me()
-                            except Exception as e:
-                                yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
-                                return
-                            session_str = await client.export_session_string()
-                            info = {
-                                "id": me.id,
-                                "first_name": me.first_name or "",
-                                "last_name": me.last_name or "",
-                                "username": me.username or "",
-                                "phone": me.phone_number or ""
-                            }
-                            await client.disconnect()
-                            del self.temp_auth_clients[user_id]
-                            logger.info(f"✅ QR-вход успешно завершён для user_id={user_id}")
-                            yield (True, session_str, info, None), True
-                            return
-                        if isinstance(resp, raw_types.auth.LoginTokenMigrateTo):
-                            try:
-                                resp = await client.invoke(
-                                    functions.auth.ImportLoginToken(token=resp.token)
-                                )
-                            except Exception as e:
-                                yield (False, None, None, f"Ошибка импорта токена (миграция): {e}"), True
-                                return
-                            if isinstance(resp, raw_types.auth.LoginTokenSuccess):
-                                try:
-                                    me = await client.get_me()
-                                except Exception as e:
-                                    yield (False, None, None, f"Ошибка получения данных пользователя: {e}"), True
-                                    return
-                                session_str = await client.export_session_string()
-                                info = {
-                                    "id": me.id,
-                                    "first_name": me.first_name or "",
-                                    "last_name": me.last_name or "",
-                                    "username": me.username or "",
-                                    "phone": me.phone_number or ""
-                                }
-                                await client.disconnect()
-                                del self.temp_auth_clients[user_id]
-                                logger.info(f"✅ QR-вход успешно завершён (миграция) для user_id={user_id}")
-                                yield (True, session_str, info, None), True
-                                return
-                    except SessionPasswordNeeded:
-                        logger.warning(f"QR: требуется пароль 2FA для user_id={user_id}")
-                        yield (None, None, None, "Требуется пароль 2FA (Cloud Password)"), True
-                        return
-                    except (AuthTokenExpired, AuthTokenInvalid, AuthKeyUnregistered) as e:
-                        logger.info(f"QR: токен ещё не принят ({type(e).__name__}), продолжаем опрос")
-                        import_attempted = False
-                    except Exception as e:
-                        logger.warning(f"QR: ImportLoginToken ошибка: {type(e).__name__}: {e}")
-                        import_attempted = False
-
                 try:
                     resp = await asyncio.wait_for(
                         client.invoke(
@@ -1028,6 +965,10 @@ class AccountSessionManager:
                         ),
                         timeout=15
                     )
+                except SessionPasswordNeeded:
+                    logger.warning(f"QR: требуется пароль 2FA для user_id={user_id}")
+                    yield (False, None, None, "Требуется пароль 2FA (Cloud Password)"), True
+                    return
                 except asyncio.TimeoutError:
                     logger.warning(f"QR: таймаут ExportLoginToken для user_id={user_id}")
                     await asyncio.sleep(3)
