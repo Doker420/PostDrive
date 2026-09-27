@@ -2506,12 +2506,34 @@ class AccountSessionManager:
                     description=f"GetChannels x{len(inputs)}",
                     notify=False, max_retries=2
                 )
+                return list(getattr(res, 'chats', []) or []) if res else []
             except AccountBlockedError:
                 raise
             except Exception as e:
-                logging.warning(f"GetChannels chunk failed: {type(e).__name__}: {e}")
-                return []
-            return list(getattr(res, 'chats', []) or []) if res else []
+                # CHANNEL_INVALID: достаточно ОДНОГО протухшего access_hash,
+                # чтобы Telegram отверг всю пачку. Раньше мы теряли все 100
+                # каналов разом и показывали пустой список. Делим пачку
+                # пополам и выясняем, кто именно битый.
+                if len(pairs) == 1:
+                    cid = pairs[0][0]
+                    logging.info(f"[acc {account_id}] канал {cid} недоступен ({type(e).__name__}), пропускаю")
+                    # протухший access_hash — пробуем разрешить заново
+                    if pairs[0][1] is not None:
+                        try:
+                            inp = await client.resolve_peer(int(cid))
+                            res = await client.invoke(
+                                raw_functions.channels.GetChannels(id=[inp]))
+                            return list(getattr(res, 'chats', []) or []) if res else []
+                        except Exception:
+                            pass
+                    return []
+                logging.warning(
+                    f"GetChannels x{len(inputs)} failed ({type(e).__name__}), "
+                    f"делю пачку пополам")
+                mid = len(pairs) // 2
+                left = await _fetch_chunk(pairs[:mid])
+                right = await _fetch_chunk(pairs[mid:])
+                return left + right
 
         try:
             for i in range(0, len(need_resolve), CHUNK):

@@ -584,6 +584,38 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 pass
             await msg.answer(text, reply_markup=reply_markup)
 
+    # ==================== GLOBAL ERROR HANDLER ====================
+    @dp.errors()
+    async def global_error_handler(event) -> bool:
+        """Любое необработанное исключение в хендлере.
+
+        Без этого aiogram просто писал traceback в лог, а пользователь
+        оставался на «зависшем» экране без единой кнопки и без объяснений.
+        """
+        exc = getattr(event, 'exception', None)
+        update = getattr(event, 'update', None)
+        logger.exception(f"Необработанная ошибка в хендлере: {type(exc).__name__}: {exc}")
+
+        text = ("❌ Внутренняя ошибка, действие не выполнено.\n\n"
+                "Откройте меню заново — /start. Если повторяется, напишите в поддержку.")
+        try:
+            cb = getattr(update, 'callback_query', None)
+            if cb is not None:
+                try:
+                    await cb.answer("❌ Внутренняя ошибка. Откройте меню заново.",
+                                    show_alert=True)
+                except Exception:
+                    pass
+                if cb.message:
+                    await cb.message.answer(text)
+                return True
+            msg = getattr(update, 'message', None)
+            if msg is not None:
+                await msg.answer(text)
+        except Exception as notify_err:
+            logger.warning(f"Не удалось сообщить об ошибке пользователю: {notify_err}")
+        return True
+
     # ==================== START & INFO ====================
     @dp.message(Command('start'))
     async def process_start_command(message: Message, state: FSMContext):
@@ -3336,9 +3368,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             db.update_neurocomment_settings(account_id, target_channels=channels_str)
 
-    @dp.callback_query(F.data.startswith('nc_channels_'))
-    async def nc_channels_callback(callback: CallbackQuery, state: FSMContext):
-        account_id = int(callback.data.split('_')[2])
+    async def _render_nc_channels_menu(callback: CallbackQuery, state: FSMContext,
+                                       account_id: int):
+        """Меню целевых каналов.
+
+        account_id передаётся ЯВНО: этот экран перерисовывают обработчики с
+        другими callback_data (ncclr_, ncman_), а объекты aiogram заморожены —
+        подменить callback.data нельзя. Раньше повторный разбор callback.data
+        внутри падал с IndexError и экран «зависал».
+        """
         await state.update_data(nc_account_id=account_id)
         current_list = _nc_channel_list(account_id)
         preview = '\n'.join([f"{i+1}. {c}" for i, c in enumerate(current_list[:10])]) if current_list else 'Не заданы'
@@ -3355,6 +3393,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"Выбрано: {len(current_list)}\n{preview}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
         )
+
+    @dp.callback_query(F.data.startswith('nc_channels_'))
+    async def nc_channels_callback(callback: CallbackQuery, state: FSMContext):
+        parts = callback.data.split('_')
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer("❌ Неверные данные кнопки. Откройте меню заново.",
+                                  show_alert=True)
+            return
+        await _render_nc_channels_menu(callback, state, int(parts[2]))
 
     @dp.callback_query(F.data.startswith('ncman_'))
     async def nc_manual_channels_callback(callback: CallbackQuery, state: FSMContext):
@@ -3375,7 +3422,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[1])
         _nc_save_channels(account_id, callback.from_user.id, [])
         await callback.answer("🗑 Список очищен")
-        await nc_channels_callback(callback, state)
+        await _render_nc_channels_menu(callback, state, account_id)
 
     _nc_scanning = set()
 
@@ -3407,7 +3454,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     f"Примерное время: <b>~{eta} сек</b>\n\n"
                     "⚠️ <b>Не нажимайте кнопки</b> до появления списка.\n\n"
                     "<i>Список появится автоматически.</i>",
-                    reply_markup=None
+                    # кнопка «Назад» обязательна: если поиск оборвётся,
+                    # пользователь не должен остаться на экране без выхода
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="◀️ Назад",
+                                             callback_data=f"nc_channels_{account_id}")]])
                 )
             except Exception:
                 pass
@@ -3876,8 +3927,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await edit_message(callback, "📁 <b>Управление паками и категориями</b>", reply_markup=markup)
 
     @dp.callback_query(F.data.startswith('admin_category_'))
-    async def admin_category_callback(callback: CallbackQuery):
-        category_id = int(callback.data.split('_')[2])
+    async def admin_category_callback(callback: CallbackQuery, category_id: int = None):
+        # category_id можно передать явно: этот экран перерисовывают
+        # обработчики с другой callback_data (admin_del_pack_...), и разбор
+        # чужой строки давал ValueError
+        if category_id is None:
+            category_id = int(callback.data.split('_')[2])
         packs = db.get_packs_in_category(category_id)
         buttons = [[InlineKeyboardButton(text=f"📦 {p['name']} ({p['chats_count']} чатов)", callback_data=f"admin_pack_{p['id']}")] for p in packs]
         buttons.append([InlineKeyboardButton(text="➕ Добавить пак", callback_data=f"admin_add_pack_{category_id}")])
@@ -3956,8 +4011,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         pack = db.get_pack(pack_id)
         db.delete_pack(pack_id)
         await callback.answer("✅ Пак удалён!", show_alert=True)
-        if pack:
-            await admin_category_callback(callback)
+        cat_id = (pack or {}).get('category_id')
+        if cat_id is not None:
+            await admin_category_callback(callback, int(cat_id))
 
     @dp.callback_query(F.data == "admin_add_category")
     async def admin_add_category_callback(callback: CallbackQuery, state: FSMContext):
@@ -5178,8 +5234,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"❌ Ошибка: {err}")
 
     @dp.callback_query(F.data.startswith('acc_autoresponder_'))
-    async def acc_autoresponder_callback(callback: CallbackQuery, state: FSMContext):
-        account_id = int(callback.data.split('_')[2])
+    async def acc_autoresponder_callback(callback: CallbackQuery, state: FSMContext,
+                                         account_id: int = None):
+        if account_id is None:
+            account_id = int(callback.data.split('_')[2])
         account = db.get_account(account_id)
         if not account:
             await callback.answer("❌ Аккаунт не найден!", show_alert=True)
@@ -5275,7 +5333,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         new_state = 0 if account.get('autoresponder_enabled', 0) == 1 else 1
         db.toggle_autoresponder(account_id, new_state)
         await callback.answer(f"{'✅ Включен' if new_state == 1 else '❌ Выключен'}!", show_alert=True)
-        await acc_autoresponder_callback(callback, None)
+        await acc_autoresponder_callback(callback, None, account_id)
 
     # ==================== MIRROR MANAGEMENT (User-facing for Partners) ====================
     @dp.callback_query(F.data == "manage_mirrors")

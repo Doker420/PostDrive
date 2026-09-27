@@ -58,7 +58,30 @@ assert 'neurocomment_menu_handler(callback.message, state)' not in src, \
     "остался вызов меню без явного user_id (подписка проверится для бота)"
 results.append("меню нейрокомментинга получает реальный user_id: OK")
 
-# 9. Файл компилируется
+# 9. Меню целевых каналов не разбирает чужую callback_data
+assert 'async def _render_nc_channels_menu(' in src, "нет отдельной отрисовки меню каналов"
+assert 'await _render_nc_channels_menu(callback, state, account_id)' in src, \
+    "очистка списка снова вызывает хендлер с чужой callback_data"
+assert 'await nc_channels_callback(callback, state)' not in src, \
+    "остался вызов nc_channels_callback из другого обработчика (IndexError)"
+seg_menu = src[src.index('async def nc_channels_callback'):]
+seg_menu = seg_menu[:seg_menu.index("@dp.callback_query(F.data.startswith('ncman_'))")]
+assert 'len(parts) < 3' in seg_menu, "нет защиты от короткой callback_data"
+results.append("меню каналов получает account_id явно: OK")
+
+# 10. Тупиковых экранов нет, ошибки видны пользователю
+assert 'reply_markup=None\n                )' not in src, "экран поиска остаётся без кнопки возврата"
+assert '@dp.errors()' in src, "нет глобального обработчика ошибок"
+results.append("тупиковых экранов нет, ошибки сообщаются пользователю: OK")
+
+# 11. Битый канал не рушит всю пачку GetChannels
+block2 = U[U.index('async def list_commentable_channels'):]
+block2 = block2[:block2.index('# ==================== CHAT LIST')]
+assert 'делю пачку пополам' in block2, "CHANNEL_INVALID по-прежнему теряет всю пачку"
+assert 'left = await _fetch_chunk(pairs[:mid])' in block2, "нет рекурсивного деления пачки"
+results.append("CHANNEL_INVALID отсекает только битый канал: OK")
+
+# 12. Файл компилируется
 import ast
 ast.parse(src)
 results.append("handlers.py компилируется: OK")
