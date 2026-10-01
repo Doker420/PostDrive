@@ -1,0 +1,56 @@
+{% macro platform_badge(l) -%}
+  <span class="pbadge pbadge-{{ l.platform }}">
+    {%- if l.platform == 'telegram' %}✈️{% else %}🟦{% endif %}
+    {{ PLATFORM_TITLES.get(l.platform, l.platform) }} · {{ KIND_TITLES.get((l.platform, l.kind), l.kind) }}
+  </span>
+{%- endmacro %}
+
+{% macro listing_card(l) %}
+<a class="card listing-card" href="/listing/{{ l.id }}">
+  <div class="listing-card-top">
+    {{ platform_badge(l) }}
+    {% if l.verified %}<span class="pbadge pbadge-verified" title="Подлинность подтверждена">✔ Подтверждена</span>{% endif %}
+  </div>
+  <div class="listing-title">{{ l.title }}</div>
+  <div class="listing-meta muted">
+    {% if l.category_name %}{{ l.category_emoji }} {{ l.category_name }}{% endif %}
+  </div>
+  <div class="listing-stats">
+    <div class="stat">
+      <div class="stat-num">{{ l.subscribers|subs }}</div>
+      <div class="stat-label">подписчиков</div>
+    </div>
+    {% if l.err %}<div class="stat">
+      <div class="stat-num">{{ l.err }}%</div>
+      <div class="stat-label">вовлечённость</div>
+    </div>{% endif %}
+    <div class="stat stat-price">
+      <div class="stat-num">{{ l.price_from|money }}</div>
+      <div class="stat-label">от, за рекламу</div>
+    </div>
+  </div>
+</a>
+{% endmacro %}
+
+{% macro status_badge(status, mapping) %}
+{%- set s = mapping.get(status, (status, 'badge-gray')) -%}
+<span class="badge {{ s[1] }}">{{ s[0] }}</span>
+{% endmacro %}
+
+{% macro pagination(page, pages, filters) %}
+{% if pages > 1 %}
+<div class="pagination">
+  {% set qp = filters.copy() %}
+  {% for p in range(1, pages + 1) %}
+    {% if p == page %}
+      <span class="page page-cur">{{ p }}</span>
+    {% elif p <= 2 or p > pages - 2 or (p - page)|abs <= 2 %}
+      {% set _ = qp.update({'page': p}) %}
+      <a class="page" href="/catalog?{{ qp|urlencode }}">{{ p }}</a>
+    {% elif (p - page)|abs == 3 %}
+      <span class="page-dots">…</span>
+    {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}

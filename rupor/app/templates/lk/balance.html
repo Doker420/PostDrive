@@ -1,0 +1,98 @@
+{% extends "lk/base.html" %}
+{% block active_tab %}balance{% endblock %}
+{% block lk %}
+<h1>Баланс и пополнение</h1>
+
+<div class="lk-cards">
+  <div class="lk-stat card">
+    <div class="muted tiny">Доступно</div>
+    <div class="lk-stat-num">{{ user.balance_kop|money }}</div>
+  </div>
+  <div class="lk-stat card">
+    <div class="muted tiny">Ожидает зачисления</div>
+    <div class="lk-stat-num">{{ pending|map(attribute='amount_kop')|sum|money }}</div>
+    <div class="tiny muted">{{ pending|length }} пополнение(й) в обработке</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2 class="card-title">Пополнить баланс</h2>
+  <form method="post" action="/lk/deposit" class="deposit-form">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="field">
+      <label>Сумма, ₽ (от {{ min_dep }} до {{ max_dep }})</label>
+      <input type="text" name="amount" inputmode="decimal" placeholder="5000" required>
+    </div>
+    <div class="pay-providers">
+      {% for code, p in providers.items() %}
+      <label class="pay-provider {{ 'disabled' if not provider_available(code) }}">
+        <input type="radio" name="provider" value="{{ code }}" {% if loop.first %}checked{% endif %}>
+        <span class="pp-ico">{{ p.icon }}</span>
+        <span class="pp-body">
+          <b>{{ p.title }}</b>
+          <span class="muted tiny">{{ p.desc }}</span>
+          {% if code in crypto_providers %}
+            <span class="tiny muted">≈ по курсу {{ usdt_rate }} ₽/USDT</span>
+          {% endif %}
+        </span>
+        {% if not provider_available(code) %}
+          <span class="badge badge-orange">демо</span>
+        {% endif %}
+      </label>
+      {% endfor %}
+    </div>
+    <button class="btn btn-primary btn-lg">Пополнить</button>
+    {% if DEMO_PAYMENTS %}
+    <div class="form-note muted tiny">В демо-режиме оплата подтверждается кнопкой на следующей странице.</div>
+    {% endif %}
+  </form>
+</div>
+
+{% if pending %}
+<div class="card">
+  <h2 class="card-title">Ожидают оплаты</h2>
+  <table class="table">
+    <tr><th>№</th><th>Сумма</th><th>Способ</th><th>Создан</th><th></th></tr>
+    {% for t in pending %}
+    <tr>
+      <td>#{{ t.id }}</td>
+      <td>{{ t.amount_kop|money }}</td>
+      <td>{{ providers[t.provider].title if t.provider in providers else t.provider }}</td>
+      <td class="muted tiny">{{ t.created_at|dt }}</td>
+      <td>
+        {% if t.provider == 'yoomoney' and provider_available('yoomoney') %}
+        <div class="muted tiny">ожидаем подтверждение от ЮMoney</div>
+        {% elif provider_available(t.provider) %}
+        <form method="post" action="/lk/deposit/{{ t.id }}/check">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="btn btn-outline btn-sm">Проверить оплату</button>
+        </form>
+        {% else %}
+        <a class="btn btn-outline btn-sm" href="/pay/demo/{{ t.id }}">Перейти к оплате</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 class="card-title">История операций</h2>
+  {% if txs %}
+  <table class="table">
+    <tr><th>№</th><th>Операция</th><th>Сумма</th><th>Способ</th><th>Статус</th><th>Дата</th></tr>
+    {% for t in txs %}
+    <tr>
+      <td class="muted">#{{ t.id }}</td>
+      <td>{{ t.comment }}</td>
+      <td class="{{ 'green' if t.amount_kop > 0 else 'red' }}">{{ t.amount_kop|money(sign=true) }}</td>
+      <td class="muted tiny">{{ t.provider or '—' }}</td>
+      <td><span class="badge {{ 'badge-green' if t.status == 'success' else 'badge-orange' if t.status == 'pending' else 'badge-red' if t.status == 'failed' else 'badge-gray' }}">{{ t.status }}</span></td>
+      <td class="muted tiny">{{ t.created_at|dt }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="muted">Операций пока нет.</div>{% endif %}
+</div>
+{% endblock %}

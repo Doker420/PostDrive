@@ -25,3 +25,9 @@ sessions_export.txt
 # Tests scratch
 _smoke.py
 bot_debug.log
+
+# РУПОР (веб-площадка)
+rupor/.venv/
+rupor/data/
+rupor/.env
+rupor/__pycache__/

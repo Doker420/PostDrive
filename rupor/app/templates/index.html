@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% from "macros.html" import listing_card %}
+{% block title %}{{ APP_NAME }} — биржа рекламы Telegram и VK{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <div class="hero-text">
+    <div class="hero-badge">🚀 Биржа рекламы для RU-сегмента</div>
+    <h1>Реклама в Telegram и VK<br><span class="grad">напрямую от владельцев</span></h1>
+    <p class="hero-sub">
+      Каналы, чаты и боты с открытыми ценами. Никаких менеджеров и переписок
+      «сколько стоит?» — выбирайте площадку, бронируйте размещение,
+      деньги удерживаются в эскроу до подтверждения результата.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary btn-lg" href="/catalog">Смотреть каталог</a>
+      <a class="btn btn-outline btn-lg" href="/register">Разместить площадку</a>
+    </div>
+    <div class="hero-stats">
+      <div><b>{{ stats.listings|subs }}</b><span>площадок</span></div>
+      <div><b>{{ stats.subscribers|subs }}</b><span>суммарный охват</span></div>
+      <div><b>{{ stats.owners|subs }}</b><span>владельцев</span></div>
+      <div><b>{{ stats.orders|subs }}</b><span>размещений</span></div>
+    </div>
+  </div>
+  <div class="hero-side">
+    <div class="hero-card">
+      <div class="hero-card-title">Как работает эскроу</div>
+      <ol class="steps">
+        <li>Рекламодатель пополняет баланс</li>
+        <li>Бронирует размещение — деньги замораживаются</li>
+        <li>Владелец публикует рекламу</li>
+        <li>Рекламодатель принимает работу — владелец получает оплату</li>
+      </ol>
+      <div class="hero-card-note">Комиссия площадки — {{ COMMISSION_PCT|int }}% только с завершённых заказов</div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Категории</h2>
+    <a class="muted" href="/catalog">все площадки →</a>
+  </div>
+  <div class="cat-grid">
+    {% for c in categories %}
+    <a class="cat-card" href="/catalog?category={{ c.id }}">
+      <span class="cat-emoji">{{ c.emoji }}</span>
+      <span class="cat-name">{{ c.name }}</span>
+      <span class="cat-cnt muted">{{ c.cnt }}</span>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Топ площадок</h2>
+    <a class="muted" href="/catalog?sort=subs_desc">весь каталог →</a>
+  </div>
+  {% if featured %}
+  <div class="grid listings-grid">
+    {% for l in featured %}{{ listing_card(l) }}{% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">Пока нет активных площадок — <a href="/register">будьте первым</a>!</div>
+  {% endif %}
+</section>
+
+<section class="section features">
+  <div class="feature">
+    <div class="feature-ico">🔍</div>
+    <h3>Честная фильтрация</h3>
+    <p>Платформа, тип, категория, охват, цена и вовлечённость — находите аудиторию за минуту.</p>
+  </div>
+  <div class="feature">
+    <div class="feature-ico">🛡️</div>
+    <h3>Эскроу-защита</h3>
+    <p>Деньги замораживаются до подтверждения размещения. Спор решает арбитраж площадки.</p>
+  </div>
+  <div class="feature">
+    <div class="feature-ico">💰</div>
+    <h3>Удобная оплата</h3>
+    <p>Пополнение CryptoBot, xRocket и ЮMoney. Внутренний баланс и полная история операций.</p>
+  </div>
+  <div class="feature">
+    <div class="feature-ico">⭐</div>
+    <h3>Отзывы после заказов</h3>
+    <p>Рейтинги оставляют только те, кто реально оплатил размещение. Никаких накруток.</p>
+  </div>
+</section>
+
+{% if DEMO_PAYMENTS %}
+<div class="demo-note">⚙️ <b>Демо-режим платежей:</b> ключи CryptoBot / xRocket / ЮMoney не заданы,
+пополнение работает на «виртуальные» деньги для теста. Настройте токены в <code>.env</code>.</div>
+{% endif %}
+{% endblock %}

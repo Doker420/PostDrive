@@ -1,0 +1,71 @@
+{% extends "lk/base.html" %}
+{% from "macros.html" import status_badge %}
+{% block active_tab %}orders{% endblock %}
+{% block lk %}
+<h1>Мои закупки рекламы</h1>
+
+{% if orders %}
+{% for o in orders %}
+<div class="card order-card">
+  <div class="order-head">
+    <div>
+      <a class="row-title" href="/listing/{{ o.listing_id }}">{{ o.listing_title }}</a>
+      <div class="muted tiny">
+        Заказ #{{ o.id }} · {{ o.fmt_title }} · {{ o.created_at|dt }}
+      </div>
+    </div>
+    <div class="order-head-right">
+      <div class="order-price">{{ o.price_kop|money }}</div>
+      {{ status_badge(o.status, order_status) }}
+    </div>
+  </div>
+
+  {% if o.status == 'disputed' and o.dispute_reason %}
+    <div class="order-box order-dispute"><b>Причина спора:</b> {{ o.dispute_reason }}</div>
+  {% endif %}
+
+  <details class="order-details">
+    <summary>Материалы и детали заказа</summary>
+    <div class="order-box muted">
+      <div><b>Материалы:</b> {{ o.comment }}</div>
+      <div><b>Владелец площадки:</b> {{ o.owner_name or '—' }}</div>
+      <div><b>Ваш контакт:</b> {{ o.contact }}</div>
+    </div>
+  </details>
+
+  <div class="order-actions">
+    {% if o.status == 'new' %}
+    <form method="post" action="/orders/{{ o.id }}/action">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-outline btn-sm" name="action" value="cancel"
+              onclick="return confirm('Отменить заказ и вернуть деньги на баланс?')">Отменить</button>
+    </form>
+    {% endif %}
+    {% if o.status == 'published' %}
+    <form method="post" action="/orders/{{ o.id }}/action">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-primary btn-sm" name="action" value="complete">✓ Подтвердить размещение</button>
+    </form>
+    <details class="dispute-details">
+      <summary class="btn btn-danger btn-sm">Открыть спор</summary>
+      <form method="post" action="/orders/{{ o.id }}/action" class="dispute-form">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="action" value="dispute">
+        <textarea name="reason" rows="2" placeholder="Что не так с размещением?" required></textarea>
+        <button class="btn btn-danger btn-sm">Отправить в арбитраж</button>
+      </form>
+    </details>
+    {% endif %}
+    {% if o.status == 'completed' %}
+    <a class="btn btn-ghost btn-sm" href="/listing/{{ o.listing_id }}">Оставить отзыв →</a>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% else %}
+<div class="card empty">
+  Вы ещё не заказывали рекламу.<br>
+  <a class="btn btn-primary" href="/catalog">Перейти в каталог →</a>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,55 @@
+{% extends "lk/base.html" %}
+{% from "macros.html" import status_badge, platform_badge %}
+{% block active_tab %}listings{% endblock %}
+{% block lk %}
+<div class="card-head">
+  <h1>Мои площадки</h1>
+  <a class="btn btn-primary" href="/lk/listings/new">+ Добавить площадку</a>
+</div>
+
+{% if listings %}
+<div class="card">
+  <table class="table">
+    <tr><th>Площадка</th><th>Охват</th><th>Цены от</th><th>Просмотры</th><th>Статус</th><th></th></tr>
+    {% for l in listings %}
+    <tr>
+      <td>
+        <a class="row-title" href="/listing/{{ l.id }}">{{ l.title }}</a>
+        <div class="muted tiny">{{ platform_badge(l) }}{% if l.category_name %} · {{ l.category_name }}{% endif %}</div>
+        {% if l.status == 'rejected' and l.reject_reason %}
+          <div class="red tiny">Причина отклонения: {{ l.reject_reason }}</div>
+        {% endif %}
+      </td>
+      <td>{{ l.subscribers|subs }}</td>
+      <td>{{ l.price_from|money }}</td>
+      <td>{{ l.views|subs }}</td>
+      <td>{{ status_badge(l.status, listing_status) }}</td>
+      <td class="row-actions">
+        <div class="row-actions-in">
+          <a class="btn btn-ghost btn-sm" href="/lk/listings/{{ l.id }}/edit">Изменить</a>
+          <form method="post" action="/lk/listings/{{ l.id }}/status">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            {% if l.status == 'active' %}
+              <button class="btn btn-outline btn-sm" name="action" value="pause">Пауза</button>
+            {% elif l.status == 'paused' %}
+              <button class="btn btn-outline btn-sm" name="action" value="resume">Включить</button>
+            {% endif %}
+            {% if l.status != 'pending' %}
+              <button class="btn btn-danger btn-sm" name="action" value="delete"
+                      onclick="return confirm('Удалить площадку?')">Удалить</button>
+            {% endif %}
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% else %}
+<div class="card empty">
+  У вас ещё нет площадок.<br>
+  Добавьте канал, чат или бот — и начните получать заказы на рекламу.
+  <div><a class="btn btn-primary" href="/lk/listings/new">+ Добавить площадку</a></div>
+</div>
+{% endif %}
+{% endblock %}

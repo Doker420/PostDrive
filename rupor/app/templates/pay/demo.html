@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Демо-оплата — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="card auth-card demo-pay">
+    <div class="demo-stripe">DEMO MODE</div>
+    <h1>{{ provider.icon }} {{ provider.title }}</h1>
+    <p class="muted">Ключи этого провайдера не настроены, поэтому оплата эмулируется.
+       В боевом режиме вы бы сейчас перешли к провайдеру.</p>
+    <div class="demo-amount">{{ tx.amount_kop|money }}</div>
+    <div class="muted tiny">Пополнение баланса #{{ tx.id }} · {{ tx.created_at|dt }}</div>
+    <form method="post" action="/pay/demo/{{ tx.id }}/confirm">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-primary btn-lg btn-block">Оплатить (демо)</button>
+    </form>
+    <a class="btn btn-ghost btn-block" href="/lk/balance">Отменить</a>
+  </div>
+</div>
+{% endblock %}

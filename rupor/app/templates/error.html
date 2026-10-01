@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Ошибка {{ code }} — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="empty big-empty">
+  <div class="big-code">{{ code }}</div>
+  <p>{{ message }}</p>
+  <a class="btn btn-primary" href="/">На главную</a>
+</div>
+{% endblock %}

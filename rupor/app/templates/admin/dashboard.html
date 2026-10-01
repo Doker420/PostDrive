@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% from "macros.html" import status_badge %}
+{% block title %}Админ — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="card-head">
+  <h1>🛡️ Админ-панель</h1>
+  <nav class="admin-nav">
+    <a class="btn btn-ghost btn-sm" href="/">На сайт</a>
+    <a class="btn btn-ghost btn-sm" href="/admin/users">Пользователи</a>
+    <a class="btn btn-ghost btn-sm" href="/admin/transactions">Транзакции</a>
+  </nav>
+</div>
+
+<div class="lk-cards">
+  <div class="lk-stat card"><div class="muted tiny">Пользователей</div><div class="lk-stat-num">{{ stats.users }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">Активных площадок</div><div class="lk-stat-num">{{ stats.listings_active }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">На модерации</div><div class="lk-stat-num">{{ stats.listings_pending }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">Заказов</div><div class="lk-stat-num">{{ stats.orders }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">Оборот (завершённые)</div><div class="lk-stat-num">{{ stats.gmv_kop|money }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">Доход с комиссии</div><div class="lk-stat-num">{{ stats.commission_kop|money }}</div></div>
+  <div class="lk-stat card"><div class="muted tiny">Пополнено всего</div><div class="lk-stat-num">{{ stats.deposits_kop|money }}</div></div>
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Очередь модерации ({{ pending|length }})</h2></div>
+  {% if pending %}
+  <table class="table">
+    <tr><th>Площадка</th><th>Владелец</th><th>Охват</th><th>Цены</th><th></th></tr>
+    {% for l in pending %}
+    <tr>
+      <td>
+        <a class="row-title" href="/listing/{{ l.id }}">{{ l.title }}</a>
+        <div class="muted tiny">{{ PLATFORM_TITLES[l.platform] }} · {{ l.link }}</div>
+        {% if l.description %}<div class="muted tiny desc-cut">{{ l.description[:140] }}…</div>{% endif %}
+      </td>
+      <td class="muted tiny">{{ l.owner_email }}</td>
+      <td>{{ l.subscribers|subs }}{% if l.err %}<div class="muted tiny">ER {{ l.err }}%</div>{% endif %}</td>
+      <td class="tiny">
+        {% for f in l.formats %}{{ f.title }}: {{ f.price|money }}<br>{% endfor %}
+      </td>
+      <td>
+        <div class="row-actions-in">
+          <form method="post" action="/admin/listings/{{ l.id }}/moderate">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button class="btn btn-primary btn-sm" name="action" value="approve">Одобрить</button>
+          </form>
+          <details class="dispute-details">
+            <summary class="btn btn-danger btn-sm">Отклонить</summary>
+            <form method="post" action="/admin/listings/{{ l.id }}/moderate" class="dispute-form">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="action" value="reject">
+              <input type="text" name="reason" placeholder="Причина" required>
+              <button class="btn btn-danger btn-sm">Отклонить</button>
+            </form>
+          </details>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="muted">Очередь пуста 👌</div>{% endif %}
+</div>
+
+<div class="card">
+  <div class="card-head"><h2>Споры ({{ disputes|length }})</h2></div>
+  {% if disputes %}
+  <table class="table">
+    <tr><th>Заказ</th><th>Покупатель</th><th>Причина</th><th>Сумма</th><th>Решение</th></tr>
+    {% for o in disputes %}
+    <tr>
+      <td>#{{ o.id }}<div class="tiny"><a href="/listing/{{ o.listing_id }}">{{ o.listing_title }}</a></div></td>
+      <td class="tiny">{{ o.buyer_email }}</td>
+      <td class="tiny">{{ o.dispute_reason }}</td>
+      <td>{{ o.price_kop|money }}</td>
+      <td>
+        <form method="post" action="/admin/orders/{{ o.id }}/resolve" class="inline-forms">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button class="btn btn-outline btn-sm" name="decision" value="refund">Вернуть покупателю</button>
+          <button class="btn btn-primary btn-sm" name="decision" value="payout">Выплатить владельцу</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="muted">Активных споров нет.</div>{% endif %}
+</div>
+{% endblock %}

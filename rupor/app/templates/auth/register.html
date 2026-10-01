@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Регистрация — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="card auth-card">
+    <h1>Регистрация</h1>
+    <p class="muted">Один аккаунт — и для владельца площадок, и для рекламодателя</p>
+    <form method="post" action="/register">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div class="field">
+        <label>Имя или название команды</label>
+        <input type="text" name="name" placeholder="Иван / MediaTeam" required>
+      </div>
+      <div class="field">
+        <label>E-mail</label>
+        <input type="email" name="email" required placeholder="you@example.com">
+      </div>
+      <div class="field">
+        <label>Пароль (мин. 8 символов)</label>
+        <input type="password" name="password" required minlength="8" placeholder="••••••••">
+      </div>
+      <div class="field">
+        <label>Telegram username <span class="muted tiny">(необязательно)</span></label>
+        <input type="text" name="tg_username" placeholder="@username">
+      </div>
+      <div class="field">
+        <label>Ссылка на VK <span class="muted tiny">(необязательно)</span></label>
+        <input type="text" name="vk_url" placeholder="https://vk.com/...">
+      </div>
+      <button class="btn btn-primary btn-lg btn-block">Создать аккаунт</button>
+    </form>
+    <div class="auth-alt muted">Уже есть аккаунт? <a href="/login">Войти</a></div>
+  </div>
+</div>
+{% endblock %}

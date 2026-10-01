@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% from "macros.html" import listing_card, pagination %}
+{% block title %}Каталог площадок — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="catalog-head">
+  <h1>Каталог площадок</h1>
+  <div class="muted">Найдено: <b>{{ total|subs }}</b></div>
+</div>
+
+<form class="filters card" method="get" action="/catalog">
+  <div class="filters-row">
+    <div class="field field-search">
+      <label>Поиск</label>
+      <input type="text" name="q" value="{{ filters.q }}" placeholder="Название, @username, описание…">
+    </div>
+    <div class="field">
+      <label>Платформа</label>
+      <select name="platform">
+        <option value="">Любая</option>
+        <option value="telegram" {% if filters.platform == 'telegram' %}selected{% endif %}>Telegram</option>
+        <option value="vk" {% if filters.platform == 'vk' %}selected{% endif %}>VK</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Тип</label>
+      <select name="kind">
+        <option value="">Любой</option>
+        <option value="channel" {% if filters.kind == 'channel' %}selected{% endif %}>Канал / сообщество</option>
+        <option value="chat" {% if filters.kind == 'chat' %}selected{% endif %}>Чат / беседа</option>
+        <option value="bot" {% if filters.kind == 'bot' %}selected{% endif %}>Бот</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Категория</label>
+      <select name="category">
+        <option value="">Все категории</option>
+        {% for c in categories %}
+        <option value="{{ c.id }}" {% if filters.category == c.id|string %}selected{% endif %}>{{ c.emoji }} {{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+  <div class="filters-row">
+    <div class="field"><label>Цена от, ₽</label><input type="number" min="0" name="price_min" value="{{ filters.price_min }}" placeholder="0"></div>
+    <div class="field"><label>Цена до, ₽</label><input type="number" min="0" name="price_max" value="{{ filters.price_max }}" placeholder="∞"></div>
+    <div class="field"><label>Подписчиков от</label><input type="number" min="0" name="subs_min" value="{{ filters.subs_min }}" placeholder="0"></div>
+    <div class="field"><label>Подписчиков до</label><input type="number" min="0" name="subs_max" value="{{ filters.subs_max }}" placeholder="∞"></div>
+    <div class="field field-grow">
+      <label>Сортировка</label>
+      <select name="sort">
+        {% for key, s in sorts.items() %}
+        <option value="{{ key }}" {% if filters.sort == key %}selected{% endif %}>{{ s[0] }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field field-btn">
+      <button class="btn btn-primary" type="submit">Применить</button>
+      <a class="btn btn-ghost" href="/catalog">Сброс</a>
+    </div>
+  </div>
+</form>
+
+{% if listings %}
+<div class="grid listings-grid">
+  {% for l in listings %}{{ listing_card(l) }}{% endfor %}
+</div>
+{{ pagination(page, pages, filters) }}
+{% else %}
+<div class="empty">
+  По вашим фильтрам ничего не найдено.<br>
+  Попробуйте расширить условия или <a href="/catalog">сбросить фильтры</a>.
+</div>
+{% endif %}
+{% endblock %}

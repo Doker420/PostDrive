@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ APP_NAME }} — {{ APP_TAGLINE }}{% endblock %}</title>
+<meta name="description" content="{{ APP_NAME }} — биржа рекламы: каналы, чаты и боты Telegram и VK. Прозрачные цены, эскроу-оплата, честная статистика.">
+<link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="container topbar-in">
+    <a class="logo" href="/">
+      <img src="/static/logo.svg" alt="" class="logo-img">
+      <span class="logo-text">{{ APP_NAME }}</span>
+    </a>
+    <nav class="nav">
+      <a href="/catalog" class="nav-link">Каталог</a>
+      <a href="/catalog?platform=telegram" class="nav-link">Telegram</a>
+      <a href="/catalog?platform=vk" class="nav-link">VK</a>
+      <a href="/how" class="nav-link">Как это работает</a>
+    </nav>
+    <div class="topbar-right">
+      {% if user %}
+        <a href="/lk/balance" class="balance-chip" title="Внутренний баланс">
+          <span class="balance-ico">₽</span>{{ user.balance_kop|money }}
+        </a>
+        <a href="/lk" class="btn btn-ghost btn-sm">Личный кабинет</a>
+        {% if user.is_admin %}<a href="/admin" class="btn btn-outline btn-sm">Админ</a>{% endif %}
+      {% else %}
+        <a href="/login" class="btn btn-ghost btn-sm">Войти</a>
+        <a href="/register" class="btn btn-primary btn-sm">Регистрация</a>
+      {% endif %}
+    </div>
+  </div>
+</header>
+
+{% if flash_msg %}
+<div class="container">
+  <div class="flash flash-{{ flash_msg.kind }}">{{ flash_msg.message }}</div>
+</div>
+{% endif %}
+
+<main class="container main">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="footer">
+  <div class="container footer-in">
+    <div>
+      <div class="logo-text small">{{ APP_NAME }} <span class="muted">— {{ APP_TAGLINE }}</span></div>
+      <div class="muted tiny">© 2026 {{ APP_NAME }}. Реклама Telegram и VK без посредников.</div>
+    </div>
+    <nav class="footer-nav">
+      <a href="/catalog">Каталог площадок</a>
+      <a href="/how">Правила и гарантии</a>
+      <a href="/register">Разместить площадку</a>
+    </nav>
+  </div>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,89 @@
+{% extends "lk/base.html" %}
+{% from "macros.html" import status_badge %}
+{% block active_tab %}dashboard{% endblock %}
+{% block lk %}
+
+<div class="lk-cards">
+  <div class="lk-stat card">
+    <div class="muted tiny">Баланс</div>
+    <div class="lk-stat-num">{{ user.balance_kop|money }}</div>
+    <a href="/lk/balance" class="tiny">пополнить →</a>
+  </div>
+  <div class="lk-stat card">
+    <div class="muted tiny">Активных площадок</div>
+    <div class="lk-stat-num">{{ stats.active }}</div>
+    {% if stats.pending %}<div class="tiny">{{ stats.pending }} на модерации</div>{% endif %}
+  </div>
+  <div class="lk-stat card">
+    <div class="muted tiny">Заработано</div>
+    <div class="lk-stat-num">{{ stats.earned|money }}</div>
+    <div class="tiny muted">после комиссии</div>
+  </div>
+  <div class="lk-stat card">
+    <div class="muted tiny">Потрачено на рекламу</div>
+    <div class="lk-stat-num">{{ stats.spent|money }}</div>
+  </div>
+</div>
+
+<div class="lk-grid">
+  <div class="card">
+    <div class="card-head">
+      <h2>Последние продажи</h2>
+      <a href="/lk/sales" class="muted tiny">все →</a>
+    </div>
+    {% if sales %}
+    <table class="table">
+      <tr><th>Площадка</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr>
+      {% for o in sales %}
+      <tr>
+        <td>{{ o.listing_title }}<div class="muted tiny">{{ o.fmt_title if o.fmt_title else '' }}</div></td>
+        <td>{{ o.price_kop|money }}</td>
+        <td>{{ status_badge(o.status, order_status) }}</td>
+        <td class="muted tiny">{{ o.created_at|dt }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}<div class="muted">Продаж пока нет. Добавьте площадку в каталог!</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>Последние закупки</h2>
+      <a href="/lk/orders" class="muted tiny">все →</a>
+    </div>
+    {% if purchases %}
+    <table class="table">
+      <tr><th>Площадка</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr>
+      {% for o in purchases %}
+      <tr>
+        <td>{{ o.listing_title }}</td>
+        <td>{{ o.price_kop|money }}</td>
+        <td>{{ status_badge(o.status, order_status) }}</td>
+        <td class="muted tiny">{{ o.created_at|dt }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}<div class="muted">Закупок пока нет. <a href="/catalog">Выбрать площадку →</a></div>{% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>Последние операции по балансу</h2>
+    <a href="/lk/balance" class="muted tiny">все →</a>
+  </div>
+  {% if txs %}
+  <table class="table">
+    <tr><th>Операция</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr>
+    {% for t in txs %}
+    <tr>
+      <td>{{ t.comment }}</td>
+      <td class="{{ 'green' if t.amount_kop > 0 else 'red' }}">{{ t.amount_kop|money(sign=true) }}</td>
+      <td><span class="badge {{ 'badge-green' if t.status == 'success' else 'badge-orange' if t.status == 'pending' else 'badge-gray' }}">{{ t.status }}</span></td>
+      <td class="muted tiny">{{ t.created_at|dt }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<div class="muted">Операций пока нет.</div>{% endif %}
+</div>
+{% endblock %}

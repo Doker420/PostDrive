@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Личный кабинет — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="lk-layout">
+  <aside class="lk-side card">
+    <div class="lk-user">
+      <div class="avatar avatar-lg">{{ (user.name or user.email)[:1]|upper }}</div>
+      <div>
+        <b>{{ user.name or 'Пользователь' }}</b>
+        <div class="muted tiny">{{ user.email }}</div>
+      </div>
+    </div>
+    <div class="lk-balance">
+      <div class="muted tiny">Баланс</div>
+      <div class="lk-balance-num">{{ user.balance_kop|money }}</div>
+      <a class="btn btn-primary btn-sm btn-block" href="/lk/balance">Пополнить</a>
+    </div>
+    <nav class="lk-nav">
+      <a href="/lk" class="{{ 'active' if self.active_tab() == 'dashboard' }}">📊 Обзор</a>
+      <a href="/lk/listings" class="{{ 'active' if self.active_tab() == 'listings' }}">📢 Мои площадки</a>
+      <a href="/lk/sales" class="{{ 'active' if self.active_tab() == 'sales' }}">💼 Продажи</a>
+      <a href="/lk/orders" class="{{ 'active' if self.active_tab() == 'orders' }}">🎯 Мои закупки</a>
+      <a href="/lk/balance" class="{{ 'active' if self.active_tab() == 'balance' }}">💰 Баланс</a>
+      {% if user.is_admin %}<hr><a href="/admin" class="admin-link">🛡️ Админ-панель</a>{% endif %}
+    </nav>
+    <a class="muted tiny logout" href="/logout">Выйти</a>
+  </aside>
+  <div class="lk-content">
+    {% block lk %}{% endblock %}
+  </div>
+</div>
+{% endblock %}

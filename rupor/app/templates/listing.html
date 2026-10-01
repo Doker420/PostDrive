@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% from "macros.html" import platform_badge, status_badge %}
+{% block title %}{{ l.title }} — реклама — {{ APP_NAME }}{% endblock %}
+{% block content %}
+
+<div class="breadcrumbs muted tiny">
+  <a href="/">Главная</a> / <a href="/catalog">Каталог</a>
+  {% if l.category_id %} / <a href="/catalog?category={{ l.category_id }}">{{ l.category_emoji }} {{ l.category_name }}</a>{% endif %}
+  / {{ l.title }}
+</div>
+
+<div class="listing-layout">
+  <div class="listing-main">
+    <div class="card listing-head">
+      <div class="listing-head-top">
+        {{ platform_badge(l) }}
+        {% if l.verified %}<span class="pbadge pbadge-verified">✔ Подтверждена администрацией</span>{% endif %}
+        {% if l.status == 'paused' %}<span class="badge badge-gray">На паузе</span>{% endif %}
+      </div>
+      <h1>{{ l.title }}</h1>
+      <div class="listing-link">
+        <a href="{{ l.link if l.link.startswith('http') else 'https://t.me/' + l.link.lstrip('@') }}"
+           target="_blank" rel="nofollow noopener" class="link-external">{{ l.link }}</a>
+      </div>
+      <div class="listing-nums">
+        <div class="stat"><div class="stat-num">{{ l.subscribers|subs }}</div><div class="stat-label">подписчиков</div></div>
+        {% if l.err %}<div class="stat"><div class="stat-num">{{ l.err }}%</div><div class="stat-label">вовлечённость (ER)</div></div>{% endif %}
+        <div class="stat"><div class="stat-num">{{ l.views|subs }}</div><div class="stat-label">просмотров страницы</div></div>
+        {% if rating_avg %}
+        <div class="stat"><div class="stat-num">⭐ {{ '%.1f'|format(rating_avg) }}</div><div class="stat-label">{{ reviews|length }} отзыв(ов)</div></div>
+        {% else %}
+        <div class="stat"><div class="stat-num">—</div><div class="stat-label">отзывов пока нет</div></div>
+        {% endif %}
+      </div>
+      {% if l.description %}
+      <div class="listing-desc">{{ l.description|replace('\n', '<br>')|safe }}</div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Отзывы о площадке</h2>
+      {% if reviews %}
+      <div class="reviews">
+        {% for r in reviews %}
+        <div class="review">
+          <div class="review-head">
+            <b>{{ r.author_name or 'Пользователь' }}</b>
+            <span class="stars">{% for _ in range(r.rating) %}★{% endfor %}<span class="stars-off">{% for _ in range(5 - r.rating) %}★{% endfor %}</span></span>
+            <span class="muted tiny">{{ r.created_at|dt }}</span>
+          </div>
+          {% if r.text %}<div class="review-text">{{ r.text }}</div>{% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="muted">Пока нет отзывов. Отзывы могут оставлять только рекламодатели с завершённым заказом.</div>
+      {% endif %}
+
+      {% if can_review %}
+      <form class="review-form" method="post" action="/listing/{{ l.id }}/review">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <h3>Оставить отзыв</h3>
+        <div class="field"><label>Оценка</label>
+          <select name="rating">
+            <option value="5">⭐⭐⭐⭐⭐ Отлично</option>
+            <option value="4">⭐⭐⭐⭐ Хорошо</option>
+            <option value="3">⭐⭐⭐ Нормально</option>
+            <option value="2">⭐⭐ Плохо</option>
+            <option value="1">⭐ Ужасно</option>
+          </select>
+        </div>
+        <div class="field"><label>Комментарий</label>
+          <textarea name="text" rows="3" placeholder="Как прошло размещение? Соблюдены ли сроки и условия?"></textarea>
+        </div>
+        <button class="btn btn-primary">Отправить отзыв</button>
+      </form>
+      {% elif not user %}
+      <div class="muted tiny">Войдите, чтобы оставлять отзывы после завершённых заказов.</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <aside class="listing-side">
+    <div class="card buy-card">
+      <h2 class="card-title">Прайс на размещение</h2>
+      {% if l.formats %}
+      <form method="post" action="/order">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="listing_id" value="{{ l.id }}">
+        <div class="formats">
+          {% for f in l.formats %}
+          <label class="format-row">
+            <input type="radio" name="fmt" value="{{ f.code }}" {% if loop.first %}checked{% endif %}>
+            <span class="format-title">{{ f.title }}<span class="muted tiny"> · {{ f.hint }}</span></span>
+            <span class="format-price">{{ f.price|money }}</span>
+          </label>
+          {% endfor %}
+        </div>
+
+        {% if user and not is_owner %}
+          {% if l.status == 'active' %}
+          <div class="field">
+            <label>Рекламные материалы и условия</label>
+            <textarea name="comment" rows="4" placeholder="Что публикуем: текст, ссылки, креативы, желаемая дата и время выхода…"></textarea>
+          </div>
+          <div class="field">
+            <label>Контакт для связи</label>
+            <input type="text" name="contact" placeholder="@username, e-mail или телефон">
+          </div>
+          <button class="btn btn-primary btn-lg btn-block">Забронировать размещение</button>
+          <div class="muted tiny escrow-note">🛡️ Оплата уходит в эскроу и переводится владельцу только после вашего подтверждения.</div>
+          {% else %}
+          <div class="muted">Площадка сейчас на паузе — заказы не принимаются.</div>
+          {% endif %}
+        {% elif is_owner %}
+          <div class="muted">Это ваша площадка. <a href="/lk/listings">Управлять</a></div>
+        {% else %}
+          <a class="btn btn-primary btn-lg btn-block" href="/login?next=/listing/{{ l.id }}">Войти и заказать</a>
+        {% endif %}
+      </form>
+      {% else %}
+      <div class="muted">Владелец пока не указал цены.</div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2 class="card-title">Владелец</h2>
+      <div class="owner-row">
+        <div class="avatar">{{ (l.owner_name or '?')[:1]|upper }}</div>
+        <div>
+          <b>{{ l.owner_name or 'Владелец' }}</b>
+          {% if l.owner_tg %}<div class="muted tiny">@{{ l.owner_tg }}</div>{% endif %}
+        </div>
+      </div>
+      <div class="muted tiny">Все расчёты идут через площадку — не переводите деньги владельцу напрямую.</div>
+    </div>
+  </aside>
+</div>
+{% endblock %}

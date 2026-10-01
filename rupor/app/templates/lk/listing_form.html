@@ -1,0 +1,90 @@
+{% extends "lk/base.html" %}
+{% block active_tab %}listings{% endblock %}
+{% block lk %}
+<div class="card-head">
+  <h1>{{ 'Редактирование площадки' if l else 'Новая площадка' }}</h1>
+  <a class="btn btn-ghost" href="/lk/listings">← К списку</a>
+</div>
+
+<form class="card form" method="post" action="{{ action }}">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+
+  <div class="form-row">
+    <div class="field">
+      <label>Платформа *</label>
+      <select name="platform" required>
+        <option value="telegram" {% if l and l.platform == 'telegram' %}selected{% endif %}>Telegram</option>
+        <option value="vk" {% if l and l.platform == 'vk' %}selected{% endif %}>VK</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Тип площадки *</label>
+      <select name="kind" required>
+        <option value="channel" {% if l and l.kind == 'channel' %}selected{% endif %}>Канал / сообщество</option>
+        <option value="chat" {% if l and l.kind == 'chat' %}selected{% endif %}>Чат / беседа</option>
+        <option value="bot" {% if l and l.kind == 'bot' %}selected{% endif %}>Бот / приложение</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Категория *</label>
+      <select name="category_id" required>
+        <option value="">— выберите —</option>
+        {% for c in categories %}
+        <option value="{{ c.id }}" {% if l and l.category_id == c.id %}selected{% endif %}>{{ c.emoji }} {{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </div>
+
+  <div class="form-row">
+    <div class="field field-grow">
+      <label>Название площадки *</label>
+      <input type="text" name="title" required maxlength="100"
+             value="{{ l.title if l else '' }}" placeholder="Например: Крипто-новости СНГ">
+    </div>
+    <div class="field field-grow">
+      <label>Ссылка * <span class="muted tiny">@username или https://…</span></label>
+      <input type="text" name="link" required
+             value="{{ l.link if l else '' }}" placeholder="@mychannel или https://vk.com/mygroup">
+    </div>
+  </div>
+
+  <div class="form-row">
+    <div class="field">
+      <label>Подписчиков / участников *</label>
+      <input type="number" name="subscribers" required min="0"
+             value="{{ l.subscribers if l else '' }}" placeholder="25000">
+    </div>
+    <div class="field">
+      <label>Вовлечённость (ER), % <span class="muted tiny">охваты/подписчики</span></label>
+      <input type="number" name="err" min="0" max="100" step="0.01"
+             value="{{ l.err if l else '' }}" placeholder="12.5">
+    </div>
+  </div>
+
+  <div class="field">
+    <label>Описание площадки</label>
+    <textarea name="description" rows="5" maxlength="3000"
+      placeholder="Тематика, аудитория, что размещаем / не размещаем, время выхода постов…">{{ l.description if l else '' }}</textarea>
+  </div>
+
+  <h3 class="form-section">Стоимость размещения, ₽ <span class="muted tiny">(заполните нужные форматы — минимум один)</span></h3>
+  <div class="form-row price-grid">
+    {% for code, f in formats.items() %}
+    <div class="field">
+      <label>{{ f.title }}</label>
+      <input type="text" name="{{ f.field }}" inputmode="decimal"
+             value="{{ (l[f.field] / 100)|string|replace('.0','') if l and l[f.field] is not none else '' }}"
+             placeholder="1500">
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="form-note muted tiny">
+    После сохранения площадка (и любые её изменения) проходит модерацию.
+    Указанные цены — публичная оферта: заказы бронируются по ним без торга.
+  </div>
+
+  <button class="btn btn-primary btn-lg">{{ 'Сохранить изменения' if l else 'Отправить на модерацию' }}</button>
+</form>
+{% endblock %}

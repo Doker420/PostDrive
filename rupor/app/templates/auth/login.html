@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Вход — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="auth-wrap">
+  <div class="card auth-card">
+    <h1>Вход</h1>
+    <p class="muted">Войдите в личный кабинет {{ APP_NAME }}</p>
+    <form method="post" action="/login">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="next" value="{{ request.query_params.get('next', '') }}">
+      <div class="field">
+        <label>E-mail</label>
+        <input type="email" name="email" required placeholder="you@example.com" autofocus>
+      </div>
+      <div class="field">
+        <label>Пароль</label>
+        <input type="password" name="password" required placeholder="••••••••">
+      </div>
+      <button class="btn btn-primary btn-lg btn-block">Войти</button>
+    </form>
+    <div class="auth-alt muted">Нет аккаунта? <a href="/register">Зарегистрируйтесь</a></div>
+  </div>
+</div>
+{% endblock %}

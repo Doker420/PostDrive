@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Админ · Пользователи — {{ APP_NAME }}{% endblock %}
+{% block content %}
+<div class="card-head">
+  <h1>🛡️ Пользователи</h1>
+  <nav class="admin-nav">
+    <a class="btn btn-ghost btn-sm" href="/admin">← Панель</a>
+    <a class="btn btn-ghost btn-sm" href="/admin/transactions">Транзакции</a>
+  </nav>
+</div>
+
+<div class="card">
+  <table class="table">
+    <tr><th>Пользователь</th><th>Регистрация</th><th>Площадки</th><th>Заказы</th><th>Баланс</th><th>Действия</th></tr>
+    {% for u in users %}
+    <tr>
+      <td>
+        <b>{{ u.name or '—' }}</b>
+        {% if u.is_admin %}<span class="badge badge-violet">админ</span>{% endif %}
+        {% if u.banned %}<span class="badge badge-red">бан</span>{% endif %}
+        <div class="muted tiny">{{ u.email }}{% if u.tg_username %} · @{{ u.tg_username }}{% endif %}</div>
+      </td>
+      <td class="muted tiny">{{ u.created_at|dt }}</td>
+      <td>{{ u.listings_cnt }}</td>
+      <td>{{ u.orders_cnt }}</td>
+      <td><b>{{ u.balance_kop|money }}</b></td>
+      <td>
+        <div class="row-actions-in">
+          <details class="dispute-details">
+            <summary class="btn btn-outline btn-sm">Баланс ±</summary>
+            <form method="post" action="/admin/users/{{ u.id }}/action" class="dispute-form">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="action" value="adjust">
+              <input type="text" name="amount" placeholder="1000 или -500, ₽" required>
+              <button class="btn btn-primary btn-sm">OK</button>
+            </form>
+          </details>
+          <form method="post" action="/admin/users/{{ u.id }}/action">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            {% if u.banned %}
+            <button class="btn btn-outline btn-sm" name="action" value="unban">Разбанить</button>
+            {% else %}
+            <button class="btn btn-danger btn-sm" name="action" value="ban"
+                    onclick="return confirm('Заблокировать пользователя?')">Бан</button>
+            {% endif %}
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

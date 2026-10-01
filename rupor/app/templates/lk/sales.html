@@ -1,0 +1,67 @@
+{% extends "lk/base.html" %}
+{% from "macros.html" import status_badge %}
+{% block active_tab %}sales{% endblock %}
+{% block lk %}
+<h1>Продажи — заказы на мои площадки</h1>
+
+{% if orders %}
+{% for o in orders %}
+<div class="card order-card">
+  <div class="order-head">
+    <div>
+      <a class="row-title" href="/listing/{{ o.listing_id }}">{{ o.listing_title }}</a>
+      <div class="muted tiny">
+        Заказ #{{ o.id }} · {{ o.fmt_title }} · {{ o.created_at|dt }} ·
+        к выплате {{ (o.price_kop - o.commission_kop)|money }}
+      </div>
+    </div>
+    <div class="order-head-right">
+      <div class="order-price">{{ o.price_kop|money }}</div>
+      {{ status_badge(o.status, order_status) }}
+    </div>
+  </div>
+
+  <div class="order-box">
+    <div><b>Материалы рекламодателя:</b></div>
+    <div class="pre">{{ o.comment }}</div>
+    <div class="order-contacts">
+      <div><b>Покупатель:</b> {{ o.buyer_name or '—' }}{% if o.buyer_tg %} · @{{ o.buyer_tg }}{% endif %} · {{ o.buyer_email }}</div>
+      <div><b>Контакт:</b> {{ o.contact }}</div>
+    </div>
+  </div>
+
+  {% if o.status == 'disputed' and o.dispute_reason %}
+    <div class="order-box order-dispute"><b>Причина спора:</b> {{ o.dispute_reason }}
+      <div class="muted tiny">Спор на рассмотрении арбитража</div></div>
+  {% endif %}
+
+  <div class="order-actions">
+    {% if o.status == 'new' %}
+    <form method="post" action="/orders/{{ o.id }}/action" class="inline-forms">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-primary btn-sm" name="action" value="accept">Принять в работу</button>
+      <button class="btn btn-danger btn-sm" name="action" value="decline"
+              onclick="return confirm('Отклонить заказ? Деньги вернутся рекламодателю.')">Отклонить</button>
+    </form>
+    {% endif %}
+    {% if o.status == 'accepted' %}
+    <form method="post" action="/orders/{{ o.id }}/action">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button class="btn btn-primary btn-sm" name="action" value="publish">✓ Реклама размещена</button>
+    </form>
+    <div class="muted tiny">Нажмите после фактической публикации поста на площадке.</div>
+    {% endif %}
+    {% if o.status == 'published' %}
+    <div class="muted tiny">Ожидаем подтверждения рекламодателя (после этого придёт выплата).</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% else %}
+<div class="card empty">
+  Заказов пока нет.<br>
+  Добавьте площадки и назначьте конкурентные цены — заказы появятся.
+  <div><a class="btn btn-primary" href="/lk/listings/new">+ Добавить площадку</a></div>
+</div>
+{% endif %}
+{% endblock %}
