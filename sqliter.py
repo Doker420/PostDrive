@@ -524,6 +524,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
             post_text TEXT DEFAULT '',
             post_photo TEXT DEFAULT '',
             post_entities TEXT DEFAULT NULL,
+            postbot_post_id TEXT DEFAULT '',
             parse_mode TEXT DEFAULT 'HTML',
             timeout INTEGER DEFAULT 5,
             spam_status INTEGER DEFAULT 0,
@@ -833,6 +834,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT \'\'')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN post_entities TEXT DEFAULT NULL')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN postbot_post_id TEXT DEFAULT \'\'')
         self._safe_ddl(c, 'CREATE UNIQUE INDEX IF NOT EXISTS idx_account_chats_acc_chat ON account_chats(account_id, chat_id)')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_enabled INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN autoresponder_text TEXT DEFAULT \'\'')
@@ -1260,6 +1262,13 @@ class DBConnection(metaclass=_PoolBoundMeta):
 
     def update_account_photo(self, account_id: int, photo: str):
         self.c.execute('UPDATE accounts SET post_photo = ? WHERE id = ?', (photo, account_id))
+        self.conn_ctx.commit()
+
+    def update_account_postbot(self, account_id: int, post_id: str = ''):
+        self.c.execute(
+            'UPDATE accounts SET postbot_post_id = ? WHERE id = ?',
+            (str(post_id or '').strip(), account_id)
+        )
         self.conn_ctx.commit()
 
     def update_account_timeout(self, account_id: int, timeout: int):

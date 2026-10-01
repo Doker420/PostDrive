@@ -13,6 +13,8 @@ def test_persistent_autopost_limits_and_warmup_state():
     try:
         db.get_or_create_user(42)
         account_id = db.add_account(42, "session", account_name="test")
+        db.update_account_postbot(account_id, "63ff0f7189df5")
+        assert db.get_account(account_id)["postbot_post_id"] == "63ff0f7189df5"
         db.configure_autopost_limits(
             account_id, min_delay_seconds=30, max_delay_seconds=60,
             hourly_limit=2, daily_limit=3
@@ -52,6 +54,14 @@ def test_user_safety_guards_are_present():
     assert "await asyncio.wait_for(factory(), timeout=TELEGRAM_CALL_TIMEOUT)" in source
     assert "asyncio.wait_for(collect_one(), timeout=20)" in source
     assert "warmup reaction" in source
+    assert "async def send_via_postbot" in source
+    assert "get_inline_bot_results(POSTBOT_USERNAME, post_id)" in source
+    assert "send_inline_bot_result(target, query_id, result_id)" in source
+
+    handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")
+    assert "📮 Через @PostBot" in handlers
+    assert "set_postbot_" in handlers
+    assert "MassActionStates.WAITING_POSTBOT_ID" in handlers
 
 
 if __name__ == "__main__":

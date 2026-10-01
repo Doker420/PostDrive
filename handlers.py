@@ -150,7 +150,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 
 from sqliter import DBConnection
 from cryptobot import CryptoBotClient
-from user import AccountSessionManager, parse_proxy_string
+from user import AccountSessionManager, normalize_postbot_id, parse_proxy_string
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,7 @@ class AddAccountStates(StatesGroup):
 class AccountPostStates(StatesGroup):
     WAITING_TEXT = State()
     WAITING_PHOTO = State()
+    WAITING_POSTBOT_ID = State()
     WAITING_TIMEOUT = State()
     WAITING_PROXY = State()
 
@@ -270,6 +271,7 @@ class AdminPromoStates(StatesGroup):
 class MassActionStates(StatesGroup):
     SELECTING_ACCOUNTS = State()
     WAITING_TARGETS = State()
+    WAITING_POSTBOT_ID = State()
     WAITING_CUSTOM_TEXT = State()
 
 class InviteStates(StatesGroup):
@@ -1063,10 +1065,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         speed = data.get('spam_speed', 'normal')
         speed_label, speed_hint = SPAM_SPEED_LABELS.get(speed, SPAM_SPEED_LABELS['normal'])
 
+        mode_label = {
+            'post': '📝 Текст из поста',
+            'custom': '✏️ Свой текст',
+            'postbot': f"📮 @PostBot ({data.get('spam_postbot_id', 'ID не задан')})",
+        }.get(mode, '📝 Текст из поста')
         text = (
             f"📨 <b>Рассылка</b>\n\n"
             f"Выбрано аккаунтов: {len(account_ids)}\n"
-            f"Режим: {'📝 Текст из поста' if mode == 'post' else '✏️ Свой текст'}\n"
+            f"Режим: {mode_label}\n"
             f"Скорость: {speed_label} — {speed_hint}\n\n"
             f"Отправьте:\n"
             f"• TXT файл с ID юзеров или username (@username или без)\n"
@@ -1082,6 +1089,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                                                   callback_data=f"spam_speed_{code}"))
         buttons = [
             speed_row,
+            [InlineKeyboardButton(text="📮 Через @PostBot", callback_data="spam_postbot_mode")],
             [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
@@ -1412,6 +1420,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         mode = data.get('spam_mode', 'post')
         custom_text = data.get('custom_spam_text', '')
         custom_entities = data.get('custom_spam_entities', None)
+        postbot_id = data.get('spam_postbot_id', '')
         speed = data.get('spam_speed', 'normal')
         delay_min, delay_max = account_manager.SPAM_SPEEDS.get(
             speed, account_manager.SPAM_SPEEDS['normal'])
@@ -1446,11 +1455,38 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                         account_id, account_targets, bot, user_id,
                         mode=mode, custom_text=custom_text,
                         custom_entities=custom_entities,
-                        delay_min=delay_min, delay_max=delay_max)))
+                        delay_min=delay_min, delay_max=delay_max,
+                        postbot_id=postbot_id)))
 
         await answer_to.answer(
             "✅ Рассылка запущена в фоне. Вы получите уведомления о прогрессе и результате.",
             reply_markup=main_menu_keyboard(user_id))
+
+    @dp.callback_query(F.data == "spam_postbot_mode", MassActionStates.WAITING_TARGETS)
+    async def spam_postbot_mode_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(MassActionStates.WAITING_POSTBOT_ID)
+        await edit_message(
+            callback,
+            "📮 <b>Рассылка через @PostBot</b>\n\n"
+            "Создайте пост в @PostBot и отправьте его ID.\n"
+            "Также принимается строка вида:\n"
+            "<code>[via_bot PostBot 63ff0f7189df5]</code>\n\n"
+            "После сохранения выберите цели рассылки.",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(MassActionStates.WAITING_POSTBOT_ID)
+    async def process_mass_postbot_id(message: Message, state: FSMContext):
+        postbot_id = normalize_postbot_id(message.text or message.caption or '')
+        if not postbot_id:
+            await message.answer(
+                "❌ Не удалось распознать ID @PostBot. Пришлите только ID "
+                "или строку [via_bot PostBot ID]."
+            )
+            return
+        await state.update_data(spam_mode='postbot', spam_postbot_id=postbot_id)
+        await ask_for_spam_targets(message, state)
 
     @dp.callback_query(F.data.startswith("spam_speed_"), MassActionStates.WAITING_TARGETS)
     async def spam_speed_callback(callback: CallbackQuery, state: FSMContext):
@@ -2747,6 +2783,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Телефон:</b> <code>{phone}</code>\n"
             f"• <b>Прокси:</b> <code>{proxy_str}</code>\n"
             f"• <b>Интервал цикла:</b> {account.get('timeout', 5)} мин\n"
+            f"• <b>@PostBot:</b> {account.get('postbot_post_id') or 'не используется'}\n"
             f"• <b>Групп всего:</b> {total_groups} (выбрано для рассылки: {enabled_chats_count})\n"
             f"• <b>Текст поста:</b> {post_text_preview}\n"
             f"• <b>Медиа:</b> {has_photo}"
@@ -5200,13 +5237,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not account:
             await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
+        postbot_id = account.get('postbot_post_id') or ''
+        postbot_status = f"📮 ID: <code>{postbot_id}</code>" if postbot_id else "не настроен"
         text = (
             f"📝 <b>Настройки поста</b> для {account.get('account_name', f'#{account_id}')}\n\n"
             f"Текущий текст: {account.get('post_text', 'Не задан')[:100]}\n"
-            f"Медиа: {'Да' if account.get('post_photo') else 'Нет'}"
+            f"Медиа: {'Да' if account.get('post_photo') else 'Нет'}\n"
+            f"@PostBot: {postbot_status}\n\n"
+            "Для режима @PostBot сначала создайте/сохраните пост в @PostBot, "
+            "затем вставьте выданный ID."
+        )
+        postbot_button = (
+            InlineKeyboardButton(text="🗑 Отключить @PostBot", callback_data=f"del_postbot_{account_id}")
+            if postbot_id else
+            InlineKeyboardButton(text="📮 Настроить через @PostBot", callback_data=f"set_postbot_{account_id}")
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"set_post_text_{account_id}")],
+            [postbot_button],
             [InlineKeyboardButton(text="🖼 Добавить фото", callback_data=f"set_post_photo_{account_id}")],
             [InlineKeyboardButton(text="🗑 Удалить фото", callback_data=f"del_post_photo_{account_id}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
@@ -5220,6 +5268,54 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.update_data(edit_post_account_id=account_id)
         await state.set_state(AccountPostStates.WAITING_TEXT)
         await edit_message(callback, "📝 Введите текст поста:", reply_markup=cancel_inline_keyboard())
+
+    @dp.callback_query(F.data.startswith('set_postbot_'))
+    async def set_postbot_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        account_id = int(callback.data.split('_')[2])
+        account = db.get_account(account_id)
+        if not account or account.get('user_id') != callback.from_user.id:
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        await state.update_data(edit_postbot_account_id=account_id)
+        await state.set_state(AccountPostStates.WAITING_POSTBOT_ID)
+        await edit_message(
+            callback,
+            "📮 <b>Пост через @PostBot</b>\n\n"
+            "Создайте пост в @PostBot и отправьте сюда его ID.\n"
+            "Можно также прислать строку вида:\n"
+            "<code>[via_bot PostBot 63ff0f7189df5]</code>",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(AccountPostStates.WAITING_POSTBOT_ID)
+    async def process_postbot_id(message: Message, state: FSMContext):
+        data = await state.get_data()
+        account_id = data.get('edit_postbot_account_id')
+        postbot_id = normalize_postbot_id(message.text or message.caption or '')
+        if not postbot_id:
+            await message.answer(
+                "❌ Не удалось распознать ID @PostBot. Пришлите только ID "
+                "или строку [via_bot PostBot ID]."
+            )
+            return
+        db.update_account_postbot(account_id, postbot_id)
+        await state.clear()
+        await message.answer(
+            f"✅ Для автопостинга выбран пост @PostBot <code>{postbot_id}</code>.\n"
+            "Теперь запустите автопостинг из панели аккаунта."
+        )
+
+    @dp.callback_query(F.data.startswith('del_postbot_'))
+    async def del_postbot_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        account = db.get_account(account_id)
+        if not account or account.get('user_id') != callback.from_user.id:
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        db.update_account_postbot(account_id, '')
+        await _answer_callback(callback, "✅ Режим @PostBot отключён", show_alert=True)
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.message(AccountPostStates.WAITING_TEXT)
     async def process_post_text(message: Message, state: FSMContext):

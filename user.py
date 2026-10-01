@@ -154,6 +154,25 @@ def _safe_payload_text(value: Any) -> str:
         return ''
 
 
+POSTBOT_USERNAME = 'PostBot'
+_POSTBOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{4,128}$')
+_POSTBOT_MARKER_RE = re.compile(
+    r'(?:\[\s*via_bot\s+@?postbot\s+|@?postbot\s+)([A-Za-z0-9_-]{4,128})',
+    re.IGNORECASE
+)
+
+
+def normalize_postbot_id(value: Any) -> str:
+    """Extract and validate a PostBot post id from UI input or post text."""
+    text = _safe_payload_text(value).strip()
+    if not text:
+        return ''
+    marker = _POSTBOT_MARKER_RE.search(text)
+    candidate = marker.group(1) if marker else text
+    candidate = candidate.strip().strip(']')
+    return candidate if _POSTBOT_ID_RE.fullmatch(candidate) else ''
+
+
 def _is_internal_noise_error(error: BaseException) -> bool:
     """Ошибки транспорта/декодирования для логов, но не для пользователя.
 
@@ -1772,6 +1791,41 @@ class AccountSessionManager:
         if last_err:
             raise last_err
         return None
+
+    async def send_via_postbot(self, client, target, postbot_id: str,
+                               account_id: int, bot=None, user_id: int = None,
+                               notify: bool = False):
+        """Send a saved @PostBot post to one target through inline mode.
+
+        @PostBot exposes saved posts as inline results. Querying and choosing
+        the result through the user session is equivalent to typing
+        ``@PostBot <post_id>`` in the target chat; no Bot API token is used.
+        A fresh inline query is requested for every target because Telegram's
+        query result id is scoped to a single inline query.
+        """
+        post_id = normalize_postbot_id(postbot_id)
+        if not post_id:
+            raise ValueError('invalid PostBot post id')
+        results = await self.tg_call(
+            lambda: client.get_inline_bot_results(POSTBOT_USERNAME, post_id),
+            account_id=account_id, bot=bot, user_id=user_id,
+            description=f'PostBot query -> {target}',
+            max_retries=2, notify=notify, stop_on_flood=True
+        )
+        result_list = getattr(results, 'results', None) if results else None
+        query_id = getattr(results, 'query_id', None) if results else None
+        if not result_list or not query_id:
+            raise TargetSkipError('PostBot не вернул сохранённый пост')
+        selected = result_list[0]
+        result_id = getattr(selected, 'id', None)
+        if not result_id:
+            raise TargetSkipError('PostBot вернул пустой результат')
+        return await self.tg_call(
+            lambda: client.send_inline_bot_result(target, query_id, result_id),
+            account_id=account_id, bot=bot, user_id=user_id,
+            description=f'PostBot send -> {target}',
+            max_retries=2, notify=notify, stop_on_flood=True
+        )
 
     async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
         """Генерирует комментарий. Перебирает провайдеров, пока кто-то не ответит."""
@@ -3543,7 +3597,11 @@ class AccountSessionManager:
             return
 
         cycle_count = 0
-        report_id = db.create_account_report(account_id, user_id, account.get('post_text', ''), account.get('post_photo', ''))
+        configured_postbot_id = normalize_postbot_id(account.get('postbot_post_id', ''))
+        report_text = account.get('post_text', '') or (
+            f"[via_bot PostBot {configured_postbot_id}]" if configured_postbot_id else ''
+        )
+        report_id = db.create_account_report(account_id, user_id, report_text, account.get('post_photo', ''))
         chats_added = set()
         self._bot = bot or self._bot
 
@@ -3588,11 +3646,15 @@ class AccountSessionManager:
 
                 post_text = acc_data.get('post_text', '')
                 post_photo = acc_data.get('post_photo', '')
+                postbot_id = normalize_postbot_id(acc_data.get('postbot_post_id', ''))
+                if not postbot_id and post_text:
+                    marker = _POSTBOT_MARKER_RE.search(_safe_payload_text(post_text))
+                    postbot_id = marker.group(1) if marker else ''
                 post_entities_json = acc_data.get('post_entities')
                 post_parse_mode = acc_data.get('post_parse_mode', 'HTML')
                 timeout_minutes = max(1, acc_data.get('timeout', 5))
 
-                if not post_text:
+                if not post_text and not postbot_id:
                     db.set_account_spam_status(account_id, 0)
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"❌ [{acc_name}] Текст поста не установлен! Настройте пост в меню.")
@@ -3713,7 +3775,13 @@ class AccountSessionManager:
 
                     # Send post - только entities, без parse_mode
                     try:
-                        if post_photo and os.path.exists(post_photo):
+                        if postbot_id:
+                            _sent = await self.send_via_postbot(
+                                client, chat_id_val, postbot_id, account_id,
+                                bot=bot, user_id=user_id,
+                                notify=not notifications_hidden
+                            )
+                        elif post_photo and os.path.exists(post_photo):
                             _sent = await self.tg_call(
                                 lambda: client.send_photo(
                                     chat_id_val,
@@ -4422,7 +4490,8 @@ class AccountSessionManager:
 
     async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int,
                             mode: str = 'post', custom_text: str = '', custom_entities: str = None,
-                            delay_min: int = 30, delay_max: int = 90):
+                            delay_min: int = 30, delay_max: int = 90,
+                            postbot_id: str = ''):
         account = db.get_account(account_id)
         if not account:
             return
@@ -4435,10 +4504,20 @@ class AccountSessionManager:
                 await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось подключиться: {err}")
             return
         
+        postbot_id = normalize_postbot_id(postbot_id)
+        if mode == 'postbot' and not postbot_id:
+            postbot_id = normalize_postbot_id(account.get('postbot_post_id', ''))
         post_text = account.get('post_text', '') if mode == 'post' else custom_text
         post_photo = account.get('post_photo', '') if mode == 'post' else ''
-        
-        if not post_text:
+
+        if mode == 'postbot' and not postbot_id:
+            if bot:
+                await bot.send_message(
+                    user_id,
+                    f"❌ [{acc_name}] Не указан ID поста @PostBot."
+                )
+            return
+        if not post_text and not postbot_id:
             if bot:
                 await bot.send_message(user_id, f"❌ [{acc_name}] Текст поста не установлен!")
             return
@@ -4472,6 +4551,22 @@ class AccountSessionManager:
                 else:
                     continue
                 
+                if postbot_id:
+                    # Inline-пост @PostBot всё равно является исходящей
+                    # публикацией аккаунта: применяем persistent budget и не
+                    # обходим hourly/daily safety limits через другой маршрут.
+                    slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
+                    if not slot_ok and slot_reason == 'minimum_delay':
+                        await asyncio.sleep(max(5, min(slot_wait, 3600)))
+                        slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
+                    if not slot_ok:
+                        errors += 1
+                        logging.warning(
+                            "[%s] PostBot рассылка остановлена лимитом %s (wait=%ss)",
+                            acc_name, slot_reason, slot_wait
+                        )
+                        break
+
                 # Рандомизация текста для каждого получателя:
                 #   {привет|здравствуйте} — случайный вариант (спинтакс)
                 #   {rand}               — случайная строка (антиспам)
@@ -4499,7 +4594,13 @@ class AccountSessionManager:
                 # помечает здоровье аккаунта и останавливает задачу, а битая
                 # цель просто пропускается. Раньше сырые client.send_* ничего
                 # этого не делали — аккаунт молча выгорал.
-                if post_photo and os.path.exists(post_photo) and mode == 'post':
+                if postbot_id:
+                    await self.send_via_postbot(
+                        client, peer, postbot_id, account_id,
+                        bot=bot, user_id=user_id,
+                        notify=not notifications_hidden
+                    )
+                elif post_photo and os.path.exists(post_photo) and mode == 'post':
                     await self.tg_call(
                         lambda: client.send_photo(
                             peer, post_photo, caption=text_to_send,
