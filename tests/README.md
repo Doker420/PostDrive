@@ -10,3 +10,9 @@ python tests/test_pg_adapter.py     # трансляция SQL-диалекта 
 
 `test_pool_threads.py` — регрессионный тест на баг общего курсора: до перехода
 на пул этот сценарий ронял процесс с SIGBUS.
+
+Платёжный flow YooMoney проверяется без реальных секретов и перевода:
+
+```bash
+python tests/test_yoomoney.py
+```

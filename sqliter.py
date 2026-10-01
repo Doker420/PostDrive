@@ -512,6 +512,23 @@ class DBConnection(metaclass=_PoolBoundMeta):
             created_at INTEGER DEFAULT (strftime('%s', 'now'))
         )''')
 
+        # YooMoney P2P payments. The label is returned by the HTTP
+        # notification and is the idempotency key for crediting a tariff.
+        self.c.execute('''CREATE TABLE IF NOT EXISTS yoomoney_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            tariff_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT DEFAULT 'RUB',
+            label TEXT NOT NULL UNIQUE,
+            operation_id TEXT DEFAULT NULL UNIQUE,
+            pay_url TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            paid_at INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+
         # User Telegram accounts (multi-account)
         self.c.execute('''CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1197,6 +1214,148 @@ class DBConnection(metaclass=_PoolBoundMeta):
             self.add_subscription_days(invoice['user_id'], tariff['duration_days'])
         self.conn_ctx.commit()
         return True
+
+    # ==================== YOOMONEY PAYMENTS ====================
+    def create_yoomoney_payment(self, user_id: int, tariff_id: int,
+                                amount_rub: Any, label: str,
+                                pay_url: str = '') -> int:
+        self.c.execute(
+            '''INSERT INTO yoomoney_payments
+               (user_id, tariff_id, amount, currency, label, pay_url, status, created_at)
+               VALUES (?, ?, ?, 'RUB', ?, ?, 'pending', ?)''',
+            (user_id, tariff_id, float(amount_rub), str(label), str(pay_url or ''), int(time.time()))
+        )
+        self.conn_ctx.commit()
+        return self.c.lastrowid
+
+    def get_yoomoney_payment(self, payment_id: int) -> Optional[Dict[str, Any]]:
+        self.c.execute('SELECT * FROM yoomoney_payments WHERE id = ?', (payment_id,))
+        return self._dict_fetchone()
+
+    def get_yoomoney_payment_by_label(self, label: str) -> Optional[Dict[str, Any]]:
+        self.c.execute('SELECT * FROM yoomoney_payments WHERE label = ?', (str(label),))
+        return self._dict_fetchone()
+
+    def mark_yoomoney_payment_paid(self, label: str, operation_id: str,
+                                   amount: Any, currency: str = '') -> Dict[str, Any]:
+        """Verify amount and credit a YooMoney payment exactly once.
+
+        The payment transition, subscription extension and entitlement update
+        intentionally use one database transaction. A webhook retry can then
+        observe either the old pending row or the complete paid state, never a
+        half-credited payment.
+        """
+        from decimal import Decimal, InvalidOperation
+        with self._thread_write_lock:
+            payment = self.get_yoomoney_payment_by_label(label)
+            if not payment:
+                return {'status': 'unknown_label', 'credited': False}
+            if not str(operation_id or '').strip():
+                return {'status': 'invalid_operation', 'credited': False}
+            if str(currency or '') != '643':
+                return {'status': 'amount_mismatch', 'credited': False,
+                        'expected_amount': payment.get('amount')}
+            try:
+                received = Decimal(str(amount)).quantize(Decimal('0.01'))
+                expected = Decimal(str(payment.get('amount'))).quantize(Decimal('0.01'))
+            except (InvalidOperation, TypeError, ValueError):
+                return {'status': 'amount_mismatch', 'credited': False,
+                        'expected_amount': payment.get('amount')}
+            if received != expected:
+                return {'status': 'amount_mismatch', 'credited': False,
+                        'expected_amount': format(expected, '.2f')}
+
+            # Re-read after taking the write lock/transaction. This protects
+            # the transition even when two notification deliveries race.
+            tx = self.conn_ctx
+            try:
+                tx.execute('BEGIN IMMEDIATE' if not dbconfig.IS_POSTGRES else 'BEGIN')
+                payment = self.get_yoomoney_payment_by_label(label)
+                if not payment:
+                    tx.rollback()
+                    return {'status': 'unknown_label', 'credited': False}
+                if payment.get('status') == 'paid':
+                    tx.rollback()
+                    return {'status': 'already_paid', 'credited': False,
+                            'user_id': payment.get('user_id')}
+                self.c.execute(
+                    'SELECT id FROM yoomoney_payments WHERE operation_id = ? AND id != ?',
+                    (str(operation_id), payment.get('id'))
+                )
+                if self.c.fetchone():
+                    tx.rollback()
+                    return {'status': 'duplicate_operation', 'credited': False}
+
+                now = int(time.time())
+                cursor = self.c
+                cursor.execute(
+                    '''UPDATE yoomoney_payments
+                       SET status = 'paid', operation_id = ?, paid_at = ?
+                       WHERE id = ? AND status = 'pending' ''',
+                    (str(operation_id), now, payment.get('id'))
+                )
+                if getattr(cursor, 'rowcount', 1) == 0:
+                    tx.rollback()
+                    return {'status': 'already_paid', 'credited': False,
+                            'user_id': payment.get('user_id')}
+
+                tariff = self.get_tariff(payment.get('tariff_id'))
+                if not tariff:
+                    tx.rollback()
+                    return {'status': 'tariff_missing', 'credited': False}
+
+                # Inline equivalent of add_subscription_days/set_user_tariff;
+                # those public helpers commit independently and therefore
+                # cannot be used inside this idempotent payment transaction.
+                user_id = payment.get('user_id')
+                user_cursor = self.c
+                user_cursor.execute(
+                    'SELECT subscription_until FROM users WHERE user_id = ?', (user_id,)
+                )
+                user_row = user_cursor.fetchone()
+                current_until = 0
+                if user_row is not None:
+                    current_until = user_row[0] if not isinstance(user_row, dict) else user_row.get('subscription_until')
+                try:
+                    current_until = int(current_until or 0)
+                except (TypeError, ValueError):
+                    current_until = 0
+                new_until = max(current_until, now) + int(tariff['duration_days']) * 86400
+                if user_row is None:
+                    user_cursor.execute(
+                        '''INSERT INTO users
+                           (user_id, username, first_name, last_name, subscription_until, is_admin, created_at)
+                           VALUES (?, '', '', '', ?, 0, ?)''',
+                        (user_id, new_until, now)
+                    )
+                else:
+                    user_cursor.execute(
+                        'UPDATE users SET subscription_until = ? WHERE user_id = ?',
+                        (new_until, user_id)
+                    )
+                if tariff.get('code'):
+                    user_cursor.execute(
+                        '''INSERT INTO user_entitlements (user_id, tariff_code, updated_at)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(user_id) DO UPDATE SET
+                           tariff_code = excluded.tariff_code, updated_at = excluded.updated_at''',
+                        (user_id, tariff['code'], now)
+                    )
+                tx.commit()
+                return {
+                    'status': 'paid', 'credited': True,
+                    'user_id': user_id,
+                    'tariff_id': payment.get('tariff_id'),
+                    'tariff_name': tariff.get('name'),
+                    'amount': format(received, '.2f'),
+                    'subscription_until': new_until,
+                }
+            except Exception:
+                try:
+                    tx.rollback()
+                except Exception:
+                    pass
+                raise
 
     # ==================== ACCOUNTS ====================
     def add_account(self, user_id: int, session_string: str, phone: str = "", account_name: str = "", proxy: str = "") -> int:

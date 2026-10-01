@@ -3,8 +3,10 @@
 # Environment variables override config.ini values (recommended for production).
 #
 # Env vars: BOT_TOKEN, BOT_ADMIN, BOT_USERNAME, USER_API_ID, USER_API_HASH,
-#           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, WEBHOOK_DOMAIN, WEBHOOK_PORT,
-#           WEBHOOK_PATH, REDIS_URL
+#           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, REDIS_URL,
+#           YOOMONEY_RECEIVER, YOOMONEY_NOTIFICATION_SECRET, YOOMONEY_TOKEN,
+#           YOOMONEY_RUB_PER_USD, YOOMONEY_WEBHOOK_HOST, YOOMONEY_WEBHOOK_PORT,
+#           YOOMONEY_WEBHOOK_PATH, YOOMONEY_SUCCESS_URL
 # Scaling:  MAX_ACTIVE_CLIENTS, MAX_TASKS_PER_USER, MAX_GLOBAL_TASKS, CLIENT_IDLE_TTL,
 #           SESSION_CHECK_TIMEOUT, CLIENT_START_TIMEOUT, SESSION_CHECK_CONCURRENCY
 
@@ -29,6 +31,20 @@ API_HASH = ВАШ_API_HASH
 [CRYPTOBOT]
 TOKEN = ВАШ_ТОКЕН_КРИПТОБОТА
 TESTNET = False
+
+[YOOMONEY]
+; Receiver wallet. Do not put notification secret or OAuth token in the repository.
+RECEIVER = 4100118544926615
+NOTIFICATION_SECRET =
+TOKEN =
+; RUB amount is calculated from the tariff's USD price using this rate.
+RUB_PER_USD = 100
+; YooMoney HTTP notification URL: https://your-domain.example/yoomoney/webhook
+WEBHOOK_HOST = 0.0.0.0
+WEBHOOK_PORT = 8012
+WEBHOOK_PATH = /yoomoney/webhook
+; Optional URL to return to after the QuickPay form. Leave empty if unused.
+SUCCESS_URL =
 
 [WEBHOOK]
 DOMAIN =ВАШ_ДОМЕН

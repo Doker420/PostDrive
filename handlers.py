@@ -151,6 +151,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from sqliter import DBConnection
 from cryptobot import CryptoBotClient
 from user import AccountSessionManager, normalize_postbot_id, parse_proxy_string
+from yoomoney import build_payment_url, make_label, usd_to_rub
 
 logger = logging.getLogger(__name__)
 
@@ -572,6 +573,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     TERMS_URL = config.get('TERMS_URL', '')
     PRIVACY_URL = config.get('PRIVACY_URL', '')
     SUPPORT_CONTACT = config.get('SUPPORT', '@support')
+    YOOMONEY_ENABLED = bool(config.get('YOOMONEY_ENABLED', False))
+    YOOMONEY_RECEIVER = config.get('YOOMONEY_RECEIVER', '')
+    YOOMONEY_RUB_PER_USD = config.get('YOOMONEY_RUB_PER_USD', '100')
+    YOOMONEY_SUCCESS_URL = config.get('YOOMONEY_SUCCESS_URL', '')
 
     DOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'documents')
 
@@ -1873,6 +1878,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             if STARS_ENABLED:
                 rows.append([InlineKeyboardButton(text=f"⭐ Telegram Stars — {_usd_to_stars(price)} ⭐",
                                                   callback_data=f"buy_stars_{tariff_id}")])
+            if YOOMONEY_ENABLED:
+                rub_amount = usd_to_rub(price, YOOMONEY_RUB_PER_USD)
+                rows.append([InlineKeyboardButton(
+                    text=f"🟡 ЮMoney — {rub_amount:.2f} ₽",
+                    callback_data=f"buy_yoomoney_{tariff_id}"
+                )])
         else:
             rows.append([InlineKeyboardButton(text="🎁 Активировать бесплатно",
                                               callback_data=f"activate_trial_{tariff_id}")])
@@ -1956,7 +1967,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             "   • сеть TRC-20 обычно дешевле по комиссии.\n"
             "2. Вернитесь сюда, выберите тариф и нажмите «💎 CryptoBot».\n"
             "3. Оплатите счёт и нажмите «Проверить оплату».\n\n"
-            "<b>Способ 3. Промокод</b> 🎁\n"
+            + (
+                "<b>Способ 3. ЮMoney</b> 🟡\n"
+                "1. Выберите тариф и нажмите «🟡 ЮMoney».\n"
+                "2. Оплатите персональный счёт по открывшейся ссылке.\n"
+                "3. Подписка зачислится автоматически после уведомления ЮMoney.\n\n"
+                if YOOMONEY_ENABLED else ""
+            )
+            + "<b>Способ 4. Промокод</b> 🎁\n"
             "Если у вас есть промокод — нажмите «🎁 Ввести промокод».\n\n"
             f"❓ Возникли сложности? Напишите в поддержку: {SUPPORT_CONTACT}"
         )
@@ -2046,6 +2064,85 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"Списано: <b>{sp.total_amount} ⭐</b>\n"
             f"Подписка активна до: <b>{format_date(user.get('subscription_until', 0))}</b>",
             reply_markup=main_menu_keyboard(user_id, admin_id=ADMIN)
+        )
+
+    @dp.callback_query(F.data.startswith('buy_yoomoney_'))
+    async def buy_yoomoney_callback(callback: CallbackQuery):
+        """Create a personal YooMoney P2P invoice for one tariff."""
+        if not YOOMONEY_ENABLED:
+            await _answer_callback(callback, "Оплата ЮMoney временно недоступна", show_alert=True)
+            return
+        try:
+            tariff_id = int(callback.data.split('_')[2])
+        except (IndexError, ValueError):
+            await _answer_callback(callback, "❌ Некорректный тариф", show_alert=True)
+            return
+        tariff = db.get_tariff(tariff_id)
+        if not tariff or float(tariff.get('price_usd') or 0) <= 0:
+            await _answer_callback(callback, "❌ Тариф не найден", show_alert=True)
+            return
+
+        try:
+            amount_rub = usd_to_rub(tariff['price_usd'], YOOMONEY_RUB_PER_USD)
+            label = make_label()
+            description = f"PostDrive: {tariff['name']}"
+            payment_url = build_payment_url(
+                receiver=YOOMONEY_RECEIVER,
+                amount_rub=amount_rub,
+                label=label,
+                description=description,
+                success_url=YOOMONEY_SUCCESS_URL,
+            )
+            payment_id = db.create_yoomoney_payment(
+                user_id=callback.from_user.id,
+                tariff_id=tariff_id,
+                amount_rub=amount_rub,
+                label=label,
+                pay_url=payment_url,
+            )
+        except Exception as error:
+            logger.error("Could not create YooMoney payment: %s", error, exc_info=True)
+            await _answer_callback(callback, "❌ Не удалось создать счёт. Попробуйте позже.", show_alert=True)
+            return
+
+        buttons = [
+            [InlineKeyboardButton(text=f"🟡 Оплатить {amount_rub:.2f} ₽", url=payment_url)],
+            [InlineKeyboardButton(text="🔄 Проверить зачисление", callback_data=f"check_yoomoney_{payment_id}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"tariff_info_{tariff_id}")],
+        ]
+        await edit_message(
+            callback,
+            "🧾 <b>Счёт YooMoney создан</b>\n\n"
+            f"• <b>Тариф:</b> {tariff['name']} ({tariff['duration_days']} дн.)\n"
+            f"• <b>Сумма:</b> <code>{amount_rub:.2f} ₽</code>\n\n"
+            "1. Нажмите «Оплатить» и завершите перевод на странице YooMoney.\n"
+            "2. Вернитесь в бот и нажмите «Проверить зачисление».\n"
+            "3. После подтверждения уведомлением YooMoney подписка активируется автоматически.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    @dp.callback_query(F.data.startswith('check_yoomoney_'))
+    async def check_yoomoney_callback(callback: CallbackQuery):
+        try:
+            payment_id = int(callback.data.split('_')[2])
+        except (IndexError, ValueError):
+            await _answer_callback(callback, "❌ Некорректный счёт", show_alert=True)
+            return
+        payment = db.get_yoomoney_payment(payment_id)
+        if not payment or payment.get('user_id') != callback.from_user.id:
+            await _answer_callback(callback, "❌ Счёт не найден", show_alert=True)
+            return
+        if payment.get('status') != 'paid':
+            await _answer_callback(callback, "⏳ Платёж ещё не подтверждён YooMoney.", show_alert=True)
+            return
+        user = db.get_user(callback.from_user.id) or {}
+        await edit_message(
+            callback,
+            "✅ <b>Платёж уже зачислен.</b>\n\n"
+            f"Подписка активна до: <b>{format_date(user.get('subscription_until', 0))}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К подписке", callback_data="back_to_subscription")]
+            ]),
         )
 
     @dp.callback_query(F.data == "enter_promo")
