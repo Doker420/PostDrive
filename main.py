@@ -72,6 +72,16 @@ def _flag(value: str, default: bool = False) -> bool:
         return default
     return value.lower() in ('1', 'true', 'yes', 'on')
 
+
+def _int_setting(env_name: str, section: str, key: str, default: int) -> int:
+    """Parse an optional integer without making the whole bot unstartable."""
+    raw = os.environ.get(env_name, _cfg(section, key, str(default)))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.error("Invalid %s=%r; using %s", env_name, raw, default)
+        return default
+
 STARS_ENABLED = _flag(os.environ.get('STARS_ENABLED', _cfg('PAYMENTS', 'STARS_ENABLED', 'true')), True)
 STARS_PER_USD = int(os.environ.get('STARS_PER_USD', _cfg('PAYMENTS', 'STARS_PER_USD', '50')))
 MINIAPP_ENABLED = _flag(os.environ.get('MINIAPP_ENABLED', _cfg('PAYMENTS', 'MINIAPP_ENABLED', 'false')))
@@ -80,16 +90,16 @@ MINIAPP_URL = os.environ.get('MINIAPP_URL', _cfg('PAYMENTS', 'MINIAPP_URL', ''))
 # YooMoney is enabled only when both the receiver and notification secret are
 # present. Tokens are never displayed or sent to Telegram; the token is kept
 # available for optional operation-history checks in the payment service.
-YOOMONEY_RECEIVER = os.environ.get('YOOMONEY_RECEIVER', _cfg('YOOMONEY', 'RECEIVER', ''))
+YOOMONEY_RECEIVER = os.environ.get('YOOMONEY_RECEIVER', _cfg('YOOMONEY', 'RECEIVER', '')).strip()
 YOOMONEY_NOTIFICATION_SECRET = os.environ.get(
     'YOOMONEY_NOTIFICATION_SECRET', _cfg('YOOMONEY', 'NOTIFICATION_SECRET', '')
-)
-YOOMONEY_TOKEN = os.environ.get('YOOMONEY_TOKEN', _cfg('YOOMONEY', 'TOKEN', ''))
-YOOMONEY_RUB_PER_USD = os.environ.get('YOOMONEY_RUB_PER_USD', _cfg('YOOMONEY', 'RUB_PER_USD', '100'))
-YOOMONEY_WEBHOOK_HOST = os.environ.get('YOOMONEY_WEBHOOK_HOST', _cfg('YOOMONEY', 'WEBHOOK_HOST', '0.0.0.0'))
-YOOMONEY_WEBHOOK_PORT = int(os.environ.get('YOOMONEY_WEBHOOK_PORT', _cfg('YOOMONEY', 'WEBHOOK_PORT', '8012')))
-YOOMONEY_WEBHOOK_PATH = os.environ.get('YOOMONEY_WEBHOOK_PATH', _cfg('YOOMONEY', 'WEBHOOK_PATH', '/yoomoney/webhook'))
-YOOMONEY_SUCCESS_URL = os.environ.get('YOOMONEY_SUCCESS_URL', _cfg('YOOMONEY', 'SUCCESS_URL', ''))
+).strip()
+YOOMONEY_TOKEN = os.environ.get('YOOMONEY_TOKEN', _cfg('YOOMONEY', 'TOKEN', '')).strip()
+YOOMONEY_RUB_PER_USD = os.environ.get('YOOMONEY_RUB_PER_USD', _cfg('YOOMONEY', 'RUB_PER_USD', '100')).strip()
+YOOMONEY_WEBHOOK_HOST = os.environ.get('YOOMONEY_WEBHOOK_HOST', _cfg('YOOMONEY', 'WEBHOOK_HOST', '0.0.0.0')).strip() or '0.0.0.0'
+YOOMONEY_WEBHOOK_PORT = _int_setting('YOOMONEY_WEBHOOK_PORT', 'YOOMONEY', 'WEBHOOK_PORT', 8012)
+YOOMONEY_WEBHOOK_PATH = os.environ.get('YOOMONEY_WEBHOOK_PATH', _cfg('YOOMONEY', 'WEBHOOK_PATH', '/yoomoney/webhook')).strip() or '/yoomoney/webhook'
+YOOMONEY_SUCCESS_URL = os.environ.get('YOOMONEY_SUCCESS_URL', _cfg('YOOMONEY', 'SUCCESS_URL', '')).strip()
 YOOMONEY_ENABLED = bool(YOOMONEY_RECEIVER and YOOMONEY_NOTIFICATION_SECRET)
 
 bot_config = {
@@ -126,14 +136,25 @@ if interrupted:
 # ── Graceful shutdown handler ─────────────────────────────────────
 _shutdown_event = asyncio.Event()
 _yoomoney_runner = None
+_yoomoney_start_task = None
 
 async def _shutdown():
     """Graceful shutdown: cancel tasks, stop clients, close DB."""
-    global _yoomoney_runner
+    global _yoomoney_runner, _yoomoney_start_task
     logger.info("Initiating graceful shutdown...")
 
     # Stop polling
     await dp.stop_polling()
+
+    # Webhook startup is deliberately isolated from polling. If a port or
+    # proxy configuration is wrong, commands must still work normally.
+    if _yoomoney_start_task is not None and not _yoomoney_start_task.done():
+        _yoomoney_start_task.cancel()
+        try:
+            await _yoomoney_start_task
+        except asyncio.CancelledError:
+            pass
+    _yoomoney_start_task = None
 
     if _yoomoney_runner is not None:
         try:
@@ -168,8 +189,35 @@ def _signal_handler(sig, frame):
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 
-async def main():
+
+async def _start_yoomoney_webhook():
+    """Start the optional HTTP endpoint without blocking Telegram polling."""
     global _yoomoney_runner
+    try:
+        _yoomoney_runner = await asyncio.wait_for(
+            start_webhook(
+                db=db,
+                bot=bot,
+                receiver=YOOMONEY_RECEIVER,
+                secret=YOOMONEY_NOTIFICATION_SECRET,
+                host=YOOMONEY_WEBHOOK_HOST,
+                port=YOOMONEY_WEBHOOK_PORT,
+                path=YOOMONEY_WEBHOOK_PATH,
+                oauth_token=YOOMONEY_TOKEN,
+            ),
+            timeout=5,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Keep the detailed failure in logs, but never let an optional
+        # payment endpoint stop the main bot from accepting commands.
+        logger.exception("YooMoney webhook could not start")
+        _yoomoney_runner = None
+
+
+async def main():
+    global _yoomoney_start_task
     print("=" * 60)
     print("🤖 Autoposter Multi-Account Bot v5.0")
     print("=" * 60)
@@ -182,29 +230,14 @@ async def main():
     # Start cleanup loop in background
     account_manager._cleanup_task = asyncio.create_task(account_manager.start_cleanup_loop())
 
+    # Start polling first. The optional YooMoney listener is launched as a
+    # bounded background task so a bind/DNS/proxy issue cannot block /start or
+    # any other Telegram command.
+    polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     if YOOMONEY_ENABLED:
-        try:
-            _yoomoney_runner = await start_webhook(
-                db=db,
-                bot=bot,
-                receiver=YOOMONEY_RECEIVER,
-                secret=YOOMONEY_NOTIFICATION_SECRET,
-                host=YOOMONEY_WEBHOOK_HOST,
-                port=YOOMONEY_WEBHOOK_PORT,
-                path=YOOMONEY_WEBHOOK_PATH,
-                oauth_token=YOOMONEY_TOKEN,
-            )
-        except Exception as e:
-            # Do not crash the bot because a port is occupied. Keep the
-            # payment buttons disabled in this process and leave the detail
-            # in logs rather than exposing infrastructure errors to users.
-            logger.error("YooMoney webhook could not start: %s", e)
-            _yoomoney_runner = None
+        _yoomoney_start_task = asyncio.create_task(_start_yoomoney_webhook())
     else:
         logger.info("YooMoney payments disabled: receiver or notification secret is not configured")
-
-    # Start polling in background
-    polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
 
     # Wait for shutdown signal
     await _shutdown_event.wait()
