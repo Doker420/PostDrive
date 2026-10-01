@@ -14,6 +14,7 @@ import dbconfig
 from sqliter import DBConnection, get_db_sync
 from user import AccountSessionManager
 from handlers import register_all_handlers
+from telegram_transport import ResilientAiohttpSession
 from yoomoney import start_webhook, stop_webhook
 
 logging.basicConfig(
@@ -27,6 +28,13 @@ config_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'confi
 config = configparser.ConfigParser()
 config.read(config_path)
 
+def _safe_int(raw, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
 TOKEN = os.environ.get('BOT_TOKEN', config['BOT']['TOKEN'])
 ADMIN = int(os.environ.get('BOT_ADMIN', config['BOT']['ADMIN']))
 USERNAME = os.environ.get('BOT_USERNAME', config['BOT'].get('USERNAME', 'bot')).strip("'\"")
@@ -34,6 +42,11 @@ API_ID = int(os.environ.get('USER_API_ID', config['USER']['API_ID']))
 API_HASH = os.environ.get('USER_API_HASH', config['USER']['API_HASH'])
 CRYPTO_BOT_TOKEN = os.environ.get('CRYPTOBOT_TOKEN', config.get('CRYPTOBOT', 'TOKEN', fallback=''))
 TESTNET = os.environ.get('CRYPTOBOT_TESTNET', config.get('CRYPTOBOT', 'TESTNET', fallback='False')).lower() in ('true', '1', 'yes')
+TELEGRAM_API_TIMEOUT = _safe_int(
+    os.environ.get('TELEGRAM_API_TIMEOUT', config.get('LIMITS', 'TELEGRAM_API_TIMEOUT', fallback='75')),
+    75,
+    30,
+)
 
 # Optional Redis FSM storage
 REDIS_URL = os.environ.get('REDIS_URL', '')
@@ -53,7 +66,16 @@ if REDIS_URL:
 if _fsm_storage is None:
     _fsm_storage = MemoryStorage()
 
-bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot_session = ResilientAiohttpSession(
+    timeout=TELEGRAM_API_TIMEOUT,
+    max_network_retries=1,
+    retry_delay=0.75,
+)
+bot = Bot(
+    token=TOKEN,
+    session=bot_session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher(storage=_fsm_storage)
 
 # Use shared DB singleton

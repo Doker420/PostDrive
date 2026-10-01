@@ -6,7 +6,7 @@
 #           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, REDIS_URL,
 #           YOOMONEY_RECEIVER, YOOMONEY_NOTIFICATION_SECRET, YOOMONEY_TOKEN,
 #           YOOMONEY_RUB_PER_USD, YOOMONEY_WEBHOOK_HOST, YOOMONEY_WEBHOOK_PORT,
-#           YOOMONEY_WEBHOOK_PATH, YOOMONEY_SUCCESS_URL
+#           YOOMONEY_WEBHOOK_PATH, YOOMONEY_SUCCESS_URL, TELEGRAM_API_TIMEOUT
 # Scaling:  MAX_ACTIVE_CLIENTS, MAX_TASKS_PER_USER, MAX_GLOBAL_TASKS, CLIENT_IDLE_TTL,
 #           SESSION_CHECK_TIMEOUT, CLIENT_START_TIMEOUT, SESSION_CHECK_CONCURRENCY
 
@@ -114,8 +114,10 @@ MAX_FLOOD_WAIT = 1800
 SESSION_CHECK_TIMEOUT = 25
 ; Таймаут запуска рабочего Pyrogram-клиента.
 CLIENT_START_TIMEOUT = 30
-; Верхний таймаут одного Telegram API вызова. Сетевые ошибки получают
-; ограниченный retry с backoff, бесконечного reconnect нет.
+; Верхний таймаут одного Pyrogram-вызова.
 TELEGRAM_CALL_TIMEOUT = 45
+; Таймаут Bot API для команд и ответов пользователю. После сетевого timeout
+; выполняется не более одного повторного запроса.
+TELEGRAM_API_TIMEOUT = 75
 ; Сколько сессий проверять параллельно в админ-панели.
 SESSION_CHECK_CONCURRENCY = 4

@@ -164,6 +164,22 @@ db = DBConnection()
 # to replace the empty acknowledgement.
 _callback_answer_state: Dict[str, bool] = {}
 
+
+def _is_bot_api_transport_error(error: BaseException) -> bool:
+    """Detect a Bot API transport failure without treating it as user input."""
+    if isinstance(error, (TelegramNetworkError, asyncio.TimeoutError, ConnectionError)):
+        return True
+    text = str(error).lower()
+    return (
+        'http client says' in text and 'timeout' in text
+        or 'request timeout error' in text
+        or 'clientconnectorerror' in text
+        or 'connection reset' in text
+        or 'connection refused' in text
+        or 'cannot connect' in text
+    )
+
+
 async def _answer_callback(callback: CallbackQuery, *args, **kwargs):
     callback_id = getattr(callback, 'id', None) or str(id(callback))
     has_message = bool(args) or bool(kwargs.get('text')) or bool(kwargs.get('show_alert'))
@@ -683,6 +699,15 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         exc = getattr(event, 'exception', None)
         update = getattr(event, 'update', None)
         logger.exception(f"Необработанная ошибка в хендлере: {type(exc).__name__}: {exc}")
+
+        # Не отправляем поверх неудачного Bot API-запроса ещё одно сообщение:
+        # это порождает вторую ошибку timeout и пользователь получает ложное
+        # «внутреннее» уведомление. ResilientAiohttpSession уже выполнил один
+        # ограниченный retry; следующая попытка будет сделана на следующем
+        # обновлении пользователя.
+        if _is_bot_api_transport_error(exc):
+            logger.warning("Bot API transport failure; user notification skipped")
+            return True
 
         text = ("❌ Внутренняя ошибка, действие не выполнено.\n\n"
                 "Откройте меню заново — /start. Если повторяется, напишите в поддержку.")
