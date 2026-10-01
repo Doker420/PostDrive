@@ -2911,13 +2911,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Медиа:</b> {has_photo}"
         )
 
+        warmup_successes = int(warmup_state.get('subscriptions_count') or 0) + int(warmup_state.get('reactions_count') or 0)
+        warmup_errors = int(warmup_state.get('error_count') or 0)
         if warmup_state.get('status') == 'running':
             left = max(0, int(warmup_state.get('ends_at') or 0) - int(time.time()))
             text += (f"\n\n🔥 <b>Автопрогрев:</b> выполняется, осталось "
                      f"примерно {left // 3600} ч. {(left % 3600) // 60} мин.\n"
-                     f"Действий: {warmup_state.get('action_count', 0)} "
+                     f"Успешных действий: {warmup_successes} "
                      f"(подписок: {warmup_state.get('subscriptions_count', 0)}, "
-                     f"реакций: {warmup_state.get('reactions_count', 0)})")
+                     f"реакций: {warmup_state.get('reactions_count', 0)})\n"
+                     f"Пропущено попыток: {warmup_errors}")
         elif warmup_state.get('status') in ('finished', 'stopped', 'failed'):
             warmup_labels = {
                 'finished': 'завершён',
@@ -2926,7 +2929,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             }
             warmup_status = warmup_labels.get(warmup_state.get('status'), 'завершён')
             text += (f"\n\n🔥 <b>Автопрогрев:</b> {warmup_status} · "
-                     f"действий: {warmup_state.get('action_count', 0)}")
+                     f"успешных действий: {warmup_successes} "
+                     f"(пропусков: {warmup_errors})")
 
         # ── Здоровье аккаунта (FloodWait / ограничения) ──
         health = account.get('health') or 'ok'

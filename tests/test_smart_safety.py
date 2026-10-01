@@ -35,9 +35,11 @@ def test_persistent_autopost_limits_and_warmup_state():
         assert state["status"] == "running"
         assert state["duration_minutes"] == 15  # lower bound is intentional
         db.update_account_warmup_action(account_id, "subscribe", start + 100)
+        db.update_account_warmup_action(account_id, "other", start + 200, "no public channel")
         state = db.get_account_warmup(account_id)
         assert state["action_count"] == 1
         assert state["subscriptions_count"] == 1
+        assert state["error_count"] == 1
         db.finish_account_warmup(account_id, "stopped")
         assert db.get_account_warmup(account_id)["status"] == "stopped"
     finally:
@@ -52,11 +54,14 @@ def test_user_safety_guards_are_present():
     assert "TELEGRAM_CALL_TIMEOUT" in source
     assert "stop_on_flood: bool = False" in source
     assert "await asyncio.wait_for(factory(), timeout=TELEGRAM_CALL_TIMEOUT)" in source
-    assert "asyncio.wait_for(collect_one(), timeout=20)" in source
+    assert "asyncio.wait_for(collect_one(), timeout=30)" in source
     assert "warmup reaction" in source
     assert "async def send_via_postbot" in source
     assert "get_inline_bot_results(POSTBOT_USERNAME, post_id)" in source
     assert "send_inline_bot_result(target, query_id, result_id)" in source
+    assert "client.search_global(query=query, limit=50)" in source
+    assert "chat = getattr(message, 'chat', None)" in source
+    assert "successful_actions = subscriptions + reactions" in source
 
     handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")
     assert "📮 Через @PostBot" in handlers

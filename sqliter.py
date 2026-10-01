@@ -1557,7 +1557,10 @@ class DBConnection(metaclass=_PoolBoundMeta):
             'subscribe': 'subscriptions_count',
             'reaction': 'reactions_count',
         }.get(action)
-        if column:
+        if column and not error:
+            # Count completed actions, not failed attempts. Failed searches or
+            # rejected channels are tracked separately in error_count and must
+            # not make a warmup appear successful or consume its action cap.
             self.c.execute(
                 f'UPDATE account_warmups SET action_count = action_count + 1, '
                 f'{column} = {column} + 1, next_action_at = ?, updated_at = ? WHERE account_id = ?',
@@ -1565,7 +1568,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
             )
         else:
             self.c.execute(
-                'UPDATE account_warmups SET action_count = action_count + 1, next_action_at = ?, updated_at = ? WHERE account_id = ?',
+                'UPDATE account_warmups SET next_action_at = ?, updated_at = ? WHERE account_id = ?',
                 (int(next_action_at), now, account_id)
             )
         if error:

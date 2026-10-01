@@ -3317,21 +3317,47 @@ class AccountSessionManager:
         """Find one public channel without scraping or noisy user messages."""
         query = random.choice(self.WARMUP_SEARCH_QUERIES)
 
-        async def collect_one():
-            candidates = client.search_global(query=query, limit=10)
-            async for chat in candidates:
+        async def collect_from_dialogs():
+            """Fallback for accounts with no matching global-search message."""
+            checked = 0
+            async for dialog in client.get_dialogs():
+                chat = getattr(dialog, 'chat', None)
+                if chat is None:
+                    continue
                 chat_type = str(getattr(chat, 'type', '')).lower()
-                if 'channel' not in chat_type:
+                if 'channel' not in chat_type and 'supergroup' not in chat_type:
+                    continue
+                username = getattr(chat, 'username', None)
+                if username:
+                    return username
+                checked += 1
+                if checked >= 50:
+                    break
+            return None
+
+        async def collect_one():
+            # Pyrogram search_global() yields Message objects, not Chat
+            # objects. The channel is available as message.chat. The old code
+            # inspected Message.type/Message.username, therefore it never
+            # found a target and every warmup iteration was recorded as an
+            # unsuccessful "other" action.
+            candidates = client.search_global(query=query, limit=50)
+            async for message in candidates:
+                chat = getattr(message, 'chat', None)
+                if chat is None:
+                    continue
+                chat_type = str(getattr(chat, 'type', '')).lower()
+                if 'channel' not in chat_type and 'supergroup' not in chat_type:
                     continue
                 # Only public usernames are eligible: an ID-only result can
                 # be a private chat and must never be joined automatically.
                 username = getattr(chat, 'username', None)
                 if username:
                     return username
-            return None
+            return await collect_from_dialogs()
 
         try:
-            return await asyncio.wait_for(collect_one(), timeout=20)
+            return await asyncio.wait_for(collect_one(), timeout=30)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -3345,6 +3371,15 @@ class AccountSessionManager:
         if not target:
             return False
         try:
+            # Do not count an already joined channel as a new subscription.
+            try:
+                chat = await asyncio.wait_for(client.get_chat(target), timeout=12)
+                if getattr(chat, 'is_member', False) is True:
+                    return False
+            except Exception:
+                # join_chat below remains the authoritative check; a temporary
+                # get_chat failure must not crash the warmup worker.
+                pass
             await self.tg_call(
                 lambda: client.join_chat(target),
                 account_id=account_id, description='warmup subscribe',
@@ -3352,7 +3387,7 @@ class AccountSessionManager:
             )
             return True
         except UserAlreadyParticipant:
-            return True
+            return False
         except AccountBlockedError:
             raise
         except Exception as error:
@@ -3417,11 +3452,16 @@ class AccountSessionManager:
                 current = db.get_account_warmup(account_id) or {}
                 if current.get('status') != 'running':
                     break
-                if int(current.get('action_count') or 0) >= self.WARMUP_MAX_ACTIONS:
-                    logging.info("warmup %s reached action cap", account_id)
-                    break
                 subscriptions = int(current.get('subscriptions_count') or 0)
                 reactions = int(current.get('reactions_count') or 0)
+                # action_count historically included failed attempts. Use the
+                # successful counters for safety caps, otherwise a sequence of
+                # search failures could consume the whole warmup without a
+                # single subscription or reaction.
+                successful_actions = subscriptions + reactions
+                if successful_actions >= self.WARMUP_MAX_ACTIONS:
+                    logging.info("warmup %s reached successful action cap", account_id)
+                    break
                 if subscriptions >= self.WARMUP_MAX_SUBSCRIPTIONS and reactions >= self.WARMUP_MAX_REACTIONS:
                     logging.info("warmup %s reached subscription/reaction caps", account_id)
                     break
