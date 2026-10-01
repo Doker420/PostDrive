@@ -1995,14 +1995,17 @@ class DBConnection(metaclass=_PoolBoundMeta):
             pass
 
     # ==================== ACCOUNT HEALTH (FloodWait / bans) ====================
-    # ok         — аккаунт работает штатно
-    # cooldown   — активный FloodWait, ждём истечения restricted_until
-    # restricted — PeerFlood / спам-блок, задачи остановлены до решения владельца
-    # banned     — аккаунт удалён/забанен Telegram, требуется переподключение
+    # ok            — аккаунт работает штатно
+    # cooldown      — активный FloodWait, ждём истечения restricted_until
+    # restricted    — PeerFlood / спам-блок, задачи остановлены до решения владельца
+    # banned        — аккаунт удалён/забанен Telegram, требуется переподключение
+    # proxy_error   — прокси недоступен/не отвечает. Не пытаться подключаться
+    #                 автоматически до ручной проверки или сброса статуса.
     HEALTH_OK = 'ok'
     HEALTH_COOLDOWN = 'cooldown'
     HEALTH_RESTRICTED = 'restricted'
     HEALTH_BANNED = 'banned'
+    HEALTH_PROXY_ERROR = 'proxy_error'
 
     def set_account_health(self, account_id: int, health: str, reason: str = '',
                            restricted_until: int = 0):
@@ -2066,6 +2069,10 @@ class DBConnection(metaclass=_PoolBoundMeta):
             return False, f"Аккаунт ограничен Telegram: {h.get('health_reason') or 'спам-блок'}"
         if state == self.HEALTH_BANNED:
             return False, f"Аккаунт заблокирован: {h.get('health_reason') or 'требуется переподключение'}"
+        if state == self.HEALTH_PROXY_ERROR:
+            return False, (
+                f"Прокси недоступен: {h.get('health_reason') or 'проверьте адрес и доступность прокси'}"
+            )
         return True, ''
 
     # ==================== TASK REGISTRY (persistence & recovery) ====================

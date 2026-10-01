@@ -86,6 +86,9 @@ bot_config = {
     'STARS_PER_USD': STARS_PER_USD,
     'MINIAPP_ENABLED': MINIAPP_ENABLED,
     'MINIAPP_URL': MINIAPP_URL,
+    'SESSION_CHECK_CONCURRENCY': max(1, int(os.environ.get(
+        'SESSION_CHECK_CONCURRENCY', _cfg('LIMITS', 'SESSION_CHECK_CONCURRENCY', '4')
+    ))),
     'TERMS_URL': os.environ.get('TERMS_URL', _cfg('LEGAL', 'TERMS_URL', '')),
     'PRIVACY_URL': os.environ.get('PRIVACY_URL', _cfg('LEGAL', 'PRIVACY_URL', '')),
     'SUPPORT': os.environ.get('SUPPORT_CONTACT', _cfg('LEGAL', 'SUPPORT', '@support')),

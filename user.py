@@ -89,6 +89,61 @@ config.read(config_path)
 # Максимальное ожидание FloodWait, которое имеет смысл пересидеть внутри задачи.
 MAX_FLOOD_WAIT = int(config.get('LIMITS', 'MAX_FLOOD_WAIT', fallback='1800'))
 
+# Проверка сессии не должна передавать управление Pyrogram на неопределённое
+# время: при мёртвом HTTP/SOCKS-прокси его внутренний reconnect может повторять
+# попытки дольше, чем живёт callback админки. Значение можно переопределить
+# через SESSION_CHECK_TIMEOUT (секунды).
+SESSION_CHECK_TIMEOUT = max(5, int(os.environ.get(
+    'SESSION_CHECK_TIMEOUT', config.get('LIMITS', 'SESSION_CHECK_TIMEOUT', fallback='25')
+)))
+CLIENT_START_TIMEOUT = max(5, int(os.environ.get(
+    'CLIENT_START_TIMEOUT', config.get('LIMITS', 'CLIENT_START_TIMEOUT', fallback='30')
+)))
+
+SESSION_CHECK_PROXY_PREFIX = 'PROXY_UNAVAILABLE: '
+SESSION_CHECK_NETWORK_PREFIX = 'NETWORK_UNAVAILABLE: '
+SESSION_CHECK_INVALID_PREFIX = 'SESSION_INVALID: '
+
+
+def _is_proxy_failure(error: BaseException, proxy_str: str = '') -> bool:
+    """Определяет ошибки транспорта, не выдавая их за битую сессию.
+
+    Ошибка при проверке через прокси чаще означает, что прокси умер, а не что
+    Telegram отозвал аккаунт. Это различие важно: после proxy_error никакая
+    фоновая задача не должна бесконечно создавать новый Client.
+    """
+    text = str(error).lower()
+    name = type(error).__name__.lower()
+    transport_markers = (
+        'proxy', 'socks', 'timed out', 'timeout', 'time-out',
+        'connection refused', 'cannot connect', 'connection reset',
+        'network is unreachable', 'name or service not known',
+        'temporary failure in name resolution', 'eof', 'broken pipe',
+    )
+    if any(marker in text or marker in name for marker in transport_markers):
+        return True
+    return bool(proxy_str) and isinstance(error, (OSError, ConnectionError, asyncio.TimeoutError))
+
+
+def _session_error_message(error: BaseException, proxy_str: str = '') -> tuple:
+    """Возвращает (категория, сообщение) для результата проверки сессии."""
+    if isinstance(error, asyncio.TimeoutError):
+        return ('proxy' if proxy_str else 'network'), (
+            f'проверка не завершилась за {SESSION_CHECK_TIMEOUT} сек.'
+        )
+    if _is_proxy_failure(error, proxy_str):
+        return 'proxy', str(error)[:260] or 'прокси не отвечает'
+    # Таймаут/сетевой сбой без прокси не должен выглядеть как отозванная
+    # session string, но и не должен запускать бесконечные повторы.
+    text = str(error).lower()
+    if any(marker in text for marker in (
+        'timed out', 'timeout', 'connection refused', 'cannot connect',
+        'connection reset', 'network is unreachable', 'name or service not known',
+        'temporary failure in name resolution', 'eof', 'broken pipe'
+    )):
+        return 'network', str(error)[:260] or 'соединение с Telegram недоступно'
+    return 'invalid', str(error)[:260] or 'сессия не прошла проверку'
+
 # ID владельца бота. Фоновые задачи периодически перепроверяют подписку, и без
 # admin_id проверка для админа проваливалась: аккаунт владельца останавливался
 # с «Подписка истекла», хотя у него безлимитный доступ.
@@ -790,11 +845,31 @@ class AccountSessionManager:
             self._client_locks[account_id] = asyncio.Lock()
         return self._client_locks[account_id]
 
-    async def test_session_string(self, session_string: str, proxy_str: str = "") -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    async def test_session_string(
+        self,
+        session_string: str,
+        proxy_str: str = "",
+        account_id: int = None,
+        timeout: int = None,
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """Проверить session string ровно один раз и гарантированно закрыть Client.
+
+        ``Client.start()`` может сам повторять подключение. Для фоновых задач и
+        проверки из админки это опасно: мёртвый прокси превращает один клик в
+        бесконечный цикл reconnect. Поэтому здесь есть жёсткий таймаут на весь
+        запуск/``get_me`` и обязательный cleanup в ``finally``.
+
+        При проверке существующего аккаунта передаём ``account_id`` — тогда
+        причина фиксируется в health аккаунта. Для недоступного прокси это
+        ``proxy_error``: последующие рассылки/парсеры не будут пробовать тот же
+        адрес снова, пока владелец не сбросит статус.
+        """
+        check_timeout = max(5, int(timeout or SESSION_CHECK_TIMEOUT))
+        client = None
         try:
             client = self.create_client(session_string, proxy_str, name="temp_test")
-            await client.start()
-            me = await client.get_me()
+            await asyncio.wait_for(client.start(), timeout=check_timeout)
+            me = await asyncio.wait_for(client.get_me(), timeout=check_timeout)
             info = {
                 "id": me.id,
                 "first_name": me.first_name or "",
@@ -802,10 +877,62 @@ class AccountSessionManager:
                 "username": me.username or "",
                 "phone": me.phone_number or ""
             }
-            await client.stop()
+            if account_id:
+                # Успешная проверка снимает только блокирующие состояния,
+                # созданные самим чекером. FloodWait/спам-ограничение не
+                # должны исчезать от одного вызова get_me().
+                try:
+                    health = db.get_account_health(account_id).get('health')
+                    if health in (db.HEALTH_PROXY_ERROR, db.HEALTH_BANNED):
+                        db.clear_account_health(account_id)
+                    db.update_account_status_by_id(account_id, 'active')
+                except Exception:
+                    logger.debug("Не удалось обновить статус после проверки", exc_info=True)
             return True, info, None
-        except Exception as e:
-            return False, None, str(e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            kind, detail = _session_error_message(error, proxy_str)
+            if kind == 'proxy':
+                result = SESSION_CHECK_PROXY_PREFIX + detail
+            elif kind == 'network':
+                result = SESSION_CHECK_NETWORK_PREFIX + detail
+            else:
+                result = SESSION_CHECK_INVALID_PREFIX + detail
+            if account_id:
+                try:
+                    if kind in ('proxy', 'network'):
+                        db.set_account_health(account_id, db.HEALTH_PROXY_ERROR, detail)
+                    else:
+                        db.set_account_health(account_id, db.HEALTH_BANNED, detail)
+                    db.update_account_status_by_id(account_id, 'error')
+                except Exception:
+                    logger.debug("Не удалось записать ошибку проверки сессии", exc_info=True)
+                # Если у аккаунта уже был рабочий Client, не оставляем его
+                # висеть в пуле после фиксации недоступного транспорта.
+                try:
+                    await self.stop_client(account_id)
+                except Exception:
+                    logger.debug("Не удалось остановить старый Client после проверки", exc_info=True)
+            return False, None, result
+        finally:
+            # Даже после TimeoutError Pyrogram может оставить транспорт в
+            # полуоткрытом состоянии. Не оставляем такой Client в памяти и не
+            # даём ему продолжить reconnect после возврата из этой функции.
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=3)
+                except asyncio.CancelledError:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    raise
+                except Exception:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=2)
+                    except Exception:
+                        pass
 
     # ==================== INTERACTIVE PHONE AUTH ====================
     async def start_phone_auth(self, user_id: int, phone: str, proxy_str: str = "") -> Tuple[bool, Optional[str], Optional[str]]:
@@ -1154,51 +1281,82 @@ class AccountSessionManager:
             return False, str(e)
 
     async def get_or_start_client(self, account_id: int, user_id: int = None) -> Tuple[Optional[Client], Optional[str]]:
+        """Получить клиент без бесконечных повторов подключения.
+
+        Один вызов делает максимум одну попытку восстановления. Если транспорт
+        через прокси не отвечает, аккаунт получает ``proxy_error`` и следующий
+        цикл рассылки сразу завершится с понятной причиной вместо reconnect
+        каждые 30 секунд.
+        """
         async with self._get_client_lock(account_id):
-            # Update last-used timestamp
             self._client_last_used[account_id] = time.time()
             if user_id:
                 self._client_owner[account_id] = user_id
-            
+
+            usable, health_reason = db.is_account_usable(account_id)
+            if not usable:
+                return None, health_reason
+
             if account_id in self.active_clients:
                 client = self.active_clients[account_id]
                 try:
-                    await client.get_me()
+                    await asyncio.wait_for(client.get_me(), timeout=CLIENT_START_TIMEOUT)
                     return client, None
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
+                    # Протухший транспорт не переиспользуем. Сначала закрываем
+                    # его, затем делаем ровно одну новую попытку ниже.
+                    self.active_clients.pop(account_id, None)
                     try:
-                        await client.start()
-                        return client, None
-                    except Exception as start_err:
-                        err_str = str(start_err).lower()
-                        if "already" in err_str or "started" in err_str:
-                            return client, None
-                        self.active_clients.pop(account_id, None)
+                        await asyncio.wait_for(client.stop(), timeout=3)
+                    except Exception:
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=2)
+                        except Exception:
+                            pass
 
             account = db.get_account(account_id)
             if not account:
                 return None, "Аккаунт не найден в базе данных"
 
+            client = None
+            proxy_str = account.get('proxy', '') or ''
             try:
                 client = self.create_client(
                     session_string=account['session_string'],
-                    proxy_str=account.get('proxy', ''),
+                    proxy_str=proxy_str,
                     name=f"acc_{account_id}"
                 )
-                await client.start()
+                await asyncio.wait_for(client.start(), timeout=CLIENT_START_TIMEOUT)
                 self.active_clients[account_id] = client
-                # Enforce client limit after adding new client
                 await self._enforce_client_limit()
                 return client, None
-            except Exception as e:
-                err_str = str(e).lower()
-                if "already" in err_str or "started" in err_str:
-                    self.active_clients[account_id] = client
-                    # Enforce client limit after adding new client
-                    await self._enforce_client_limit()
-                    return client, None
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(client.stop(), timeout=3)
+                    except Exception:
+                        try:
+                            await asyncio.wait_for(client.disconnect(), timeout=2)
+                        except Exception:
+                            pass
+
+                kind, detail = _session_error_message(error, proxy_str)
+                if kind == 'proxy':
+                    reason = f"{SESSION_CHECK_PROXY_PREFIX}{detail}"
+                    db.set_account_health(account_id, db.HEALTH_PROXY_ERROR, reason)
+                elif kind == 'network':
+                    reason = f"{SESSION_CHECK_NETWORK_PREFIX}{detail}"
+                    db.set_account_health(account_id, db.HEALTH_PROXY_ERROR, reason)
+                else:
+                    reason = f"{SESSION_CHECK_INVALID_PREFIX}{detail}"
+                    db.set_account_health(account_id, db.HEALTH_BANNED, reason)
                 db.update_account_status(account_id, 'error')
-                return None, f"Ошибка запуска сессии аккаунта: {e}"
+                logger.error(f"❌ [acc {account_id}] подключение остановлено: {reason}")
+                return None, reason
 
     async def get_last_10_pms(self, account_id: int):
         client, err = await self.get_or_start_client(account_id)
@@ -3005,9 +3163,17 @@ class AccountSessionManager:
                 # переподключение могли заменить объект сессии
                 client, cli_err = await self.get_or_start_client(account_id)
                 if not client:
-                    logging.warning(f"⚠️ [{acc_name}] Нет клиента для рассылки ({cli_err}), жду 30с")
-                    await asyncio.sleep(30)
-                    continue
+                    # Ошибка уже зафиксирована в account health. Не превращаем
+                    # один отвалившийся прокси в бесконечный reconnect-цикл.
+                    db.set_account_spam_status(account_id, 0)
+                    logging.error(f"🛑 [{acc_name}] Рассылка остановлена: {cli_err}")
+                    if bot and not notifications_hidden:
+                        await self._safe_bot_message(
+                            bot, user_id,
+                            f"🛑 [{acc_name}] Рассылка остановлена.\n{cli_err}\n\n"
+                            "Проверьте прокси и сбросьте статус в панели аккаунта."
+                        )
+                    break
 
                 # Re-check subscription & status
                 if not db.is_user_subscribed(user_id, ADMIN_ID):

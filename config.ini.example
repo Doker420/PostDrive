@@ -5,7 +5,8 @@
 # Env vars: BOT_TOKEN, BOT_ADMIN, BOT_USERNAME, USER_API_ID, USER_API_HASH,
 #           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, WEBHOOK_DOMAIN, WEBHOOK_PORT,
 #           WEBHOOK_PATH, REDIS_URL
-# Scaling:  MAX_ACTIVE_CLIENTS, MAX_TASKS_PER_USER, MAX_GLOBAL_TASKS, CLIENT_IDLE_TTL
+# Scaling:  MAX_ACTIVE_CLIENTS, MAX_TASKS_PER_USER, MAX_GLOBAL_TASKS, CLIENT_IDLE_TTL,
+#           SESSION_CHECK_TIMEOUT, CLIENT_START_TIMEOUT, SESSION_CHECK_CONCURRENCY
 
 [BOT]
 TOKEN = ВАШ_ТОКЕН_БОТА
@@ -93,3 +94,9 @@ SUPPORT = @support
 ; аккаунт помечается как ограниченный, владелец получает уведомление.
 ; 1800 = 30 минут. Более длинные паузы обычно означают спам-блок.
 MAX_FLOOD_WAIT = 1800
+; Жёсткий таймаут одной проверки сессии, включая подключение через прокси.
+SESSION_CHECK_TIMEOUT = 25
+; Таймаут запуска рабочего Pyrogram-клиента.
+CLIENT_START_TIMEOUT = 30
+; Сколько сессий проверять параллельно в админ-панели.
+SESSION_CHECK_CONCURRENCY = 4

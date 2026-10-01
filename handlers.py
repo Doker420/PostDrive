@@ -156,6 +156,44 @@ logger = logging.getLogger(__name__)
 
 db = DBConnection()
 
+# Telegram leaves a callback button with a spinner until answerCallbackQuery
+# arrives. Some screens do a DB/network operation before rendering the next
+# screen, so every callback handler acknowledges it immediately. The helper is
+# idempotent for nested re-render calls and still allows a later alert/message
+# to replace the empty acknowledgement.
+_callback_answer_state: Dict[str, bool] = {}
+
+async def _answer_callback(callback: CallbackQuery, *args, **kwargs):
+    callback_id = getattr(callback, 'id', None) or str(id(callback))
+    has_message = bool(args) or bool(kwargs.get('text')) or bool(kwargs.get('show_alert'))
+    if _callback_answer_state.get(callback_id) and not has_message:
+        return
+    try:
+        await callback.answer(*args, **kwargs)
+    except TelegramNetworkError as error:
+        # A transient Bot API network error must not prevent the actual screen
+        # handler from running; the edit/send below may still succeed.
+        logger.debug('Callback %s acknowledgement network error: %s', callback_id, error)
+    except TelegramBadRequest as error:
+        # A callback may have expired while a slow Telegram API call was in
+        # progress. The screen itself can still be rendered; do not turn this
+        # harmless race into the global error handler.
+        message = str(error).lower()
+        if (
+            'query is too old' not in message
+            and 'query id is invalid' not in message
+            and 'query_id_invalid' not in message
+        ):
+            raise
+        logger.debug('Callback %s expired before acknowledgement', callback_id)
+    finally:
+        _callback_answer_state[callback_id] = True
+        # Keep this process-local cache bounded. Callback IDs are unique and
+        # retaining them forever would slowly leak memory in a long-running bot.
+        if len(_callback_answer_state) > 10000:
+            for old_id in list(_callback_answer_state)[:2000]:
+                _callback_answer_state.pop(old_id, None)
+
 # ==================== FSM STATES ====================
 class AddAccountStates(StatesGroup):
     WAITING_PROXY = State()
@@ -288,6 +326,8 @@ async def process_referral(user_id: int, referral_code: str, admin_id: int) -> b
         return False
     return db.add_referral(partner['user_id'], user_id)
 
+_mandatory_sub_cache: Dict[int, Tuple[bool, float, str]] = {}
+
 async def check_mandatory_subscription(user_id: int, bot: Bot, ADMIN: int) -> bool:
     enabled = db.get_kv("mandatory_sub_enabled", "0")
     channel = db.get_kv("mandatory_sub_channel", "")
@@ -295,14 +335,33 @@ async def check_mandatory_subscription(user_id: int, bot: Bot, ADMIN: int) -> bo
         return True
     if user_id == ADMIN:
         return True
+
+    # /start и кнопка «проверить» часто приходят подряд. Не отправляем два
+    # одинаковых сетевых запроса к Bot API и не заставляем пользователя ждать
+    # повторно после простоя.
+    now = time.monotonic()
+    cached = _mandatory_sub_cache.get(user_id)
+    if cached and cached[2] == channel and now - cached[1] < (5 if not cached[0] else 30):
+        return cached[0]
+
     try:
-        member = await bot.get_chat_member(channel, user_id)
-        if member.status in ['member', 'administrator', 'creator']:
-            return True
-        return False
+        member = await asyncio.wait_for(
+            bot.get_chat_member(channel, user_id), timeout=8
+        )
+        result = member.status in ['member', 'administrator', 'creator']
+        _mandatory_sub_cache[user_id] = (result, now, channel)
+        return result
+    except asyncio.TimeoutError:
+        logging.warning(
+            "Mandatory subscription check timed out for user %s in %s",
+            user_id, channel
+        )
     except Exception as e:
         logging.error(f"Error checking mandatory subscription for user {user_id} in channel {channel}: {e}")
-        return False
+    # Короткий negative cache предотвращает шквал повторных /start, но не
+    # блокирует повторную проверку надолго при временном сбое Telegram.
+    _mandatory_sub_cache[user_id] = (False, now, channel)
+    return False
 
 async def get_mandatory_sub_keyboard():
     channel = db.get_kv("mandatory_sub_channel", "")
@@ -541,6 +600,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     CHATS_PER_PAGE = 8
     user_selected_leave_chats: Dict[int, set] = {}
 
+    # Проверка сессий администратором — отдельная фоновая задача. Раньше весь
+    # цикл выполнялся прямо внутри callback-хендлера, а каждый мёртвый прокси
+    # мог удерживать его на reconnect. Один клик теперь запускает максимум одну
+    # проверку, а сам callback сразу подтверждается и не выглядит «зависшим».
+    admin_session_check_task: Optional[asyncio.Task] = None
+    admin_session_check_concurrency = max(
+        1, int(config.get('SESSION_CHECK_CONCURRENCY', os.environ.get(
+            'SESSION_CHECK_CONCURRENCY', '4'
+        )))
+    )
+
     IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'img')
 
     async def send_photo(message, photo_name, caption, reply_markup=None):
@@ -665,6 +735,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "check_mandatory_sub")
     async def check_mandatory_sub_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         user_id = callback.from_user.id
         if await check_mandatory_subscription(user_id, bot, ADMIN):
             await state.clear()
@@ -682,7 +753,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             )
             await edit_photo(callback, 'welcome.jpg', text, main_menu_keyboard(user_id, is_admin))
         else:
-            await callback.answer("❌ Вы не подписаны на канал!", show_alert=True)
+            await _answer_callback(callback, "❌ Вы не подписаны на канал!", show_alert=True)
 
     @dp.message(F.text == 'ℹ️ Информация')
     async def info_handler(message: Message, state: FSMContext):
@@ -712,6 +783,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('legal_'))
     async def legal_doc_callback(callback: CallbackQuery):
         # legal_{terms|rules}_{page}
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         doc = parts[1]
         page = int(parts[2]) if len(parts) > 2 else 0
@@ -804,6 +876,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('instructions_start_'))
     async def instructions_start_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         page = int(callback.data.split('_')[-1])
         await state.update_data(instruction_page=page)
         await show_instruction_page(callback, state, page)
@@ -827,6 +900,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('instruction_quiz_start_'))
     async def instruction_quiz_start_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         page = int(callback.data.split('_')[-1])
         await state.update_data(quiz_page=0, quiz_score=0, quiz_correct_answers=[])
         await show_quiz_question(callback, state)
@@ -875,6 +949,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('instruction_quiz_answer_'))
     async def instruction_quiz_answer_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         page = int(parts[3])
         answer = int(parts[4])
@@ -925,28 +1000,28 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             else:
                 await edit_message(message_or_callback, text)
             return
-        
+
         data = await state.get_data()
         selected = data.get('selected_accounts', [])
-        
+
         await state.set_state(MassActionStates.SELECTING_ACCOUNTS)
         await state.update_data(action_type=action, selected_accounts=selected)
-        
+
         buttons = []
         for acc in accounts:
             icon = "☑️" if acc['id'] in selected else "⬜"
             name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
             phone = f"({acc['phone']})" if acc.get('phone') else ""
             buttons.append([InlineKeyboardButton(text=f"{icon} {name} {phone}", callback_data=f"toggle_mass_{action}_{acc['id']}")])
-        
+
         buttons.append([InlineKeyboardButton(text="✅ Далее", callback_data=f"mass_action_next_{action}")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        
+
         action_name = "📨 Рассылка" if action == "spam" else "📥 Инвайтинг"
         text = f"{action_name}\n\nВыберите аккаунты:"
         photo = 'acc.jpg' if action == 'spam' else 'catalog.jpg'
-        
+
         if isinstance(message_or_callback, Message):
             await send_photo(message_or_callback, photo, text, markup)
         else:
@@ -1012,23 +1087,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_ids = data.get('invite_account_ids', [])
         page = data.get('invite_chat_page', 0)
         per_page = 10
-        
+
         all_chats = []
         for acc_id in account_ids:
             # Инвайтить можно только в группы/супергруппы
             for chat in db.get_account_chats(acc_id, chat_types=db.GROUP_CHAT_TYPES):
                 all_chats.append(chat)
-        
+
         total = len(all_chats)
         start = page * per_page
         end = start + per_page
         page_chats = all_chats[start:end]
-        
+
         buttons = []
         for chat in page_chats:
             title = chat.get('chat_title') or chat['chat_id']
             buttons.append([InlineKeyboardButton(text=f"💬 {title[:35]}", callback_data=f"invite_chat_{chat['account_id']}_{chat['chat_id']}")])
-        
+
         total_pages = max(1, (total + per_page - 1) // per_page)
         nav_buttons = []
         if page > 0:
@@ -1037,12 +1112,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"invite_chat_page_{page+1}"))
         if nav_buttons:
             buttons.append(nav_buttons)
-        
+
         buttons.append([InlineKeyboardButton(text="🔗 Ввести ID/ссылку чата", callback_data="invite_custom_chat")])
         buttons.append([InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_invite")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        
+
         text = f"📥 <b>Инвайтинг</b>\n\nЧаты: {total}\nСтраница: {page+1}/{total_pages}\n\nВыберите чат для инвайта:"
         await edit_message(callback, text, markup)
 
@@ -1066,6 +1141,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('toggle_mass_spam_'))
     async def toggle_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         data = await state.get_data()
         selected = data.get('selected_accounts', [])
@@ -1078,6 +1154,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('toggle_mass_invite_'))
     async def toggle_mass_invite_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         data = await state.get_data()
         selected = data.get('selected_accounts', [])
@@ -1094,9 +1171,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         action = data.get('action_type')
         selected = data.get('selected_accounts', [])
         if not selected:
-            await callback.answer("❌ Выберите хотя бы один аккаунт!", show_alert=True)
+            await _answer_callback(callback, "❌ Выберите хотя бы один аккаунт!", show_alert=True)
             return
-        
+
         if action == 'spam':
             await state.clear()
             text = (
@@ -1122,19 +1199,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "refresh_mass_spam")
     async def refresh_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await show_account_selection(callback, 'spam', state)
 
     @dp.callback_query(F.data == "refresh_mass_invite")
     async def refresh_mass_invite_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await show_account_selection(callback, 'invite', state)
 
     @dp.callback_query(F.data == "spam_mode_post")
     async def spam_mode_post_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.update_data(spam_mode='post')
         await ask_for_spam_targets(callback, state)
 
     @dp.callback_query(F.data == "spam_mode_custom")
     async def spam_mode_custom_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.update_data(spam_mode='custom')
         await edit_message(
             callback,
@@ -1176,12 +1257,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('invite_chat_page_'))
     async def invite_chat_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         page = int(callback.data.split('_')[3])
         await state.update_data(invite_chat_page=page)
         await show_invite_chat_selection(callback, state)
 
     @dp.callback_query(F.data == "invite_custom_chat")
     async def invite_custom_chat_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await edit_message(callback, "🔗 <b>Введите ID чата или ссылку:</b>\n\nНапример: -100123456789 или https://t.me/username", reply_markup=cancel_inline_keyboard())
         await state.set_state(InviteStates.WAITING_CUSTOM_CHAT)
 
@@ -1194,6 +1277,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('invite_chat_'))
     async def invite_chat_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         chat_id = '_'.join(parts[3:])
@@ -1212,12 +1296,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_ids = data.get('invite_account_ids', [data.get('invite_account_id')])
         chat_id = data.get('invite_chat_id') or data.get('invite_custom_chat')
         user_id = message.from_user.id
-        
+
         if not chat_id or not account_ids:
             await message.answer("❌ Ошибка состояния!")
             await state.clear()
             return
-        
+
         users = []
         if message.document:
             try:
@@ -1230,21 +1314,21 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 return
         elif message.text:
             users = [l.strip() for l in message.text.strip().split('\n') if l.strip()]
-        
+
         if not users:
             await message.answer("❌ Нет пользователей в файле!")
             return
-        
+
         await state.clear()
-        
+
         valid_account_ids = [aid for aid in account_ids if aid]
         if not valid_account_ids:
             await message.answer("❌ Не выбраны аккаунты для инвайта!")
             return
-        
+
         per_account = len(users) // len(valid_account_ids)
         remainder = len(users) % len(valid_account_ids)
-        
+
         start = 0
         for idx, account_id in enumerate(valid_account_ids):
             count = per_account + (1 if idx < remainder else 0)
@@ -1252,7 +1336,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             start += count
             await message.answer(f"🚀 [{idx+1}/{len(valid_account_ids)}] Запускаю инвайт {len(chunk)} пользователей на аккаунт #{account_id}...")
             asyncio.create_task(account_manager.run_limited(account_manager.invite_users(account_id, chat_id, list(chunk), bot, user_id, auto_join=True)))
-        
+
         await state.clear()
         await message.answer(
             "✅ Инвайт запущен в фоне. Вы получите уведомления о прогрессе и результате.",
@@ -1261,6 +1345,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "cancel_action", StateFilter('*'))
     async def cancel_action_handler(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         _stop_qr_poller(callback.from_user.id)
         if account_manager:
             account_manager.cancel_phone_auth(callback.from_user.id)
@@ -1272,7 +1357,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         data = await state.get_data()
         account_ids = data.get('spam_account_ids', [])
         user_id = message.from_user.id
-        
+
         targets = []
         if message.document:
             try:
@@ -1285,11 +1370,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 return
         elif message.text:
             targets = [l.strip() for l in message.text.strip().split('\n') if l.strip()]
-        
+
         if not targets:
             await message.answer("❌ Нет целей! Отправьте файл или список.")
             return
-        
+
         parsed_targets = []
         for t in targets:
             if t.startswith('https://t.me/'):
@@ -1302,11 +1387,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 parsed_targets.append(int(t))
             else:
                 parsed_targets.append(f"@{t}")
-        
+
         if not parsed_targets:
             await message.answer("❌ Не удалось распознать цели!")
             return
-        
+
         await _start_spam_distribution(message, state, user_id, parsed_targets, data)
 
     async def _start_spam_distribution(answer_to, state: FSMContext, user_id: int,
@@ -1360,11 +1445,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def spam_speed_callback(callback: CallbackQuery, state: FSMContext):
         code = callback.data.rsplit('_', 1)[-1]
         if code not in SPAM_SPEED_LABELS:
-            await callback.answer("❌ Неизвестная скорость", show_alert=True)
+            await _answer_callback(callback, "❌ Неизвестная скорость", show_alert=True)
             return
         await state.update_data(spam_speed=code)
         label, hint = SPAM_SPEED_LABELS[code]
-        await callback.answer(f"{label}: {hint}", show_alert=(code == 'fast'))
+        await _answer_callback(callback, f"{label}: {hint}", show_alert=(code == 'fast'))
         await ask_for_spam_targets(callback, state)
 
     @dp.callback_query(F.data == "spam_targets_contacts", MassActionStates.WAITING_TARGETS)
@@ -1374,9 +1459,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         data = await state.get_data()
         account_ids = [a for a in data.get('spam_account_ids', []) if a]
         if not account_ids:
-            await callback.answer("❌ Сначала выберите аккаунты.", show_alert=True)
+            await _answer_callback(callback, "❌ Сначала выберите аккаунты.", show_alert=True)
             return
-        await callback.answer("📇 Собираю контакты…")
+        await _answer_callback(callback, "📇 Собираю контакты…")
         status = await callback.message.answer("📇 Загружаю контакты аккаунтов…")
 
         targets, problems, per_acc = [], [], []
@@ -1408,57 +1493,58 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def acc_pms_callback(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         account_id = int(callback.data.split('_')[2])
-        
-        await callback.answer("⏳ Синхронизация...", show_alert=False)
+
+        await _answer_callback(callback, "⏳ Синхронизация...", show_alert=False)
         _, err = await account_manager.fetch_and_sync_chats(account_id)
         if err:
-            await callback.answer(f"⚠️ Ошибка синхронизации: {err}", show_alert=True)
-        
+            await _answer_callback(callback, f"⚠️ Ошибка синхронизации: {err}", show_alert=True)
+
         per_page = 20
         total = db.get_account_private_chats_count(account_id)
         chats = db.get_account_private_chats(account_id, page=0, per_page=per_page)
-        
+
         if not chats:
-            await callback.answer("💬 Нет личных чатов!", show_alert=True)
+            await _answer_callback(callback, "💬 Нет личных чатов!", show_alert=True)
             return
-        
+
         buttons = []
         for chat in chats:
             title = chat.get('chat_title') or chat['chat_id']
             buttons.append([InlineKeyboardButton(text=f"💬 {title[:35]}", callback_data=f"pm_chat_{account_id}_{chat['chat_id']}")])
-        
+
         total_pages = max(1, (total + per_page - 1) // per_page)
         nav_buttons = []
         if total_pages > 1:
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"pm_page_{account_id}_1"))
         if nav_buttons:
             buttons.append(nav_buttons)
-        
+
         buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"acc_pms_{account_id}")])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        
+
         text = f"💬 <b>Личные чаты</b> (стр. 1/{total_pages})\n\nВыберите чат для ответа:"
         await edit_message(callback, text, markup)
 
     @dp.callback_query(F.data.startswith('pm_page_'))
     async def pm_page_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3])
         per_page = 20
         total = db.get_account_private_chats_count(account_id)
         chats = db.get_account_private_chats(account_id, page=page, per_page=per_page)
-        
+
         if not chats:
-            await callback.answer("📭 Пусто!", show_alert=True)
+            await _answer_callback(callback, "📭 Пусто!", show_alert=True)
             return
-        
+
         buttons = []
         for chat in chats:
             title = chat.get('chat_title') or chat['chat_id']
             buttons.append([InlineKeyboardButton(text=f"💬 {title[:35]}", callback_data=f"pm_chat_{account_id}_{chat['chat_id']}")])
-        
+
         total_pages = max(1, (total + per_page - 1) // per_page)
         nav_buttons = []
         if page > 0:
@@ -1467,38 +1553,39 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"pm_page_{account_id}_{page+1}"))
         if nav_buttons:
             buttons.append(nav_buttons)
-        
+
         buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"acc_pms_{account_id}")])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        
+
         text = f"💬 <b>Личные чаты</b> (стр. {page+1}/{total_pages})\n\nВыберите чат для ответа:"
         await edit_message(callback, text, markup)
 
     @dp.callback_query(F.data.startswith('pm_chat_'))
     async def pm_chat_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         chat_id = '_'.join(parts[3:])
         await state.update_data(pm_account_id=account_id, pm_chat_id=chat_id)
         await state.set_state(AccountSettingsStates.WAITING_FOR_PM_REPLY)
-        
+
         chat_title = chat_id
         account_chats = db.get_account_chats(account_id)
         for c in account_chats:
             if c['chat_id'] == chat_id:
                 chat_title = c.get('chat_title') or chat_id
                 break
-        
+
         print(f"DEBUG: Looking for chat_id={chat_id}, found title={chat_title}, total chats={len(account_chats)}")
-        
+
         last_messages = []
         try:
             last_messages = await account_manager.get_last_private_messages(account_id, chat_id, limit=3)
             print(f"DEBUG: Got {len(last_messages)} messages for chat {chat_id}")
         except Exception as e:
             print(f"Error fetching last messages for {chat_id}: {e}")
-        
+
         quote_text = f"💬 <b>Ответ в:</b> {chat_title}\n"
         if last_messages:
             quote_text += "\n<b>💭 Последние сообщения:</b>\n"
@@ -1510,12 +1597,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             quote_text += "\n<i>Нет сообщений в истории</i>\n"
         quote_text += "\n✏️ <b>Отправьте сообщение</b> (текст/фото/стикер/документ/голос):"
-        
+
         try:
             await callback.message.delete()
         except:
             pass
-        
+
         await callback.message.answer(
             quote_text,
             reply_markup=cancel_inline_keyboard()
@@ -1526,27 +1613,27 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         data = await state.get_data()
         account_id = data.get('pm_account_id')
         chat_id = data.get('pm_chat_id')
-        
+
         if not account_id or not chat_id:
             await state.clear()
             await message.answer("❌ Ошибка состояния!")
             return
-        
+
         account = db.get_account(account_id)
         if not account:
             await state.clear()
             await message.answer("❌ Аккаунт не найден!")
             return
-        
+
         client, err = await account_manager.get_or_start_client(account_id)
         if not client:
             await state.clear()
             await message.answer(f"❌ Ошибка подключения: {err}")
             return
-        
+
         target = int(chat_id) if chat_id.startswith('-') or chat_id.isdigit() else chat_id
         sent = False
-        
+
         try:
             if message.text:
                 await client.send_message(target, message.text)
@@ -1622,7 +1709,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             await message.answer(f"❌ Ошибка отправки: {e}")
             return
-        
+
         await state.clear()
         if sent:
             await message.answer("✅ Сообщение отправлено!")
@@ -1683,11 +1770,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "back_to_subscription")
     async def back_to_subscription_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         await render_subscription(callback, callback.from_user.id)
 
     @dp.callback_query(F.data == "show_tariffs")
     async def show_tariffs_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         tariffs = db.get_tariffs(active_only=True)
         tariffs = sorted(tariffs, key=lambda t: (t.get('sort_order') or 0, t.get('price_usd') or 0))
         rows, lines = [], []
@@ -1715,7 +1804,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         tariff_id = int(callback.data.split('_')[2])
         t = db.get_tariff(tariff_id)
         if not t:
-            await callback.answer("❌ Тариф не найден", show_alert=True)
+            await _answer_callback(callback, "❌ Тариф не найден", show_alert=True)
             return
         price = float(t['price_usd'])
         icon = TARIFF_ICONS.get(t.get('code', ''), '📦')
@@ -1750,19 +1839,20 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         t = db.get_tariff(tariff_id)
         if not t or float(t['price_usd']) > 0:
-            await callback.answer("❌ Недоступно", show_alert=True)
+            await _answer_callback(callback, "❌ Недоступно", show_alert=True)
             return
         ent = db.get_user_entitlements(user_id)
         if ent.get('tariff_code'):
-            await callback.answer("🎁 Пробный период уже активировался ранее.", show_alert=True)
+            await _answer_callback(callback, "🎁 Пробный период уже активировался ранее.", show_alert=True)
             return
         db.add_subscription_days(user_id, int(t['duration_days']))
         db.set_user_tariff(user_id, t.get('code') or 'trial')
-        await callback.answer("🎉 Пробный доступ активирован!", show_alert=True)
+        await _answer_callback(callback, "🎉 Пробный доступ активирован!", show_alert=True)
         await render_subscription(callback, user_id)
 
     @dp.callback_query(F.data == "show_addons")
     async def show_addons_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         text = (
             "➕ <b>Дополнительные пакеты</b>\n\n"
             f"🔹 <b>Слот аккаунта</b> — ${db.ADDON_ACCOUNT_SLOT_USD:.0f}/мес\n"
@@ -1789,13 +1879,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def addon_callback(callback: CallbackQuery):
         kind = callback.data.split('_', 1)[1]
         if kind == 'warmup':
-            await callback.answer(
+            await _answer_callback(callback,
                 "🔥 Прогрев аккаунтов скоро будет доступен. "
                 f"Напишите в поддержку {SUPPORT_CONTACT} для ручного подключения.",
                 show_alert=True
             )
             return
-        await callback.answer(
+        await _answer_callback(callback,
             f"Для покупки пакета напишите в поддержку {SUPPORT_CONTACT}. "
             "Автооплата пакетов появится в ближайшем обновлении.",
             show_alert=True
@@ -1803,6 +1893,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "howto_pay")
     async def howto_pay_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         text = (
             "💡 <b>Как оплатить подписку</b>\n\n"
             "<b>Способ 1. Telegram Stars</b> ⭐ <i>(быстро, прямо в Telegram)</i>\n"
@@ -1830,12 +1921,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def buy_stars_callback(callback: CallbackQuery):
         """Оплата через Telegram Stars (XTR) — нативный инвойс Telegram."""
         if not STARS_ENABLED:
-            await callback.answer("⭐ Оплата звёздами отключена", show_alert=True)
+            await _answer_callback(callback, "⭐ Оплата звёздами отключена", show_alert=True)
             return
         tariff_id = int(callback.data.split('_')[2])
         t = db.get_tariff(tariff_id)
         if not t:
-            await callback.answer("❌ Тариф не найден", show_alert=True)
+            await _answer_callback(callback, "❌ Тариф не найден", show_alert=True)
             return
         stars = _usd_to_stars(float(t['price_usd']))
         from aiogram.types import LabeledPrice
@@ -1853,10 +1944,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 provider_token="",                    # для XTR токен не нужен
                 start_parameter="postdrive-sub"
             )
-            await callback.answer("⭐ Счёт отправлен")
+            await _answer_callback(callback, "⭐ Счёт отправлен")
         except Exception as e:
             logger.error(f"Stars invoice failed: {e}")
-            await callback.answer(f"❌ Не удалось создать счёт: {str(e)[:150]}", show_alert=True)
+            await _answer_callback(callback, f"❌ Не удалось создать счёт: {str(e)[:150]}", show_alert=True)
 
     @dp.pre_checkout_query()
     async def stars_pre_checkout(pre_checkout_query):
@@ -1912,6 +2003,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "enter_promo")
     async def enter_promo_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(PromoStates.WAITING_PROMO_CODE)
         await edit_message(callback, "🎁 <b>Введите промокод:</b>", reply_markup=cancel_inline_keyboard())
 
@@ -1939,7 +2031,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         tariff_id = int(callback.data.split('_')[2])
         tariff = db.get_tariff(tariff_id)
         if not tariff:
-            await callback.answer("❌ Тариф не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Тариф не найден!", show_alert=True)
             return
 
         user_id = callback.from_user.id
@@ -1968,7 +2060,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_tariffs")]
         ]
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, 
+        await edit_message(callback,
             f"🧾 <b>Счёт на оплату #{invoice_id}</b>\n\n"
             f"• <b>Тариф:</b> {tariff['name']} ({tariff['duration_days']} дн.)\n"
             f"• <b>Сумма к оплате:</b> <code>{amount:.2f} USDT</code>\n\n"
@@ -1979,6 +2071,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('check_pay_'))
     async def check_payment_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         invoice_id = int(callback.data.split('_')[2])
         token_to_use = db.get_kv("cryptobot_token", CRYPTO_BOT_TOKEN)
         client = CryptoBotClient(token_to_use, testnet=TESTNET)
@@ -2004,10 +2097,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
             await edit_message(callback, f"🎉 <b>Оплата успешно подтверждена!</b>\n\n✅ Ваша подписка активна до: <b>{sub_until}</b>")
         else:
-            await callback.answer("⏳ Оплата ещё не поступила.", show_alert=True)
+            await _answer_callback(callback, "⏳ Оплата ещё не поступила.", show_alert=True)
 
     @dp.callback_query(F.data == "back_to_tariffs")
     async def back_to_tariffs_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         tariffs = db.get_tariffs(active_only=True)
         buttons = [[InlineKeyboardButton(text=f"🛒 {t['name']} — ${t['price_usd']:.2f} (USDT)", callback_data=f"buy_tariff_{t['id']}")] for t in tariffs]
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -2051,11 +2145,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
-            await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            await _answer_callback(callback, "🔒 Требуется активная подписка!", show_alert=True)
             return
         allowed, reason, limits = db.can_add_account(user_id, ADMIN)
         if not allowed:
-            await callback.answer(
+            await _answer_callback(callback,
                 f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
                 show_alert=True
             )
@@ -2069,6 +2163,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "skip_proxy", AddAccountStates.WAITING_PROXY)
     async def skip_proxy_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.update_data(proxy="")
         await show_auth_method_selection(callback, state)
 
@@ -2104,6 +2199,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "auth_phone", AddAccountStates.WAITING_METHOD)
     async def auth_phone_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AddAccountStates.WAITING_PHONE)
         await edit_message(callback, "📱 Введите номер телефона:", reply_markup=cancel_inline_keyboard())
 
@@ -2171,6 +2267,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "auth_string_session", AddAccountStates.WAITING_METHOD)
     async def auth_string_session_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AddAccountStates.WAITING_SESSION_STRING)
         await edit_message(callback, "📄 Отправьте String Session:", reply_markup=cancel_inline_keyboard())
 
@@ -2259,6 +2356,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "auth_qr", AddAccountStates.WAITING_METHOD)
     async def auth_qr_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         user_id = callback.from_user.id
         _stop_qr_poller(user_id)
         account_manager.cancel_phone_auth(user_id)     # закрываем прошлую временную сессию
@@ -2310,17 +2408,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         task = qr_pollers.get(user_id)
         if task and not task.done():
-            await callback.answer("⏳ Уже проверяю вход, подождите — ничего нажимать не нужно.",
+            await _answer_callback(callback, "⏳ Уже проверяю вход, подождите — ничего нажимать не нужно.",
                                   show_alert=True)
             return
         if user_id not in account_manager.temp_auth_clients:
-            await callback.answer("⌛ QR-сессия истекла. Запустите добавление аккаунта заново.",
+            await _answer_callback(callback, "⌛ QR-сессия истекла. Запустите добавление аккаунта заново.",
                                   show_alert=True)
             return
         data = await state.get_data()
         proxy_str = data.get('proxy', '')
         status_msg = await callback.message.answer("⏳ Проверяю подтверждение входа…")
-        await callback.answer()
+        await _answer_callback(callback)
         qr_pollers[user_id] = asyncio.create_task(
             _qr_poll(user_id, proxy_str, state, callback.message, status_msg))
 
@@ -2373,11 +2471,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
-            await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            await _answer_callback(callback, "🔒 Требуется активная подписка!", show_alert=True)
             return
         allowed, reason, limits = db.can_add_account(user_id, ADMIN)
         if not allowed:
-            await callback.answer(
+            await _answer_callback(callback,
                 f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».",
                 show_alert=True
             )
@@ -2391,6 +2489,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "skip_proxy", AddAccountStates.WAITING_PROXY)
     async def skip_proxy_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.update_data(proxy="")
         await show_auth_method_selection(callback, state)
 
@@ -2426,6 +2525,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "auth_phone", AddAccountStates.WAITING_METHOD)
     async def auth_phone_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AddAccountStates.WAITING_PHONE)
         await edit_message(callback, "📱 Введите номер телефона:", reply_markup=cancel_inline_keyboard())
 
@@ -2493,6 +2593,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "auth_string_session", AddAccountStates.WAITING_METHOD)
     async def auth_string_session_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AddAccountStates.WAITING_SESSION_STRING)
         await edit_message(callback, "📄 Отправьте String Session:", reply_markup=cancel_inline_keyboard())
 
@@ -2615,6 +2716,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 text += (f"\n\n🚫 <b>Сессия недействительна</b>\n"
                          f"{reason[:200]}\n\n"
                          f"Аккаунт нужно подключить заново (удалите и добавьте снова).")
+            elif health == 'proxy_error':
+                transport_name = "прокси" if account.get('proxy') else "сетевое соединение"
+                text += (f"\n\n🌐 <b>Недоступно: {transport_name}</b>\n"
+                         f"{reason[:200]}\n\n"
+                         f"Автоподключение и рассылка остановлены, чтобы не зациклить попытки.\n"
+                         f"Проверьте {transport_name} и нажмите «♻️ Сбросить статус ограничения», "
+                         f"после чего запустите проверку ещё раз.")
 
         fc = account.get('flood_count') or 0
         if fc:
@@ -2634,12 +2742,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.rsplit('_', 1)[1])
         account = db.get_account(account_id)
         if not account or account['user_id'] != callback.from_user.id:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         db.clear_account_health(account_id)
-        if account.get('status') == 'banned':
+        if account.get('status') in ('banned', 'error'):
             db.update_account_status(account_id, 'active')
-        await callback.answer(
+        await _answer_callback(callback,
             "♻️ Статус сброшен. Если ограничение ещё действует, Telegram выдаст его снова.",
             show_alert=True
         )
@@ -2647,12 +2755,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('manage_acc_'))
     async def manage_acc_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         account_id = int(callback.data.split('_')[2])
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data == "back_to_accounts")
     async def back_to_accounts_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         user_id = callback.from_user.id
         accounts = db.get_user_accounts(user_id)
@@ -2673,39 +2783,39 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[2])
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
-            await callback.answer("🔒 Требуется активная подписка!", show_alert=True)
+            await _answer_callback(callback, "🔒 Требуется активная подписка!", show_alert=True)
             return
         account = db.get_account(account_id)
         if not account or not account.get('post_text'):
-            await callback.answer("⚠️ Сначала настройте текст поста!", show_alert=True)
+            await _answer_callback(callback, "⚠️ Сначала настройте текст поста!", show_alert=True)
             return
         chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
             await account_manager.fetch_and_sync_chats(account_id)
             chats = db.get_account_chats(account_id, spam_only=True, chat_types=db.GROUP_CHAT_TYPES)
         if not chats:
-            await callback.answer("⚠️ Нет выбранных групп для рассылки!", show_alert=True)
+            await _answer_callback(callback, "⚠️ Нет выбранных групп для рассылки!", show_alert=True)
             return
         ok, msg = await account_manager.start_account_spam(account_id, bot, user_id)
-        await callback.answer(msg, show_alert=True)
+        await _answer_callback(callback, msg, show_alert=True)
         await render_account_dashboard(callback, account_id, user_id)
 
     @dp.callback_query(F.data.startswith('stop_spam_'))
     async def stop_spam_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
         await account_manager.stop_account_spam(account_id, callback.from_user.id)
-        await callback.answer("🛑 Рассылка остановлена", show_alert=True)
+        await _answer_callback(callback, "🛑 Рассылка остановлена", show_alert=True)
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('acc_sync_'))
     async def acc_sync_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
-        await callback.answer("⏳ Синхронизация...", show_alert=False)
+        await _answer_callback(callback, "⏳ Синхронизация...", show_alert=False)
         chats, err = await account_manager.fetch_and_sync_chats(account_id)
         if err:
-            await callback.answer(f"❌ Ошибка: {err}", show_alert=True)
+            await _answer_callback(callback, f"❌ Ошибка: {err}", show_alert=True)
         else:
-            await callback.answer(f"✅ Найдено {len(chats)} чатов!", show_alert=True)
+            await _answer_callback(callback, f"✅ Найдено {len(chats)} чатов!", show_alert=True)
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('toggle_notif_'))
@@ -2713,14 +2823,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[2])
         account = db.get_account(account_id)
         if not account:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         new_state = 0 if account.get('notifications_hidden', 0) == 1 else 1
         db.toggle_notifications(account_id, new_state)
         if new_state == 1:
-            await callback.answer("🔕 Уведомления скрыты (только успешные отправки)", show_alert=True)
+            await _answer_callback(callback, "🔕 Уведомления скрыты (только успешные отправки)", show_alert=True)
         else:
-            await callback.answer("🔔 Уведомления показываются", show_alert=True)
+            await _answer_callback(callback, "🔔 Уведомления показываются", show_alert=True)
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('acc_report_'))
@@ -2728,17 +2838,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[2])
         account = db.get_account(account_id)
         if not account:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
-        
+
         reports = db.get_account_reports(account_id)
         if not reports:
-            await callback.answer("📊 Нет отчетов. Запустите рассылку.", show_alert=True)
+            await _answer_callback(callback, "📊 Нет отчетов. Запустите рассылку.", show_alert=True)
             return
-        
+
         last_report = reports[0]
         report_chats = db.get_report_chats(last_report['id'])
-        
+
         text = f"📊 <b>Отчет: {account.get('account_name', f'#{account_id}')}</b>\n\n"
         text += f"💬 Текст: {last_report.get('post_text', '')[:100]}...\n"
         text += f"✅ Отправлено: {last_report.get('sent_count', 0)}\n"
@@ -2746,7 +2856,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         text += f"📅 Запущен: {format_date(last_report.get('started_at', 0))}\n"
         if last_report.get('finished_at'):
             text += f"🏁 Завершен: {format_date(last_report.get('finished_at', 0))}\n"
-        
+
         buttons = [
             [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"download_report_{last_report['id']}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
@@ -2759,9 +2869,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         report_id = int(callback.data.split('_')[2])
         report_chats = db.get_report_chats(report_id)
         if not report_chats:
-            await callback.answer("📊 Нет данных!", show_alert=True)
+            await _answer_callback(callback, "📊 Нет данных!", show_alert=True)
             return
-        
+
         import csv
         import io
         output = io.StringIO()
@@ -2783,6 +2893,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('acc_parse_'))
     async def acc_parse_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         parts = callback.data.split('_')
         account_id = int(parts[2])
@@ -2793,7 +2904,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             account_id, page=page, per_page=per_page, chat_types=db.GROUP_CHAT_TYPES
         )
         if total == 0:
-            await callback.answer("💬 Групп не найдено. Синхронизируйте чаты!", show_alert=True)
+            await _answer_callback(callback, "💬 Групп не найдено. Синхронизируйте чаты!", show_alert=True)
             return
         total_pages = max(1, (total + per_page - 1) // per_page)
         if page >= total_pages:
@@ -2826,6 +2937,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('parsecfg_'))
     async def parse_config_callback(callback: CallbackQuery, state: FSMContext):
         # parsecfg_{account_id}_{page}_{chat_id}
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[1])
         page = int(parts[2])
@@ -2858,6 +2970,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('parsecustom_'))
     async def parse_custom_depth_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[1])
         chat_id = '_'.join(parts[2:])
@@ -2941,16 +3054,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         history_limit = int(parts[2])
         chat_id = '_'.join(parts[3:])
         await state.clear()
-        await callback.answer("🚀 Запускаю парсинг...")
+        await _answer_callback(callback, "🚀 Запускаю парсинг...")
         await start_parse_task(callback, account_id, chat_id, history_limit, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('cancel_parse_'))
     async def cancel_parse_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
         if account_manager.cancel_parse(account_id):
-            await callback.answer("🛑 Парсинг отменен!", show_alert=True)
+            await _answer_callback(callback, "🛑 Парсинг отменен!", show_alert=True)
         else:
-            await callback.answer("❌ Нет активного парсинга", show_alert=True)
+            await _answer_callback(callback, "❌ Нет активного парсинга", show_alert=True)
 
     PARSED_PER_PAGE = 20
 
@@ -2966,7 +3079,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         users, total = db.get_parsed_users_paginated(account_id, user_id,
                                                      page=page, per_page=per_page)
         if total == 0:
-            await callback.answer(
+            await _answer_callback(callback,
                 "📭 Список пуст. Сначала запустите парсинг группы.", show_alert=True)
             return
 
@@ -3029,7 +3142,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         users = db.get_parsed_users(account_id, user_id)
         if not users:
-            await callback.answer("📊 Нет данных!", show_alert=True)
+            await _answer_callback(callback, "📊 Нет данных!", show_alert=True)
             return
         import csv, io
         output = io.StringIO()
@@ -3052,7 +3165,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         data = '\ufeff' + output.getvalue()
         file = BufferedInputFile(data.encode('utf-8'),
                                  filename=f"parsed_users_{account_id}.csv")
-        await callback.answer("📥 Готовлю CSV...")
+        await _answer_callback(callback, "📥 Готовлю CSV...")
         await callback.message.answer_document(
             file,
             caption=(f"👥 Спарсено: {len(users)}\n\n"
@@ -3065,9 +3178,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         users = db.get_parsed_users(account_id, user_id)
         if not users:
-            await callback.answer("📊 Нет данных!", show_alert=True)
+            await _answer_callback(callback, "📊 Нет данных!", show_alert=True)
             return
-        await callback.answer("🌐 Собираю таблицу...")
+        await _answer_callback(callback, "🌐 Собираю таблицу...")
         acc = db.get_account(account_id)
         acc_name = (acc.get('account_name') if acc else None) or f"Аккаунт #{account_id}"
         html = _build_parsed_html(users, acc_name)
@@ -3081,6 +3194,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('parsed_clear_'))
     async def parsed_clear_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Да, очистить",
@@ -3096,7 +3210,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def parsed_clear_ok_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[2])
         db.clear_parsed_users(account_id, callback.from_user.id)
-        await callback.answer("🗑 Список очищен", show_alert=True)
+        await _answer_callback(callback, "🗑 Список очищен", show_alert=True)
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('parsed_users_page_'))
@@ -3104,11 +3218,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         parts = callback.data.split('_')
         account_id = int(parts[3])
         page = int(parts[4])
-        await callback.answer()
+        await _answer_callback(callback)
         await _render_parsed_users(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('acc_del_'))
     async def acc_del_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"confirm_del_acc_{account_id}")],
@@ -3123,7 +3238,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await account_manager.stop_account_spam(account_id, user_id)
         await account_manager.stop_client(account_id)
         db.delete_account(account_id, user_id)
-        await callback.answer("✅ Аккаунт удалён", show_alert=True)
+        await _answer_callback(callback, "✅ Аккаунт удалён", show_alert=True)
         await back_to_accounts_callback(callback, None)
 
     # ==================== NEUROCOMMENTING ====================
@@ -3162,7 +3277,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         account = db.get_account(account_id)
         if not account or account['user_id'] != user_id:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         nc = db.get_neurocomment_settings(account_id)
         status = "🟢 Включен" if nc and nc.get('enabled') else "🔴 Выключен"
@@ -3205,6 +3320,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('nc_mode_prompt_'))
     async def nc_mode_prompt_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         await state.update_data(nc_account_id=account_id)
         await state.set_state(NeuroCommentStates.WAITING_PROMPT)
@@ -3253,14 +3369,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         which = parts[2] if len(parts) > 2 else 'prompt'
         nc = db.get_neurocomment_settings(account_id)
         if not nc:
-            await callback.answer("❌ Сначала задайте промт!", show_alert=True)
+            await _answer_callback(callback, "❌ Сначала задайте промт!", show_alert=True)
             return
         instruction = nc.get('post_prompt' if which == 'post_prompt' else 'prompt', '') or ''
         if not instruction.strip():
-            await callback.answer("❌ Промт пуст!", show_alert=True)
+            await _answer_callback(callback, "❌ Промт пуст!", show_alert=True)
             return
 
-        await callback.answer("⏳ Генерирую...")
+        await _answer_callback(callback, "⏳ Генерирую...")
         demo_post = (
             "Сегодня рынок снова удивил: основные активы прибавили около 5% за сутки. "
             "Аналитики спорят, коррекция это или начало нового тренда."
@@ -3295,6 +3411,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('nc_mode_custom_'))
     async def nc_mode_custom_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         await state.update_data(nc_account_id=account_id)
         await state.set_state(NeuroCommentStates.WAITING_CUSTOM_COMMENTS)
@@ -3327,6 +3444,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('nc_mode_post_prompt_'))
     async def nc_mode_post_prompt_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[4])
         await state.update_data(nc_account_id=account_id)
         await state.set_state(NeuroCommentStates.WAITING_POST_PROMPT)
@@ -3398,13 +3516,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def nc_channels_callback(callback: CallbackQuery, state: FSMContext):
         parts = callback.data.split('_')
         if len(parts) < 3 or not parts[2].isdigit():
-            await callback.answer("❌ Неверные данные кнопки. Откройте меню заново.",
+            await _answer_callback(callback, "❌ Неверные данные кнопки. Откройте меню заново.",
                                   show_alert=True)
             return
         await _render_nc_channels_menu(callback, state, int(parts[2]))
 
     @dp.callback_query(F.data.startswith('ncman_'))
     async def nc_manual_channels_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[1])
         await state.update_data(nc_account_id=account_id)
         await state.set_state(NeuroCommentStates.WAITING_TARGET_CHANNELS)
@@ -3421,7 +3540,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def nc_clear_channels_callback(callback: CallbackQuery, state: FSMContext):
         account_id = int(callback.data.split('_')[1])
         _nc_save_channels(account_id, callback.from_user.id, [])
-        await callback.answer("🗑 Список очищен")
+        await _answer_callback(callback, "🗑 Список очищен")
         await _render_nc_channels_menu(callback, state, account_id)
 
     _nc_scanning = set()
@@ -3433,7 +3552,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         cache_key = f"nc_channels_cache_{account_id}"
 
         if account_id in _nc_scanning:
-            await callback.answer(
+            await _answer_callback(callback,
                 "⏳ Поиск каналов уже идёт.\n\n"
                 "Дождитесь окончания — не нажимайте кнопки.",
                 show_alert=True
@@ -3442,7 +3561,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         _nc_scanning.add(account_id)
         try:
-            await callback.answer("⏳ Начинаю поиск...")
+            await _answer_callback(callback, "⏳ Начинаю поиск...")
             total_channels = db.count_account_chats(account_id, chat_types=('channel',))
             # Каналы запрашиваются пачками по 100 (1 запрос на пачку)
             eta = max(5, int((total_channels / 100 + 1) * 3))
@@ -3472,7 +3591,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                         inline_keyboard=[[InlineKeyboardButton(
                             text="◀️ Назад", callback_data=f"nc_channels_{account_id}")]]))
                 except Exception:
-                    await callback.answer(f"❌ {err}", show_alert=True)
+                    await _answer_callback(callback, f"❌ {err}", show_alert=True)
                 return None, err
             await state.update_data(**{cache_key: cached, 'nc_account_id': account_id})
             return cached, None
@@ -3498,7 +3617,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 return
 
         if not cached:
-            await callback.answer(
+            await _answer_callback(callback,
                 "📢 Каналов с открытыми комментариями не найдено. "
                 "Синхронизируйте чаты или добавьте каналы вручную.",
                 show_alert=True
@@ -3538,6 +3657,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('nccl_'))
     async def nc_channel_list_callback(callback: CallbackQuery, state: FSMContext):
         # nccl_{account_id}_{page}
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[1])
         page = int(parts[2]) if len(parts) > 2 else 0
@@ -3545,6 +3665,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('ncrf_'))
     async def nc_refresh_channels_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[1])
         cached, err = await _load_nc_channels(callback, state, account_id, refresh=True)
         if err:
@@ -3554,6 +3675,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('nctg_'))
     async def nc_toggle_channel_callback(callback: CallbackQuery, state: FSMContext):
         # nctg_{account_id}_{page}_{chat_id}
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[1])
         page = int(parts[2])
@@ -3563,7 +3685,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         cached = data.get(f"nc_channels_cache_{account_id}", [])
         if not cached:
             # FSM-состояние потеряно (перезапуск бота) — список нужно искать заново
-            await callback.answer(
+            await _answer_callback(callback,
                 "⚠️ Список устарел. Нажмите «🔄 Обновить список».", show_alert=True
             )
             return
@@ -3578,7 +3700,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             channels.append(ref)
         _nc_save_channels(account_id, callback.from_user.id, channels)
-        await callback.answer("☑️ Выбран" if ref in channels else "⬜ Снят")
+        await _answer_callback(callback, "☑️ Выбран" if ref in channels else "⬜ Снят")
         await _render_nc_channels(callback, state, account_id, page, cached=cached)
 
     @dp.message(NeuroCommentStates.WAITING_TARGET_CHANNELS)
@@ -3607,6 +3729,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('nc_delay_'))
     async def nc_delay_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         await state.update_data(nc_account_id=account_id)
         await state.set_state(NeuroCommentStates.WAITING_COMMENT_DELAY)
@@ -3643,7 +3766,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         account_id = int(callback.data.split('_')[2])
         if not db.is_user_subscribed(user_id, ADMIN):
-            await callback.answer(
+            await _answer_callback(callback,
                 "🔒 Подписка не активна.\n\n"
                 "Если вы её оплачивали — нажмите «💳 Подписка» и проверьте статус, "
                 "либо напишите в поддержку.",
@@ -3652,7 +3775,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         nc = db.get_neurocomment_settings(account_id)
         if not nc:
-            await callback.answer("❌ Сначала настройте режим нейрокомментинга!", show_alert=True)
+            await _answer_callback(callback, "❌ Сначала настройте режим нейрокомментинга!", show_alert=True)
             return
         new_state = 0 if nc.get('enabled') == 1 else 1
         db.update_neurocomment_settings(account_id, enabled=new_state)
@@ -3665,15 +3788,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     msg += ("\n\nЕсли аккаунт уже разблокирован (проверьте @SpamBot), "
                             "сбросьте статус кнопкой «♻️ Сбросить статус ограничения» в меню аккаунта.")
                 msg = "❌ " + msg
-            await callback.answer(msg, show_alert=True)
+            await _answer_callback(callback, msg, show_alert=True)
         else:
             await account_manager.stop_neurocomment(account_id, callback.from_user.id)
-            await callback.answer("🛑 Нейрокомментинг остановлен", show_alert=True)
+            await _answer_callback(callback, "🛑 Нейрокомментинг остановлен", show_alert=True)
         await state.clear()
         await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
 
     @dp.callback_query(F.data == "back_to_neurocomment")
     async def back_to_neurocomment_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
 
@@ -3701,6 +3825,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "become_partner")
     async def become_partner_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         user_id = callback.from_user.id
         partner = db.get_partner(user_id)
         if partner:
@@ -3712,7 +3837,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await edit_message(callback, f"🎉 <b>Вы стали партнёром!</b>\n\nКод: <code>{referral_code}</code>")
             await show_partner_profile(callback, partner)
         else:
-            await callback.answer("❌ Ошибка!", show_alert=True)
+            await _answer_callback(callback, "❌ Ошибка!", show_alert=True)
 
     async def show_partner_profile(source, partner: dict):
         stats = db.get_partner_stats(partner['user_id'])
@@ -3736,6 +3861,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "back_to_main")
     async def back_to_main_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
         user_id = callback.from_user.id
         user = db.get_user(user_id)
@@ -3747,11 +3873,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         partner = db.get_partner(user_id)
         if not partner:
-            await callback.answer("❌ Вы не партнёр!", show_alert=True)
+            await _answer_callback(callback, "❌ Вы не партнёр!", show_alert=True)
             return
         balance = partner.get('earnings_balance', 0)
         if balance < 10:
-            await callback.answer(f"❌ Мин. сумма $10. Баланс: ${balance:.2f}", show_alert=True)
+            await _answer_callback(callback, f"❌ Мин. сумма $10. Баланс: ${balance:.2f}", show_alert=True)
             return
         await edit_message(callback, f"💰 <b>Вывод средств</b>\n\nБаланс: <b>${balance:.2f}</b>\n\nВведите сумму:", cancel_inline_keyboard())
 
@@ -3780,7 +3906,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         partner = db.get_partner(user_id)
         if not partner:
-            await callback.answer("❌ Вы не партнёр!", show_alert=True)
+            await _answer_callback(callback, "❌ Вы не партнёр!", show_alert=True)
             return
         referrals = db.get_partner_referrals(user_id)
         text = f"👥 <b>Мои рефералы</b> ({len(referrals)})\n\n"
@@ -3791,6 +3917,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "partner_history")
     async def partner_history_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         user_id = callback.from_user.id
         transactions = db.get_partner_transactions(user_id, limit=10)
         text = "📜 <b>История операций</b>\n\n"
@@ -3836,6 +3963,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_stats")
     async def admin_stats_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         stats = db.get_admin_stats()
         text = (
             f"📊 <b>Статистика бота</b>\n\n"
@@ -3856,6 +3984,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_promo_media")
     async def admin_promo_media_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AdminStates.WAITING_PROMO_MEDIA)
         await edit_message(callback,
             "🎬 <b>Промо медиа</b>\n\n"
@@ -3889,8 +4018,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_give_sub")
     async def admin_give_sub_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AdminStates.WAITING_USER_ID_SUB)
-        await edit_message(callback, 
+        await edit_message(callback,
             "👤 <b>Выдача подписки</b>\n\nВведите ID пользователя:",
             reply_markup=cancel_inline_keyboard()
         )
@@ -3919,6 +4049,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_manage_packs")
     async def admin_manage_packs_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         categories = db.get_categories()
         buttons = [[InlineKeyboardButton(text=f"📁 {c['name']}", callback_data=f"admin_category_{c['id']}")] for c in categories]
         buttons.append([InlineKeyboardButton(text="➕ Добавить категорию", callback_data="admin_add_category")])
@@ -3931,6 +4062,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         # category_id можно передать явно: этот экран перерисовывают
         # обработчики с другой callback_data (admin_del_pack_...), и разбор
         # чужой строки давал ValueError
+        await _answer_callback(callback)
         if category_id is None:
             category_id = int(callback.data.split('_')[2])
         packs = db.get_packs_in_category(category_id)
@@ -3945,7 +4077,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         pack_id = int(callback.data.split('_')[2])
         pack = db.get_pack(pack_id)
         if not pack:
-            await callback.answer("❌ Пак не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Пак не найден!", show_alert=True)
             return
         chats = db.get_pack_chats(pack_id)
         buttons = [[InlineKeyboardButton(text=f"❌ {c['chat_url'][:30]}", callback_data=f"admin_del_pack_chat_{c['id']}")] for c in chats[:20]]
@@ -3958,6 +4090,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_add_pack_'))
     async def admin_add_pack_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         category_id = int(callback.data.split('_')[3])
         await state.update_data(category_id=category_id)
         await state.set_state(AdminStates.WAITING_PACK_NAME)
@@ -3981,10 +4114,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_add_chats_'))
     async def admin_add_chats_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         pack_id = int(callback.data.split('_')[3])
         await state.update_data(pack_id=pack_id)
         await state.set_state(AdminStates.WAITING_PACK_CHATS_INPUT)
-        await edit_message(callback, 
+        await edit_message(callback,
             "💬 <b>Добавление чатов в пак</b>\n\n"
             "Отправьте ссылки на чаты (по одной на строку):",
             reply_markup=cancel_inline_keyboard()
@@ -4003,20 +4137,21 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def admin_del_pack_chat_callback(callback: CallbackQuery):
         item_id = int(callback.data.split('_')[4])
         db.delete_pack_chat(item_id)
-        await callback.answer("✅ Чат удалён из пака!", show_alert=True)
+        await _answer_callback(callback, "✅ Чат удалён из пака!", show_alert=True)
 
     @dp.callback_query(F.data.startswith('admin_del_pack_'))
     async def admin_del_pack_callback(callback: CallbackQuery):
         pack_id = int(callback.data.split('_')[3])
         pack = db.get_pack(pack_id)
         db.delete_pack(pack_id)
-        await callback.answer("✅ Пак удалён!", show_alert=True)
+        await _answer_callback(callback, "✅ Пак удалён!", show_alert=True)
         cat_id = (pack or {}).get('category_id')
         if cat_id is not None:
             await admin_category_callback(callback, int(cat_id))
 
     @dp.callback_query(F.data == "admin_add_category")
     async def admin_add_category_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AdminStates.WAITING_CATEGORY_NAME)
         await edit_message(callback, "📁 <b>Новая категория</b>\n\nВведите название:", reply_markup=cancel_inline_keyboard())
 
@@ -4028,6 +4163,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_manage_tariffs")
     async def admin_manage_tariffs_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         tariffs = db.get_tariffs(active_only=False)
         buttons = [[InlineKeyboardButton(text=f"💳 {t['name']} — ${t['price_usd']:.2f} ({t['duration_days']} дн.)", callback_data=f"admin_tariff_{t['id']}")] for t in tariffs]
         buttons.append([InlineKeyboardButton(text="➕ Добавить тариф", callback_data="admin_add_tariff")])
@@ -4040,7 +4176,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         tariff_id = int(callback.data.split('_')[2])
         tariff = db.get_tariff(tariff_id)
         if not tariff:
-            await callback.answer("❌ Тариф не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Тариф не найден!", show_alert=True)
             return
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🗑 Удалить тариф", callback_data=f"admin_del_tariff_{tariff_id}")],
@@ -4053,11 +4189,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def admin_del_tariff_callback(callback: CallbackQuery):
         tariff_id = int(callback.data.split('_')[3])
         db.delete_tariff(tariff_id)
-        await callback.answer("✅ Тариф удалён!", show_alert=True)
+        await _answer_callback(callback, "✅ Тариф удалён!", show_alert=True)
         await admin_manage_tariffs_callback(callback)
 
     @dp.callback_query(F.data == "admin_add_tariff")
     async def admin_add_tariff_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AdminStates.WAITING_TARIFF_NAME)
         await edit_message(callback, "💳 <b>Новый тариф</b>\n\nВведите название:", reply_markup=cancel_inline_keyboard())
 
@@ -4090,9 +4227,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_export_sessions")
     async def admin_export_sessions_callback(callback: CallbackQuery):
+        await _answer_callback(callback, "⏳ Готовлю выгрузку...")
         accounts = db.get_all_accounts_with_user()
         if not accounts:
-            await callback.answer("❌ Нет аккаунтов для выгрузки!", show_alert=True)
+            await _answer_callback(callback, "❌ Нет аккаунтов для выгрузки!", show_alert=True)
             return
         import csv
         import io
@@ -4112,27 +4250,99 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         file = BufferedInputFile(output.getvalue().encode('utf-8'), filename="sessions_export.csv")
         await callback.message.answer_document(file, caption="📥 Выгрузка сессий")
 
+    async def _run_admin_session_check(callback: CallbackQuery, accounts: list):
+        """Проверить аккаунты ограниченным числом одноразовых подключений."""
+        semaphore = asyncio.Semaphore(admin_session_check_concurrency)
+
+        async def check_one(account):
+            async with semaphore:
+                try:
+                    ok, _, error = await account_manager.test_session_string(
+                        account['session_string'], account.get('proxy', ''),
+                        account_id=account['id']
+                    )
+                    return ok, error or ''
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    # Не даём одной неожиданной ошибке оборвать весь отчёт.
+                    logger.error(
+                        "Ошибка проверки аккаунта #%s: %s",
+                        account.get('id'), error, exc_info=True
+                    )
+                    return False, str(error)
+
+        results = await asyncio.gather(*(check_one(acc) for acc in accounts))
+        checked = len(results)
+        valid = sum(1 for ok, _ in results if ok)
+        proxy_errors = sum(
+            1 for ok, error in results
+            if not ok and error.startswith('PROXY_UNAVAILABLE:')
+        )
+        network_errors = sum(
+            1 for ok, error in results
+            if not ok and error.startswith('NETWORK_UNAVAILABLE:')
+        )
+        invalid = checked - valid - proxy_errors - network_errors
+
+        text = (
+            "✅ <b>Проверка завершена!</b>\n\n"
+            f"📱 Проверено: {checked}\n"
+            f"🟢 Валидных: {valid}\n"
+            f"🔴 Невалидных сессий: {invalid}\n"
+            f"🌐 Недоступных прокси: {proxy_errors}\n"
+            f"📡 Сбоев соединения: {network_errors}\n\n"
+            "Транспортные ошибки помечены и больше не вызывают бесконечные "
+            "переподключения до сброса статуса."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Проверить ещё раз", callback_data="admin_check_sessions")],
+            [InlineKeyboardButton(text="◀️ В админ-панель", callback_data="admin_panel")]
+        ])
+        try:
+            await edit_message(callback, text, markup)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Не удалось показать результат проверки сессий", exc_info=True)
+
     @dp.callback_query(F.data == "admin_check_sessions")
     async def admin_check_sessions_callback(callback: CallbackQuery):
-        await callback.answer("⏳ Проверка сессий...", show_alert=False)
+        nonlocal admin_session_check_task
+        user = db.get_user(callback.from_user.id)
+        if callback.from_user.id != ADMIN and (not user or user.get('is_admin') != 1):
+            await _answer_callback(callback, "❌ Доступ запрещён!", show_alert=True)
+            return
+
+        if admin_session_check_task and not admin_session_check_task.done():
+            await _answer_callback(callback, "⏳ Проверка уже выполняется, повторно запускать не нужно.", show_alert=True)
+            return
+
         accounts = db.get_all_accounts()
-        checked = 0
-        valid = 0
-        invalid = 0
-        for acc in accounts:
-            checked += 1
-            ok, _, _ = await account_manager.test_session_string(acc['session_string'], acc.get('proxy', ''))
-            if ok:
-                valid += 1
-                db.update_account_status_by_id(acc['id'], 'active')
-            else:
-                invalid += 1
-                db.update_account_status_by_id(acc['id'], 'error')
-        text = f"✅ <b>Проверка завершена!</b>\n\n📱 Проверено: {checked}\n🟢 Валидных: {valid}\n🔴 Невалидных: {invalid}"
-        await edit_message(callback, text)
+        # Ставим sentinel до первого await: второй callback не сможет
+        # стартовать параллельную проверку в коротком окне между answer и
+        # созданием фоновой задачи.
+        admin_session_check_task = asyncio.current_task()
+        await _answer_callback(callback, "⏳ Проверка запущена", show_alert=False)
+        if not accounts:
+            await edit_message(callback, "📱 Аккаунтов для проверки нет.")
+            return
+
+        await edit_message(
+            callback,
+            f"⏳ <b>Проверка сессий запущена</b>\n\n"
+            f"Аккаунтов: {len(accounts)}\n"
+            f"Параллельных проверок: {admin_session_check_concurrency}\n\n"
+            "Для недоступного прокси будет установлен статус «Прокси недоступен»."
+        )
+        admin_session_check_task = asyncio.create_task(
+            _run_admin_session_check(callback, accounts),
+            name='admin-session-check'
+        )
 
     @dp.callback_query(F.data == "admin_mandatory_sub")
     async def admin_mandatory_sub_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         enabled = db.get_kv("mandatory_sub_enabled", "0")
         channel = db.get_kv("mandatory_sub_channel", "")
         status = "🟢 Включена" if enabled == "1" else "🔴 Выключена"
@@ -4146,8 +4356,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_set_mandatory_channel")
     async def admin_set_mandatory_channel_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(MandatorySubStates.WAITING_CHANNEL)
-        await edit_message(callback, 
+        await edit_message(callback,
             "📢 <b>Канал для обязательной подписки</b>\n\n"
             "Введите @username или ID канала:",
             reply_markup=cancel_inline_keyboard()
@@ -4165,11 +4376,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         enabled = db.get_kv("mandatory_sub_enabled", "0")
         new_val = "0" if enabled == "1" else "1"
         db.set_kv("mandatory_sub_enabled", new_val)
-        await callback.answer(f"{'✅ Включена' if new_val == '1' else '❌ Выключена'}!", show_alert=True)
+        await _answer_callback(callback, f"{'✅ Включена' if new_val == '1' else '❌ Выключена'}!", show_alert=True)
         await admin_mandatory_sub_callback(callback, None)
 
     @dp.callback_query(F.data == "admin_recurring")
     async def admin_recurring_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         messages = db.get_recurring_messages()
         buttons = [[InlineKeyboardButton(text=f"🔄 {m['name']} ({m['interval_minutes']} мин.)", callback_data=f"admin_recurring_{m['id']}")] for m in messages]
         buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data="admin_add_recurring")])
@@ -4180,7 +4392,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def _show_recurring_item(callback: CallbackQuery, msg_id: int):
         msg = db.get_recurring_message(msg_id)
         if not msg:
-            await callback.answer("❌ Не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Не найдено!", show_alert=True)
             return
         status = "🟢 Активно" if msg['is_active'] == 1 else "🔴 Остановлено"
         last_sent = msg.get('last_sent_at', 0)
@@ -4223,11 +4435,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_recurring_'))
     async def admin_recurring_item_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         await _show_recurring_item(callback, msg_id)
 
     @dp.callback_query(F.data == "admin_add_recurring")
     async def admin_add_recurring_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(RecurringStates.WAITING_NAME)
         await edit_message(callback, "🔄 <b>Новое рекуррентное сообщение</b>\n\nВведите название:", reply_markup=cancel_inline_keyboard())
 
@@ -4270,6 +4484,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_edit_recurring_text_'))
     async def admin_edit_recurring_text_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         msg = db.get_recurring_message(msg_id)
         await state.update_data(edit_recurring_id=msg_id)
@@ -4303,6 +4518,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_edit_recurring_interval_'))
     async def admin_edit_recurring_interval_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         msg = db.get_recurring_message(msg_id)
         current_interval = msg.get('interval_minutes', 60) if msg else 60
@@ -4333,6 +4549,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_edit_recurring_media_'))
     async def admin_edit_recurring_media_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         await state.update_data(edit_recurring_id=msg_id)
         await state.set_state(RecurringStates.WAITING_MEDIA)
@@ -4357,7 +4574,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def _show_recurring_buttons_menu(callback: CallbackQuery, msg_id: int):
         msg = db.get_recurring_message(msg_id)
         if not msg:
-            await callback.answer("❌ Сообщение не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Сообщение не найдено!", show_alert=True)
             return
         buttons_raw = msg.get('buttons', '[]')
         try:
@@ -4402,11 +4619,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_edit_recurring_btns_'))
     async def admin_edit_recurring_btns_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         await _show_recurring_buttons_menu(callback, msg_id)
 
     @dp.callback_query(F.data.startswith('admin_add_rec_btn_'))
     async def admin_add_rec_btn_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         msg_id = int(callback.data.split('_')[-1])
         await state.update_data(btn_msg_id=msg_id)
         await state.set_state(RecurringStates.WAITING_BUTTON_TEXT)
@@ -4470,6 +4689,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('set_btn_style_'))
     async def set_btn_style_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         msg_id = int(parts[3])
         style = parts[4]
@@ -4481,7 +4701,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         msg = db.get_recurring_message(msg_id)
         if not msg:
-            await callback.answer("❌ Сообщение не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Сообщение не найдено!", show_alert=True)
             await state.clear()
             return
 
@@ -4503,11 +4723,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         buttons_list.append(new_button)
         db.update_recurring_message(msg_id, buttons=json.dumps(buttons_list, ensure_ascii=False))
         await state.clear()
-        await callback.answer("✅ Кнопка добавлена!", show_alert=True)
+        await _answer_callback(callback, "✅ Кнопка добавлена!", show_alert=True)
         await _show_recurring_buttons_menu(callback, msg_id)
 
     @dp.callback_query(F.data.startswith('admin_del_rec_btn_'))
     async def admin_del_rec_btn_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         msg_id = int(parts[4])
         idx = int(parts[5])
@@ -4522,21 +4743,21 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             if 0 <= idx < len(buttons_list):
                 buttons_list.pop(idx)
                 db.update_recurring_message(msg_id, buttons=json.dumps(buttons_list, ensure_ascii=False))
-                await callback.answer("✅ Кнопка удалена!")
+                await _answer_callback(callback, "✅ Кнопка удалена!")
         await _show_recurring_buttons_menu(callback, msg_id)
 
     @dp.callback_query(F.data.startswith('admin_clr_rec_btns_'))
     async def admin_clr_rec_btns_callback(callback: CallbackQuery):
         msg_id = int(callback.data.split('_')[-1])
         db.update_recurring_message(msg_id, buttons="[]")
-        await callback.answer("✅ Все кнопки удалены!")
+        await _answer_callback(callback, "✅ Все кнопки удалены!")
         await _show_recurring_buttons_menu(callback, msg_id)
 
     @dp.callback_query(F.data.startswith('admin_toggle_recurring_'))
     async def admin_toggle_recurring_callback(callback: CallbackQuery):
         msg_id = int(callback.data.split('_')[-1])
         db.toggle_recurring_message(msg_id)
-        await callback.answer("✅ Статус изменён!", show_alert=True)
+        await _answer_callback(callback, "✅ Статус изменён!", show_alert=True)
         await _show_recurring_item(callback, msg_id)
 
     @dp.callback_query(F.data.startswith('admin_send_recurring_'))
@@ -4544,9 +4765,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         msg_id = int(callback.data.split('_')[-1])
         msg = db.get_recurring_message(msg_id)
         if not msg:
-            await callback.answer("❌ Не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Не найдено!", show_alert=True)
             return
-        await callback.answer("🚀 Запуск рассылки...")
+        await _answer_callback(callback, "🚀 Запуск рассылки...")
         status_msg = await callback.message.answer("⏳ Рассылка выполняется...")
         success, failed = await send_recurring_message_to_users(bot, db, msg_id)
         await status_msg.edit_text(
@@ -4560,11 +4781,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def admin_del_recurring_callback(callback: CallbackQuery):
         msg_id = int(callback.data.split('_')[-1])
         db.delete_recurring_message(msg_id)
-        await callback.answer("✅ Удалено!", show_alert=True)
+        await _answer_callback(callback, "✅ Удалено!", show_alert=True)
         await admin_recurring_callback(callback)
 
     @dp.callback_query(F.data == "admin_mirrors")
     async def admin_mirrors_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         mirrors = db.get_all_mirrors()
         buttons = [[InlineKeyboardButton(text=f"🪞 @{m['bot_username'] or 'unknown'} {'✅' if m['is_active'] == 1 else '❌'}", callback_data=f"admin_mirror_{m['id']}")] for m in mirrors]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel")])
@@ -4574,7 +4796,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def _show_admin_mirror_item(callback: CallbackQuery, mirror_id: int):
         mirror = db.get_mirror(mirror_id)
         if not mirror:
-            await callback.answer("❌ Зеркало не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Зеркало не найдено!", show_alert=True)
             return
         status = "🟢 Активно" if mirror['is_active'] == 1 else "🔴 Остановлено"
         text = f"🪞 <b>Зеркало #{mirror_id}</b>\n\n@{mirror.get('bot_username', 'unknown')}\nСтатус: {status}"
@@ -4587,6 +4809,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_mirror_'))
     async def admin_mirror_item_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         mirror_id = int(callback.data.split('_')[-1])
         await _show_admin_mirror_item(callback, mirror_id)
 
@@ -4594,14 +4817,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def admin_toggle_mirror_callback(callback: CallbackQuery):
         mirror_id = int(callback.data.split('_')[-1])
         db.toggle_mirror(mirror_id, ADMIN)
-        await callback.answer("✅ Статус изменён!", show_alert=True)
+        await _answer_callback(callback, "✅ Статус изменён!", show_alert=True)
         await _show_admin_mirror_item(callback, mirror_id)
 
     @dp.callback_query(F.data.startswith('admin_del_mirror_'))
     async def admin_del_mirror_callback(callback: CallbackQuery):
         mirror_id = int(callback.data.split('_')[-1])
         db.delete_mirror(mirror_id, ADMIN)
-        await callback.answer("✅ Зеркало удалено!", show_alert=True)
+        await _answer_callback(callback, "✅ Зеркало удалено!", show_alert=True)
         await admin_mirrors_callback(callback)
 
     @dp.callback_query(F.data == "admin_panel")
@@ -4610,7 +4833,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         user = db.get_user(user_id)
         if user_id != ADMIN and (not user or user.get('is_admin') != 1):
-            await callback.answer("❌ Доступ запрещён!", show_alert=True)
+            await _answer_callback(callback, "❌ Доступ запрещён!", show_alert=True)
             return
         users = db.get_all_users()
         sub_count = sum(1 for u in users if u.get('subscription_until', 0) > int(time.time()))
@@ -4633,6 +4856,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "admin_manage_promos")
     async def admin_manage_promos_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         promos = db.get_all_promo_codes()
         buttons = []
         for p in promos:
@@ -4653,7 +4877,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 promo = p
                 break
         if not promo:
-            await callback.answer("❌ Не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Не найдено!", show_alert=True)
             return
         uses = db.get_promo_code_uses(promo_id)
         status = "🟢 Активен" if promo['is_active'] == 1 else "🔴 Деактивирован"
@@ -4673,11 +4897,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_promo_'))
     async def admin_promo_item_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         promo_id = int(callback.data.split('_')[-1])
         await _show_admin_promo_item(callback, promo_id)
 
     @dp.callback_query(F.data == "admin_add_promo")
     async def admin_add_promo_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(AdminPromoStates.WAITING_PROMO_CODE)
         await edit_message(callback, "🎁 <b>Новый промокод</b>\n\nВведите код:", reply_markup=cancel_inline_keyboard())
 
@@ -4710,6 +4936,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('admin_toggle_promo_'))
     async def admin_toggle_promo_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         promo_id = int(callback.data.split('_')[-1])
         promo = None
         for p in db.get_all_promo_codes():
@@ -4719,14 +4946,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if promo:
             db.c.execute('UPDATE promo_codes SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?', (promo_id,))
             db.conn.commit()
-        await callback.answer("✅ Статус изменён!", show_alert=True)
+        await _answer_callback(callback, "✅ Статус изменён!", show_alert=True)
         await _show_admin_promo_item(callback, promo_id)
 
     @dp.callback_query(F.data.startswith('admin_del_promo_'))
     async def admin_del_promo_callback(callback: CallbackQuery):
         promo_id = int(callback.data.split('_')[-1])
         db.delete_promo_code(promo_id)
-        await callback.answer("✅ Удалено!", show_alert=True)
+        await _answer_callback(callback, "✅ Удалено!", show_alert=True)
         await admin_manage_promos_callback(callback)
 
     # ==================== CHAT PACKS CATALOG (User View) ====================
@@ -4750,7 +4977,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         category_id = int(callback.data.split('_')[2])
         packs = db.get_packs_in_category(category_id)
         if not packs:
-            await callback.answer("📭 В этой категории нет паков!", show_alert=True)
+            await _answer_callback(callback, "📭 В этой категории нет паков!", show_alert=True)
             return
         buttons = [[InlineKeyboardButton(text=f"📦 {p['name']} ({p['chats_count']} чатов)", callback_data=f"user_pack_{p['id']}")] for p in packs]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_catalog")])
@@ -4762,7 +4989,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         pack_id = int(callback.data.split('_')[2])
         pack = db.get_pack(pack_id)
         if not pack:
-            await callback.answer("❌ Пак не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Пак не найден!", show_alert=True)
             return
         chats = db.get_pack_chats(pack_id)
         text = f"📦 <b>{pack['name']}</b>\n\n{pack['description']}\n\n"
@@ -4780,22 +5007,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         pack_id = int(callback.data.split('_')[2])
         pack = db.get_pack(pack_id)
         if not pack:
-            await callback.answer("❌ Пак не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Пак не найден!", show_alert=True)
             return
         chats = db.get_pack_chats(pack_id)
         if not chats:
-            await callback.answer("📭 В паке нет чатов!", show_alert=True)
+            await _answer_callback(callback, "📭 В паке нет чатов!", show_alert=True)
             return
         user_id = callback.from_user.id
         accounts = db.get_user_accounts(user_id)
         if not accounts:
-            await callback.answer("📱 У вас нет аккаунтов!", show_alert=True)
+            await _answer_callback(callback, "📱 У вас нет аккаунтов!", show_alert=True)
             return
         if len(accounts) == 1:
             account_id = accounts[0]['id']
             chat_urls = [c['chat_url'] for c in chats]
             asyncio.create_task(account_manager.run_limited(account_manager.join_chats_batch(account_id, chat_urls, bot, user_id)))
-            await callback.answer(f"🚀 Вступление запущено на аккаунте {accounts[0].get('account_name', f'#{account_id}')}", show_alert=True)
+            await _answer_callback(callback, f"🚀 Вступление запущено на аккаунте {accounts[0].get('account_name', f'#{account_id}')}", show_alert=True)
         else:
             buttons = []
             for acc in accounts:
@@ -4814,17 +5041,18 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         pack = db.get_pack(pack_id)
         account = db.get_account(account_id)
         if not pack or not account:
-            await callback.answer("❌ Ошибка!", show_alert=True)
+            await _answer_callback(callback, "❌ Ошибка!", show_alert=True)
             return
         chats = db.get_pack_chats(pack_id)
         chat_urls = [c['chat_url'] for c in chats]
         user_id = callback.from_user.id
         asyncio.create_task(account_manager.run_limited(account_manager.join_chats_batch(account_id, chat_urls, bot, user_id)))
         acc_name = account.get('account_name') or f"#{account_id}"
-        await callback.answer(f"🚀 Вступление запущено на {acc_name}!", show_alert=True)
+        await _answer_callback(callback, f"🚀 Вступление запущено на {acc_name}!", show_alert=True)
 
     @dp.callback_query(F.data == "back_to_catalog")
     async def back_to_catalog_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         categories = db.get_categories()
         buttons = [[InlineKeyboardButton(text=f"📁 {c['name']}", callback_data=f"user_category_{c['id']}")] for c in categories]
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -4837,7 +5065,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         account = db.get_account(account_id)
         if not account:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         text = (
             f"📝 <b>Настройки поста</b> для {account.get('account_name', f'#{account_id}')}\n\n"
@@ -4854,6 +5082,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('set_post_text_'))
     async def set_post_text_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         await state.update_data(edit_post_account_id=account_id)
         await state.set_state(AccountPostStates.WAITING_TEXT)
@@ -4883,6 +5112,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('set_post_photo_'))
     async def set_post_photo_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         await state.update_data(edit_post_account_id=account_id)
         await state.set_state(AccountPostStates.WAITING_PHOTO)
@@ -4917,11 +5147,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def del_post_photo_callback(callback: CallbackQuery):
         account_id = int(callback.data.split('_')[3])
         db.update_account_photo(account_id, '')
-        await callback.answer("✅ Фото удалено!", show_alert=True)
+        await _answer_callback(callback, "✅ Фото удалено!", show_alert=True)
         await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('acc_timeout_'))
     async def acc_timeout_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         await state.update_data(edit_timeout_account_id=account_id)
         await state.set_state(AccountPostStates.WAITING_TIMEOUT)
@@ -4950,12 +5181,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if total == 0:
             total_any = db.count_account_chats(account_id)
             if total_any:
-                await callback.answer(
+                await _answer_callback(callback,
                     "💬 Групп не найдено. Нажмите «Синхронизировать чаты» — старые записи без типа нужно обновить.",
                     show_alert=True
                 )
             else:
-                await callback.answer("💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
+                await _answer_callback(callback, "💬 Нет чатов. Сначала синхронизируйте!", show_alert=True)
             return
 
         total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
@@ -4999,10 +5230,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "noop")
     async def noop_callback(callback: CallbackQuery):
-        await callback.answer()
+        await _answer_callback(callback)
 
     @dp.callback_query(F.data.startswith('acc_chats_'))
     async def acc_chats_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
@@ -5011,6 +5243,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('toggle_chat_'))
     async def toggle_chat_callback(callback: CallbackQuery):
         # toggle_chat_{account_id}_{page}_{chat_id}
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         try:
@@ -5020,7 +5253,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             page = 0
             chat_id = '_'.join(parts[3:])
         new_state = db.toggle_chat_spam(account_id, chat_id)
-        await callback.answer(f"{'✅ Включен' if new_state == 1 else '❌ Отключен'}!", show_alert=False)
+        await _answer_callback(callback, f"{'✅ Включен' if new_state == 1 else '❌ Отключен'}!", show_alert=False)
         # Остаёмся на текущей странице
         await render_acc_chats(callback, account_id, page)
 
@@ -5030,7 +5263,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(parts[3])
         page = int(parts[4]) if len(parts) > 4 else 0
         db.set_all_chats_spam(account_id, 1, chat_types=GROUP_TYPES)
-        await callback.answer("✅ Все группы включены!", show_alert=False)
+        await _answer_callback(callback, "✅ Все группы включены!", show_alert=False)
         await render_acc_chats(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('disable_all_chats_'))
@@ -5039,13 +5272,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(parts[3])
         page = int(parts[4]) if len(parts) > 4 else 0
         db.set_all_chats_spam(account_id, 0, chat_types=GROUP_TYPES)
-        await callback.answer("❌ Все группы отключены!", show_alert=False)
+        await _answer_callback(callback, "❌ Все группы отключены!", show_alert=False)
         await render_acc_chats(callback, account_id, page)
 
     async def render_massleave(callback: CallbackQuery, account_id: int, page: int = 0):
         page_chats, total = db.get_account_chats_paginated(account_id, page=page, per_page=CHATS_PER_PAGE)
         if total == 0:
-            await callback.answer("💬 Нет чатов для выхода!", show_alert=True)
+            await _answer_callback(callback, "💬 Нет чатов для выхода!", show_alert=True)
             return
         total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
         if page >= total_pages:
@@ -5076,6 +5309,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('acc_massleave_'))
     async def acc_massleave_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         page = int(parts[3]) if len(parts) > 3 else 0
@@ -5083,6 +5317,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('select_leave_'))
     async def select_leave_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         parts = callback.data.split('_')
         account_id = int(parts[2])
         try:
@@ -5097,7 +5332,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             selected.discard(chat_id)
         else:
             selected.add(chat_id)
-        await callback.answer()
+        await _answer_callback(callback)
         await render_massleave(callback, account_id, page)
 
     @dp.callback_query(F.data.startswith('confirm_leave_'))
@@ -5106,12 +5341,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         user_id = callback.from_user.id
         selected = user_selected_leave_chats.get(user_id, set())
         if not selected:
-            await callback.answer("❌ Выберите чаты!", show_alert=True)
+            await _answer_callback(callback, "❌ Выберите чаты!", show_alert=True)
             return
         chats_list = list(selected)
         asyncio.create_task(account_manager.run_limited(account_manager.leave_chats_batch(account_id, chats_list, bot, user_id)))
         user_selected_leave_chats[user_id] = set()
-        await callback.answer("🚪 Выход запущен!", show_alert=True)
+        await _answer_callback(callback, "🚪 Выход запущен!", show_alert=True)
         await render_account_dashboard(callback, account_id, user_id)
 
     # ==================== JOIN CHATS ====================
@@ -5120,7 +5355,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[3])
         categories = db.get_categories()
         if not categories:
-            await callback.answer("📭 Каталог пуст!", show_alert=True)
+            await _answer_callback(callback, "📭 Каталог пуст!", show_alert=True)
             return
         buttons = [[InlineKeyboardButton(text=f"📁 {c['name']}", callback_data=f"join_pack_cat_{account_id}_{c['id']}")] for c in categories]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
@@ -5129,10 +5364,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data.startswith('acc_join_'))
     async def acc_join_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         await state.update_data(join_account_id=account_id)
         await state.set_state(ChatManagementStates.WAITING_TXT_FILE)
-        await edit_message(callback, 
+        await edit_message(callback,
             "📥 <b>Вступить в чаты</b>\n\n"
             "Отправьте текст со ссылками на чаты (по одной на строку)\n"
             "Или файл .txt со ссылками\n"
@@ -5147,7 +5383,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         category_id = int(parts[4])
         packs = db.get_packs_in_category(category_id)
         if not packs:
-            await callback.answer("📭 В категории нет паков!", show_alert=True)
+            await _answer_callback(callback, "📭 В категории нет паков!", show_alert=True)
             return
         buttons = [[InlineKeyboardButton(text=f"📦 {p['name']} ({p['chats_count']} чатов)", callback_data=f"join_pack_acc_{p['id']}_{account_id}")] for p in packs]
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"acc_join_pack_{account_id}")])
@@ -5174,23 +5410,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not links:
             await message.answer("❌ Нет ссылок!")
             return
-        
+
         for account_id in account_ids:
             if account_id:
                 asyncio.create_task(account_manager.run_limited(account_manager.join_chats_batch(account_id, links, bot, user_id)))
-        
+
         await state.clear()
         await message.answer(f"🚀 Вступление запущено на {len(account_ids)} аккаунтах! Обрабатываю {len(links)} ссылок...")
 
     # ==================== PROXY MANAGEMENT ====================
     @dp.callback_query(F.data.startswith('acc_proxy_'))
     async def acc_proxy_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         await state.update_data(proxy_account_id=account_id)
         account = db.get_account(account_id)
         current_proxy = account.get('proxy', '') if account else 'Не задан'
         await state.set_state(AddAccountStates.WAITING_PROXY)
-        await edit_message(callback, 
+        await edit_message(callback,
             f"🌐 <b>Прокси</b>\n\nТекущее: <code>{current_proxy}</code>\n\n"
             "Введите новое прокси или «удалить» для очистки:",
             reply_markup=cancel_inline_keyboard()
@@ -5217,6 +5454,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     # ==================== BIO & AUTORESPONDER ====================
     @dp.callback_query(F.data.startswith('acc_bio_'))
     async def acc_bio_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
         await state.update_data(bio_account_id=account_id)
         await state.set_state(AccountSettingsStates.WAITING_FOR_BIO)
@@ -5240,7 +5478,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             account_id = int(callback.data.split('_')[2])
         account = db.get_account(account_id)
         if not account:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         enabled = account.get('autoresponder_enabled', 0)
         text = account.get('autoresponder_text', '')
@@ -5250,13 +5488,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="✅ Включить" if enabled != 1 else "❌ Выключить", callback_data=f"toggle_autoresponder_{account_id}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
         ])
-        await edit_message(callback, 
+        await edit_message(callback,
             f"🤖 <b>Автоответчик</b>\n\nСтатус: {status}\nТекст: {text[:100] or 'Не задан'}",
             reply_markup=markup
         )
 
     @dp.callback_query(F.data.startswith('set_autoresponder_text_'))
     async def set_autoresponder_text_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         await state.update_data(autoresponder_account_id=account_id)
         await state.set_state(AccountSettingsStates.WAITING_FOR_AUTORESPONDER)
@@ -5266,13 +5505,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def process_autoresponder_text(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('autoresponder_account_id')
-        
+
         media_path = ""
         media_type = ""
         # ⭐ ЧИСТЫЙ ТЕКСТ без тегов + ENTITIES отдельно
         text = message.text or message.caption or ""
         text = text.strip()
-        
+
         # ⭐ КОПИРУЕМ ENTITIES из входящего сообщения
         entities_json = None
         caption_entities = message.caption_entities if message.caption_entities else (message.entities if message.entities else None)
@@ -5286,10 +5525,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 'url': e.url if hasattr(e, 'url') else None,
                 'user_id': e.user.id if hasattr(e, 'user') and e.user else None,
             } for e in caption_entities])
-        
+
         import os
         os.makedirs('img', exist_ok=True)
-        
+
         if message.photo:
             file_id = message.photo[-1].file_id
             media_path = f"img/ar_{account_id}_{file_id}.jpg"
@@ -5316,7 +5555,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             media_path = f"img/ar_{account_id}_{file_id}.webp"
             await message.bot.download(message.sticker, destination=media_path)
             media_type = "sticker"
-            
+
         db.update_autoresponder(account_id, text, None)
         db.update_autoresponder_media(account_id, media_path, media_type)
         db.update_autoresponder_entities(account_id, entities_json)
@@ -5328,16 +5567,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_id = int(callback.data.split('_')[2])
         account = db.get_account(account_id)
         if not account:
-            await callback.answer("❌ Аккаунт не найден!", show_alert=True)
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
             return
         new_state = 0 if account.get('autoresponder_enabled', 0) == 1 else 1
         db.toggle_autoresponder(account_id, new_state)
-        await callback.answer(f"{'✅ Включен' if new_state == 1 else '❌ Выключен'}!", show_alert=True)
+        await _answer_callback(callback, f"{'✅ Включен' if new_state == 1 else '❌ Выключен'}!", show_alert=True)
         await acc_autoresponder_callback(callback, None, account_id)
 
     # ==================== MIRROR MANAGEMENT (User-facing for Partners) ====================
     @dp.callback_query(F.data == "manage_mirrors")
     async def manage_mirrors_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         user_id = callback.from_user.id
         mirrors = db.get_partner_mirrors(user_id)
         buttons = []
@@ -5351,8 +5591,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "add_mirror")
     async def add_mirror_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.set_state(MirrorStates.WAITING_BOT_TOKEN)
-        await edit_message(callback, 
+        await edit_message(callback,
             "🪞 <b>Добавление зеркала</b>\n\n"
             "Введите токен бота от @BotFather:",
             reply_markup=cancel_inline_keyboard()
@@ -5379,6 +5620,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     @dp.callback_query(F.data == "confirm_add_mirror")
     async def confirm_add_mirror_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         data = await state.get_data()
         token = data.get('mirror_token')
         username = data.get('mirror_username')
@@ -5389,7 +5631,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def _show_partner_mirror_item(callback: CallbackQuery, mirror_id: int):
         mirror = db.get_mirror(mirror_id)
         if not mirror:
-            await callback.answer("❌ Зеркало не найдено!", show_alert=True)
+            await _answer_callback(callback, "❌ Зеркало не найдено!", show_alert=True)
             return
         status = "🟢 Активно" if mirror['is_active'] == 1 else "🔴 Остановлено"
         markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -5397,13 +5639,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"partner_del_mirror_{mirror_id}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="manage_mirrors")]
         ])
-        await edit_message(callback, 
+        await edit_message(callback,
             f"🪞 <b>Зеркало #{mirror_id}</b>\n\n@{mirror.get('bot_username', 'unknown')}\nСтатус: {status}",
             reply_markup=markup
         )
 
     @dp.callback_query(F.data.startswith('partner_mirror_'))
     async def partner_mirror_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
         mirror_id = int(callback.data.split('_')[-1])
         await _show_partner_mirror_item(callback, mirror_id)
 
@@ -5411,12 +5654,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def partner_toggle_mirror_callback(callback: CallbackQuery):
         mirror_id = int(callback.data.split('_')[-1])
         db.toggle_mirror(mirror_id, callback.from_user.id)
-        await callback.answer("✅ Статус изменён!", show_alert=True)
+        await _answer_callback(callback, "✅ Статус изменён!", show_alert=True)
         await _show_partner_mirror_item(callback, mirror_id)
 
     @dp.callback_query(F.data.startswith('partner_del_mirror_'))
     async def partner_del_mirror_callback(callback: CallbackQuery):
         mirror_id = int(callback.data.split('_')[-1])
         db.delete_mirror(mirror_id, callback.from_user.id)
-        await callback.answer("✅ Зеркало удалено!", show_alert=True)
+        await _answer_callback(callback, "✅ Зеркало удалено!", show_alert=True)
         await manage_mirrors_callback(callback)
