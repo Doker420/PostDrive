@@ -534,6 +534,44 @@ class DBConnection(metaclass=_PoolBoundMeta):
             FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
         )''')
 
+        # Умный лимитер автопостинга. Счётчики хранятся в БД, поэтому лимит
+        # не сбрасывается при перезапуске процесса и действует независимо от
+        # количества циклов/воркеров.
+        self.c.execute('''CREATE TABLE IF NOT EXISTS autopost_limits (
+            account_id INTEGER PRIMARY KEY,
+            min_delay_seconds INTEGER DEFAULT 120,
+            max_delay_seconds INTEGER DEFAULT 240,
+            hourly_limit INTEGER DEFAULT 20,
+            daily_limit INTEGER DEFAULT 100,
+            hour_bucket INTEGER DEFAULT 0,
+            hour_sent INTEGER DEFAULT 0,
+            day_bucket INTEGER DEFAULT 0,
+            day_sent INTEGER DEFAULT 0,
+            last_sent_at INTEGER DEFAULT 0,
+            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        )''')
+
+        # Автопрогрев аккаунтов: один persisted state на аккаунт. Прогрев
+        # переживает перезапуск бота и не запускается второй раз параллельно.
+        self.c.execute('''CREATE TABLE IF NOT EXISTS account_warmups (
+            account_id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'idle',
+            duration_minutes INTEGER DEFAULT 120,
+            started_at INTEGER DEFAULT 0,
+            ends_at INTEGER DEFAULT 0,
+            next_action_at INTEGER DEFAULT 0,
+            action_count INTEGER DEFAULT 0,
+            subscriptions_count INTEGER DEFAULT 0,
+            reactions_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            last_error TEXT DEFAULT '',
+            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+        )''')
+        self.c.execute('CREATE INDEX IF NOT EXISTS idx_account_warmups_status ON account_warmups(status)')
+
         # Chats for each account (selective spamming and settings)
         self.c.execute('''CREATE TABLE IF NOT EXISTS account_chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1230,6 +1268,151 @@ class DBConnection(metaclass=_PoolBoundMeta):
 
     def set_account_spam_status(self, account_id: int, spam_status: int):
         self.c.execute('UPDATE accounts SET spam_status = ? WHERE id = ?', (int(spam_status), account_id))
+        self.conn_ctx.commit()
+
+    # ==================== SMART AUTOPOST / WARMUP ====================
+    def get_autopost_limits(self, account_id: int) -> Dict[str, Any]:
+        self.c.execute('SELECT * FROM autopost_limits WHERE account_id = ?', (account_id,))
+        row = self._dict_fetchone()
+        if row:
+            return row
+        now = int(time.time())
+        self.c.execute(
+            'INSERT OR IGNORE INTO autopost_limits '
+            '(account_id, hour_bucket, day_bucket, updated_at) VALUES (?, ?, ?, ?)',
+            (account_id, now // 3600, now // 86400, now)
+        )
+        self.conn_ctx.commit()
+        self.c.execute('SELECT * FROM autopost_limits WHERE account_id = ?', (account_id,))
+        return self._dict_fetchone() or {
+            'account_id': account_id, 'min_delay_seconds': 120,
+            'max_delay_seconds': 240, 'hourly_limit': 20, 'daily_limit': 100,
+            'hour_bucket': now // 3600, 'hour_sent': 0,
+            'day_bucket': now // 86400, 'day_sent': 0, 'last_sent_at': 0,
+        }
+
+    def configure_autopost_limits(self, account_id: int, min_delay_seconds: int = 120,
+                                  max_delay_seconds: int = 240,
+                                  hourly_limit: int = 20, daily_limit: int = 100):
+        self.get_autopost_limits(account_id)
+        lo = max(30, min(int(min_delay_seconds), 3600))
+        hi = max(lo, min(int(max_delay_seconds), 7200))
+        hour_cap = max(1, min(int(hourly_limit), 100))
+        day_cap = max(hour_cap, min(int(daily_limit), 1000))
+        self.c.execute(
+            'UPDATE autopost_limits SET min_delay_seconds = ?, max_delay_seconds = ?, '
+            'hourly_limit = ?, daily_limit = ?, updated_at = ? WHERE account_id = ?',
+            (lo, hi, hour_cap, day_cap, int(time.time()), account_id)
+        )
+        self.conn_ctx.commit()
+
+    def reserve_autopost_slot(self, account_id: int, now: int = None) -> Tuple[bool, int, str]:
+        """Reserve one send slot, returning (allowed, wait_seconds, reason).
+
+        The read/reset/update sequence is protected by the DB's existing
+        process-wide writer lock. This matters when two account workers race
+        immediately before a Telegram API call: at most one reserves a slot.
+        """
+        with self._thread_write_lock:
+            now = int(now or time.time())
+            limits = self.get_autopost_limits(account_id)
+            hour_bucket = now // 3600
+            day_bucket = now // 86400
+            hour_sent = int(limits.get('hour_sent') or 0) if limits.get('hour_bucket') == hour_bucket else 0
+            day_sent = int(limits.get('day_sent') or 0) if limits.get('day_bucket') == day_bucket else 0
+            hourly_limit = max(1, int(limits.get('hourly_limit') or 20))
+            daily_limit = max(hourly_limit, int(limits.get('daily_limit') or 100))
+            if day_sent >= daily_limit:
+                return False, max(60, (day_bucket + 1) * 86400 - now), 'daily_limit'
+            if hour_sent >= hourly_limit:
+                return False, max(30, (hour_bucket + 1) * 3600 - now), 'hourly_limit'
+            last_sent = int(limits.get('last_sent_at') or 0)
+            min_delay = max(30, int(limits.get('min_delay_seconds') or 120))
+            if last_sent and now - last_sent < min_delay:
+                return False, min_delay - (now - last_sent), 'minimum_delay'
+            self.c.execute(
+                'UPDATE autopost_limits SET hour_bucket = ?, hour_sent = ?, day_bucket = ?, '
+                'day_sent = ?, last_sent_at = ?, updated_at = ? WHERE account_id = ?',
+                (hour_bucket, hour_sent + 1, day_bucket, day_sent + 1, now, now, account_id)
+            )
+            self.conn_ctx.commit()
+            return True, 0, 'ok'
+
+    def get_account_warmup(self, account_id: int) -> Optional[Dict[str, Any]]:
+        self.c.execute('SELECT * FROM account_warmups WHERE account_id = ?', (account_id,))
+        return self._dict_fetchone()
+
+    def get_running_account_warmups(self) -> List[Dict[str, Any]]:
+        now = int(time.time())
+        self.c.execute(
+            "SELECT * FROM account_warmups WHERE status = 'running' AND ends_at > ?",
+            (now,)
+        )
+        return self._dict_fetchall()
+
+    def finish_expired_warmups(self):
+        self.c.execute(
+            "UPDATE account_warmups SET status = 'finished', updated_at = ? "
+            "WHERE status = 'running' AND ends_at <= ?",
+            (int(time.time()), int(time.time()))
+        )
+        self.conn_ctx.commit()
+
+    def start_account_warmup(self, account_id: int, user_id: int, duration_minutes: int) -> Dict[str, Any]:
+        """Create or restart a warmup with a bounded duration."""
+        now = int(time.time())
+        duration = max(15, min(int(duration_minutes), 14 * 24 * 60))
+        ends = now + duration * 60
+        self.c.execute(
+            '''INSERT INTO account_warmups
+               (account_id, user_id, status, duration_minutes, started_at, ends_at,
+                next_action_at, action_count, subscriptions_count, reactions_count,
+                error_count, last_error, updated_at)
+               VALUES (?, ?, 'running', ?, ?, ?, ?, 0, 0, 0, 0, '', ?)
+               ON CONFLICT(account_id) DO UPDATE SET
+                 user_id = excluded.user_id,
+                 status = 'running', duration_minutes = excluded.duration_minutes,
+                 started_at = excluded.started_at, ends_at = excluded.ends_at,
+                 next_action_at = excluded.next_action_at, action_count = 0,
+                 subscriptions_count = 0, reactions_count = 0, error_count = 0,
+                 last_error = '', updated_at = excluded.updated_at''',
+            (account_id, user_id, duration, now, ends, now, now)
+        )
+        self.conn_ctx.commit()
+        return self.get_account_warmup(account_id) or {}
+
+    def update_account_warmup_action(self, account_id: int, action: str,
+                                     next_action_at: int, error: str = ''):
+        """Persist progress without exposing implementation errors to users."""
+        now = int(time.time())
+        column = {
+            'subscribe': 'subscriptions_count',
+            'reaction': 'reactions_count',
+        }.get(action)
+        if column:
+            self.c.execute(
+                f'UPDATE account_warmups SET action_count = action_count + 1, '
+                f'{column} = {column} + 1, next_action_at = ?, updated_at = ? WHERE account_id = ?',
+                (int(next_action_at), now, account_id)
+            )
+        else:
+            self.c.execute(
+                'UPDATE account_warmups SET action_count = action_count + 1, next_action_at = ?, updated_at = ? WHERE account_id = ?',
+                (int(next_action_at), now, account_id)
+            )
+        if error:
+            self.c.execute(
+                'UPDATE account_warmups SET error_count = error_count + 1, last_error = ?, updated_at = ? WHERE account_id = ?',
+                (str(error)[:300], now, account_id)
+            )
+        self.conn_ctx.commit()
+
+    def finish_account_warmup(self, account_id: int, status: str = 'finished', error: str = ''):
+        status = status if status in ('idle', 'running', 'finished', 'stopped', 'failed') else 'finished'
+        self.c.execute(
+            'UPDATE account_warmups SET status = ?, last_error = ?, updated_at = ? WHERE account_id = ?',
+            (status, str(error or '')[:300], int(time.time()), account_id)
+        )
         self.conn_ctx.commit()
 
     def delete_account(self, account_id: int, user_id: int) -> bool:

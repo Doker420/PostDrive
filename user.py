@@ -64,6 +64,7 @@ DEAD_SESSION_ERRORS = tuple({
 SKIP_TARGET_ERRORS = tuple({
     ChatWriteForbidden, ChatAdminRequired, ChannelPrivate, UsernameNotOccupied,
     InviteHashExpired, UserPrivacyRestricted, UserBlocked, UserIsBlocked,
+    UserAlreadyParticipant,
 } - {_NeverRaised})
 
 
@@ -77,6 +78,10 @@ class AccountBlockedError(Exception):
 
 class TargetSkipError(Exception):
     """Цель (чат/пользователь) недоступна — пропускаем её, задача продолжается."""
+
+
+class WarmupStopError(Exception):
+    """Безопасная причина остановки автопрогрева без технического текста."""
 
 
 
@@ -98,6 +103,9 @@ SESSION_CHECK_TIMEOUT = max(5, int(os.environ.get(
 )))
 CLIENT_START_TIMEOUT = max(5, int(os.environ.get(
     'CLIENT_START_TIMEOUT', config.get('LIMITS', 'CLIENT_START_TIMEOUT', fallback='30')
+)))
+TELEGRAM_CALL_TIMEOUT = max(10, int(os.environ.get(
+    'TELEGRAM_CALL_TIMEOUT', config.get('LIMITS', 'TELEGRAM_CALL_TIMEOUT', fallback='45')
 )))
 
 SESSION_CHECK_PROXY_PREFIX = 'PROXY_UNAVAILABLE: '
@@ -123,6 +131,43 @@ def _is_proxy_failure(error: BaseException, proxy_str: str = '') -> bool:
     if any(marker in text or marker in name for marker in transport_markers):
         return True
     return bool(proxy_str) and isinstance(error, (OSError, ConnectionError, asyncio.TimeoutError))
+
+
+def _safe_payload_text(value: Any) -> str:
+    """Нормализует повреждённый текст из Telegram/HTTP payload без падения."""
+    if value is None:
+        return ''
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        try:
+            return raw.decode('utf-8')
+        except UnicodeDecodeError:
+            # Telegram text is normally UTF-8. Replacement is intentional:
+            # malformed optional text must not kill a worker or leak a codec
+            # traceback to a user.
+            return raw.decode('utf-8', errors='replace')
+    try:
+        return str(value)
+    except UnicodeDecodeError:
+        return ''
+    except Exception:
+        return ''
+
+
+def _is_internal_noise_error(error: BaseException) -> bool:
+    """Ошибки транспорта/декодирования для логов, но не для пользователя.
+
+    Они не являются действием пользователя и не помогают ему настроить
+    аккаунт. Внутри всё равно остаются в logging с traceback при необходимости.
+    """
+    text = str(error).lower()
+    return (
+        isinstance(error, UnicodeDecodeError)
+        or 'utf-16-le' in text
+        or 'utf-16' in text and 'decode' in text
+        or ('http client says' in text and 'request timeout' in text)
+        or 'request timeout error' in text
+    )
 
 
 def _session_error_message(error: BaseException, proxy_str: str = '') -> tuple:
@@ -591,6 +636,8 @@ class AccountSessionManager:
         self.active_leave_tasks: Dict[int, asyncio.Task] = {}
         self.active_parse_tasks: Dict[int, asyncio.Task] = {}
         self.active_comment_tasks: Dict[int, asyncio.Task] = {}
+        self.active_warmup_tasks: Dict[int, asyncio.Task] = {}
+        self.active_warmup_task_ids: Dict[int, int] = {}
         self.active_comment_task_ids: Dict[int, int] = {}  # account_id -> task_id in DB
         self.comment_listeners: Dict[int, Dict[str, int]] = {}
         # время последнего отправленного комментария по аккаунтам:
@@ -608,6 +655,7 @@ class AccountSessionManager:
         self._last_bot_message: Dict[int, float] = {}
         self._bot_message_interval = 1.0
         self._spam_progress: Dict[int, Dict] = {}  # account_id -> {success, errors, total, running}
+        self._autopost_notified: Dict[int, set] = {}
         self._user_task_counts: Dict[int, int] = {}  # user_id -> active task count
         self._user_task_lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -671,6 +719,7 @@ class AccountSessionManager:
         'active_spam_tasks': '📨 рассылка',
         'active_parse_tasks': '🔍 парсинг',
         'active_comment_tasks': '🧠 нейрокомментинг',
+        'active_warmup_tasks': '🔥 автопрогрев',
         'active_join_tasks': '➕ вступление в чаты',
         'active_leave_tasks': '➖ выход из чатов',
     }
@@ -689,8 +738,8 @@ class AccountSessionManager:
     def _is_account_busy(self, account_id: int) -> bool:
         """Check if an account has active tasks (spam, parse, comment, join, leave)."""
         for task_dict in [self.active_spam_tasks, self.active_parse_tasks,
-                          self.active_comment_tasks, self.active_join_tasks,
-                          self.active_leave_tasks]:
+                          self.active_comment_tasks, self.active_warmup_tasks,
+                          self.active_join_tasks, self.active_leave_tasks]:
             task = task_dict.get(account_id)
             if task and not task.done():
                 return True
@@ -749,8 +798,37 @@ class AccountSessionManager:
                 except Exception as e:
                     logger.warning(f"Failed to stop client {account_id}: {e}")
 
+    async def _restore_stalled_warmups(self):
+        """Resume unfinished warmups after a clean/restarted process."""
+        try:
+            db.finish_expired_warmups()
+            rows = db.get_running_account_warmups()
+        except Exception as error:
+            logger.debug("watchdog: не удалось прочитать автопрогрев: %s", error)
+            return
+        for state in rows:
+            account_id = state.get('account_id')
+            user_id = state.get('user_id')
+            if not account_id or account_id in self.active_warmup_tasks:
+                continue
+            remaining = max(15, int((int(state.get('ends_at') or 0) - time.time() + 59) // 60))
+            try:
+                ok, message = await self.start_account_warmup(
+                    account_id, self._bot, user_id, remaining
+                )
+                if ok:
+                    await self._safe_bot_message(
+                        self._bot, user_id,
+                        f"♻️ Автопрогрев аккаунта #{account_id} продолжен после перезапуска."
+                    )
+                else:
+                    logger.info("watchdog: автопрогрев %s не возобновлён: %s", account_id, message)
+            except Exception as error:
+                logger.error("watchdog: ошибка возобновления warmup %s: %s", account_id, error, exc_info=True)
+
     async def start_cleanup_loop(self):
         """Background task that periodically cleans up idle clients and AR_HISTORY."""
+        await self._restore_stalled_warmups()
         while True:
             try:
                 await asyncio.sleep(300)  # every 5 minutes
@@ -758,6 +836,7 @@ class AccountSessionManager:
                 await self._evict_idle_clients()
                 await self._enforce_client_limit()
                 await self._restore_stalled_neurocomment()
+                await self._restore_stalled_warmups()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -806,8 +885,8 @@ class AccountSessionManager:
 
         # Cancel all active tasks
         for task_dict in [self.active_spam_tasks, self.active_parse_tasks,
-                          self.active_comment_tasks, self.active_join_tasks,
-                          self.active_leave_tasks]:
+                          self.active_comment_tasks, self.active_warmup_tasks,
+                          self.active_join_tasks, self.active_leave_tasks]:
             for account_id, task in list(task_dict.items()):
                 if task and not task.done():
                     task.cancel()
@@ -826,6 +905,7 @@ class AccountSessionManager:
         self._client_owner.clear()
         self._client_locks.clear()
         self.active_spam_task_ids.clear()
+        self.active_warmup_task_ids.clear()
         self.active_comment_task_ids.clear()
 
         # Disconnect temp auth clients
@@ -1529,7 +1609,8 @@ class AccountSessionManager:
     # ==================== TELEGRAM CALL GUARD (FloodWait & bans) ====================
     async def tg_call(self, factory, *, account_id: int = None, bot=None, user_id: int = None,
                       description: str = '', max_retries: int = 3,
-                      notify: bool = True, raise_on_skip: bool = False):
+                      notify: bool = True, raise_on_skip: bool = False,
+                      stop_on_flood: bool = False):
         """Выполняет вызов Telegram API с обработкой FloodWait и банов.
 
         factory — функция без аргументов, возвращающая корутину. Именно функция,
@@ -1550,7 +1631,10 @@ class AccountSessionManager:
 
         for attempt in range(1, max_retries + 1):
             try:
-                result = await factory()
+                # Единый верхний предел защищает worker от зависших HTTP/API
+                # транспортов; сетевые таймауты ниже получают ограниченный
+                # экспоненциальный retry, а не бесконечный reconnect.
+                result = await asyncio.wait_for(factory(), timeout=TELEGRAM_CALL_TIMEOUT)
                 # Успешный вызов после флуда — снимаем пометку кулдауна
                 if account_id and attempt > 1:
                     try:
@@ -1570,6 +1654,11 @@ class AccountSessionManager:
                         db.record_flood_wait(account_id, wait)
                     except Exception:
                         pass
+
+                if stop_on_flood:
+                    msg = f"FloodWait during warmup: {wait}s"
+                    logging.warning(f"🛑 [acc {account_id}] {label}: прогрев остановлен из-за FloodWait {wait}s")
+                    raise AccountBlockedError(msg, kind='restricted')
 
                 if wait > MAX_FLOOD_WAIT:
                     msg = (f"FloodWait {wait} сек. ({wait // 60} мин.) — это дольше лимита "
@@ -1661,7 +1750,14 @@ class AccountSessionManager:
             except Exception as e:
                 last_err = e
                 # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
-                transient = isinstance(e, (asyncio.TimeoutError, ConnectionError, OSError))
+                error_text = str(e).lower()
+                transient = (
+                    isinstance(e, (asyncio.TimeoutError, ConnectionError, OSError))
+                    or 'timeout' in error_text
+                    or 'timed out' in error_text
+                    or 'connection reset' in error_text
+                    or 'connection refused' in error_text
+                )
                 if transient and attempt < max_retries:
                     backoff = min(30, 2 ** attempt) + random.uniform(0, 1.5)
                     logging.warning(
@@ -1965,29 +2061,46 @@ class AccountSessionManager:
             # Если модели в конфиге не заданы — берём default_model провайдера
             models = G4F_MODELS or [getattr(provider, 'default_model', None) or None]
             for model in models:
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(_sync_call, provider, model),
-                        timeout=G4F_TIMEOUT
-                    )
-                    cleaned = self._clean_ai_output(result)
-                    if cleaned:
-                        logging.info(f"🤖 g4f:{label}/{model or 'default'} → {cleaned[:80]}")
-                        return cleaned
-                except asyncio.TimeoutError:
-                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: таймаут {G4F_TIMEOUT}s")
-                except Exception as e:
-                    if self._is_paid_error(e):
-                        # Провайдер перешёл на платную модель (402 / credits /
-                        # proof-of-work). Бесплатным он уже не станет — исключаем
-                        # его до перезапуска, чтобы не долбиться в стену.
-                        self._g4f_paid.add(label)
-                        logging.warning(
-                            f"💰 g4f {label}: требует оплату — исключён из бесплатного пула"
+                for provider_attempt in range(1, 3):
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(_sync_call, provider, model),
+                            timeout=G4F_TIMEOUT
                         )
+                        cleaned = self._clean_ai_output(result)
+                        if cleaned:
+                            logging.info(f"🤖 g4f:{label}/{model or 'default'} → {cleaned[:80]}")
+                            return cleaned
                         break
-                    logging.warning(f"⚠️ g4f {label}/{model or 'default'}: "
-                                    f"{type(e).__name__}: {str(e)[:120]}")
+                    except asyncio.TimeoutError:
+                        logging.warning(
+                            f"⚠️ g4f {label}/{model or 'default'}: таймаут "
+                            f"{G4F_TIMEOUT}s ({provider_attempt}/2)"
+                        )
+                        if provider_attempt < 2:
+                            await asyncio.sleep(1.5)
+                            continue
+                    except Exception as e:
+                        if self._is_paid_error(e):
+                            # Провайдер перешёл на платную модель (402 / credits /
+                            # proof-of-work). Бесплатным он уже не станет — исключаем
+                            # его до перезапуска, чтобы не долбиться в стену.
+                            self._g4f_paid.add(label)
+                            logging.warning(
+                                f"💰 g4f {label}: требует оплату — исключён из бесплатного пула"
+                            )
+                            break
+                        text = str(e).lower()
+                        transport = any(marker in text for marker in (
+                            'timeout', 'timed out', 'connection reset',
+                            'connection refused', 'temporarily unavailable'
+                        ))
+                        logging.warning(f"⚠️ g4f {label}/{model or 'default'}: "
+                                        f"{type(e).__name__}: {str(e)[:120]}")
+                        if transport and provider_attempt < 2:
+                            await asyncio.sleep(1.5)
+                            continue
+                    break
         if self._g4f_paid:
             logging.error(
                 "❌ g4f: бесплатные провайдеры не ответили "
@@ -2105,7 +2218,10 @@ class AccountSessionManager:
         if not client:
             logging.error(f"❌ [{acc_name}] Failed to start client: {err}")
             if bot and not notifications_hidden:
-                await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось запустить сессию: {err}")
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"⚠️ [{acc_name}] Не удалось запустить сессию. Проверьте состояние аккаунта в панели."
+                )
             return
         
         logging.info(f"✅ [{acc_name}] Client started successfully")
@@ -2129,7 +2245,10 @@ class AccountSessionManager:
                     if not ok_access:
                         logging.warning(f"⚠️ [{acc_name}] {channel}: {access_msg}")
                         if bot and not notifications_hidden:
-                            await bot.send_message(user_id, f"⚠️ [{acc_name}] {channel}: {access_msg}")
+                            await self._safe_bot_message(
+                                bot, user_id,
+                                f"⚠️ [{acc_name}] Канал {channel} недоступен для комментариев."
+                            )
                         continue
                     chat = await client.get_chat(chat_id)
                     valid_channels.append(channel)
@@ -2139,9 +2258,12 @@ class AccountSessionManager:
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен (комментарии: {discussion_id})")
                 except Exception as e:
-                    logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}")
-                    if bot and not notifications_hidden:
-                        await bot.send_message(user_id, f"⚠️ [{acc_name}] Канал {channel} недоступен: {str(e)[:100]}")
+                    logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}", exc_info=True)
+                    if bot and not notifications_hidden and not _is_internal_noise_error(e):
+                        await self._safe_bot_message(
+                            bot, user_id,
+                            f"⚠️ [{acc_name}] Канал {channel} временно недоступен."
+                        )
             
             logging.info(f"📊 [{acc_name}] Channel validation complete: {len(valid_channels)}/{len(target_channels)} valid")
             
@@ -2245,10 +2367,19 @@ class AccountSessionManager:
                         logging.debug(f"📥 [{acc_name}] Fetching recent posts from {channel}")
                         last_seen = self.comment_listeners.get(account_id, {}).get(str(channel), 0)
                         fresh = []
-                        async for m in client.get_chat_history(chat_id, limit=self.NC_HISTORY_LIMIT):
-                            if not m or m.id <= last_seen:
-                                continue
-                            fresh.append(m)
+                        try:
+                            async for m in client.get_chat_history(chat_id, limit=self.NC_HISTORY_LIMIT):
+                                if not m or m.id <= last_seen:
+                                    continue
+                                fresh.append(m)
+                        except UnicodeDecodeError as decode_error:
+                            # A malformed optional Telegram payload should only
+                            # skip this history page, not terminate the worker.
+                            logging.warning(
+                                "[%s] повреждённый payload истории %s пропущен: %s",
+                                acc_name, channel, decode_error
+                            )
+                            continue
                         # от старого к новому: комментируем по одному за цикл
                         fresh.reverse()
                         logging.info(f"🔎 [{acc_name}] {channel}: last_seen={last_seen}, "
@@ -2260,7 +2391,17 @@ class AccountSessionManager:
                                 self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
                                 continue
 
-                            post_text = msg.text or msg.caption or ''
+                            try:
+                                post_text = _safe_payload_text(
+                                    getattr(msg, 'text', None) or getattr(msg, 'caption', None) or ''
+                                )
+                            except UnicodeDecodeError as decode_error:
+                                logging.warning(
+                                    "[%s] повреждённый текст поста %s/%s пропущен: %s",
+                                    acc_name, channel, getattr(msg, 'id', '?'), decode_error
+                                )
+                                self.comment_listeners.setdefault(account_id, {})[str(channel)] = getattr(msg, 'id', 0)
+                                continue
                             logging.debug(f"📩 [{acc_name}] Post id={msg.id} date={msg.date} text_len={len(post_text)} in {channel}")
 
                             # Режим 'prompt' пишет по своей теме и не нуждается в
@@ -2383,16 +2524,22 @@ class AccountSessionManager:
 
                             except Exception as send_err:
                                 logging.error(f"❌ [{acc_name}] Failed to send comment to {channel}: {type(send_err).__name__}: {send_err}")
-                                if bot and not notifications_hidden:
-                                    await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка отправки в {channel}: {str(send_err)[:100]}")
+                                if bot and not notifications_hidden and not _is_internal_noise_error(send_err):
+                                    await self._safe_bot_message(
+                                        bot, user_id,
+                                        f"⚠️ [{acc_name}] Не удалось отправить комментарий в {channel}. Подробности сохранены в журнале."
+                                    )
                             # не больше одного комментария за цикл — иначе аккаунт
                             # выстреливает очередь сообщений и ловит спам-блок
                             break
                     
                     except Exception as e:
                         logging.error(f"❌ [{acc_name}] Error processing channel {channel}: {type(e).__name__}: {e}")
-                        if bot and not notifications_hidden:
-                            await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка проверки канала {channel}: {str(e)[:100]}")
+                        if bot and not notifications_hidden and not _is_internal_noise_error(e):
+                            await self._safe_bot_message(
+                                bot, user_id,
+                                f"⚠️ [{acc_name}] Не удалось проверить канал {channel}. Подробности сохранены в журнале."
+                            )
                 
                 # Опрашиваем каналы часто (не реже раза в NC_CHECK_INTERVAL),
                 # а comment_delay теперь задаёт паузу МЕЖДУ комментариями.
@@ -2419,11 +2566,15 @@ class AccountSessionManager:
                 except Exception:
                     pass
         except Exception as e:
-            logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}")
-            if bot and not notifications_hidden:
+            logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}", exc_info=True)
+            if bot and not notifications_hidden and not _is_internal_noise_error(e):
                 try:
-                    await bot.send_message(user_id, f"❌ [{acc_name}] Критическая ошибка: {str(e)[:200]}")
-                except:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"⚠️ [{acc_name}] Нейрокомментинг остановлен из-за временной ошибки. "
+                        "Подробности сохранены в журнале."
+                    )
+                except Exception:
                     pass
         finally:
             logging.info(f"🧠 [{acc_name}] Neurocomment worker stopped")
@@ -3094,6 +3245,242 @@ class AccountSessionManager:
         if bot:
             await bot.send_message(user_id, f"✅ [{acc_name}] Массовый выход завершён!\n🚪 Покинуто чатов: {left}\n❌ Ошибок: {failed}")
 
+    # ==================== SMART AUTOPOST / ACCOUNT WARMUP ====================
+    WARMUP_SEARCH_QUERIES = (
+        'новости', 'технологии', 'спорт', 'музыка', 'путешествия',
+        'кино', 'юмор', 'наука', 'бизнес', 'культура'
+    )
+    WARMUP_REACTIONS = ('👍', '❤', '🔥', '👏', '😁')
+    WARMUP_MAX_ACTIONS = 30
+    WARMUP_MAX_SUBSCRIPTIONS = 8
+    WARMUP_MAX_REACTIONS = 20
+
+    def is_account_warming(self, account_id: int) -> bool:
+        task = self.active_warmup_tasks.get(account_id)
+        return task is not None and not task.done()
+
+    async def _warmup_find_channel(self, client):
+        """Find one public channel without scraping or noisy user messages."""
+        query = random.choice(self.WARMUP_SEARCH_QUERIES)
+
+        async def collect_one():
+            candidates = client.search_global(query=query, limit=10)
+            async for chat in candidates:
+                chat_type = str(getattr(chat, 'type', '')).lower()
+                if 'channel' not in chat_type:
+                    continue
+                # Only public usernames are eligible: an ID-only result can
+                # be a private chat and must never be joined automatically.
+                username = getattr(chat, 'username', None)
+                if username:
+                    return username
+            return None
+
+        try:
+            return await asyncio.wait_for(collect_one(), timeout=20)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.warning("warmup search failed (%s): %s", query, error, exc_info=True)
+            if _is_proxy_failure(error):
+                raise WarmupStopError('network unavailable') from error
+        return None
+
+    async def _warmup_subscribe(self, client, account_id: int) -> bool:
+        target = await self._warmup_find_channel(client)
+        if not target:
+            return False
+        try:
+            await self.tg_call(
+                lambda: client.join_chat(target),
+                account_id=account_id, description='warmup subscribe',
+                notify=False, max_retries=2, stop_on_flood=True
+            )
+            return True
+        except UserAlreadyParticipant:
+            return True
+        except AccountBlockedError:
+            raise
+        except Exception as error:
+            logging.warning("warmup subscribe failed: %s", error, exc_info=True)
+            if _is_proxy_failure(error):
+                raise WarmupStopError('network unavailable') from error
+            return False
+
+    async def _warmup_react(self, client, account_id: int) -> bool:
+        target = await self._warmup_find_channel(client)
+        if not target:
+            return False
+        try:
+            chat = await asyncio.wait_for(client.get_chat(target), timeout=12)
+
+            async def get_recent_message():
+                async for candidate in client.get_chat_history(chat.id, limit=8):
+                    if candidate and getattr(candidate, 'id', None) and not getattr(candidate, 'service', None):
+                        return candidate
+                return None
+
+            message = await asyncio.wait_for(get_recent_message(), timeout=20)
+            if not message:
+                return False
+            send_reaction = getattr(client, 'send_reaction', None)
+            if send_reaction is None:
+                return False
+            await self.tg_call(
+                lambda: send_reaction(
+                    chat.id, message.id, emoji=random.choice(self.WARMUP_REACTIONS)
+                ),
+                account_id=account_id, description='warmup reaction',
+                notify=False, max_retries=2, stop_on_flood=True
+            )
+            return True
+        except AccountBlockedError:
+            raise
+        except Exception as error:
+            logging.warning("warmup reaction failed: %s", error, exc_info=True)
+            if _is_proxy_failure(error):
+                raise WarmupStopError('network unavailable') from error
+            return False
+
+    async def _warmup_worker(self, account_id: int, bot, user_id: int,
+                             task_id: int = None):
+        state = db.get_account_warmup(account_id) or {}
+        ends_at = int(state.get('ends_at') or time.time())
+        account = db.get_account(account_id) or {}
+        acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
+        try:
+            client, error = await self.get_or_start_client(account_id)
+            if not client:
+                db.finish_account_warmup(account_id, 'failed', 'client unavailable')
+                if bot:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"⚠️ [{acc_name}] Автопрогрев не запущен: аккаунт недоступен."
+                    )
+                return
+
+            while time.time() < ends_at:
+                current = db.get_account_warmup(account_id) or {}
+                if current.get('status') != 'running':
+                    break
+                if int(current.get('action_count') or 0) >= self.WARMUP_MAX_ACTIONS:
+                    logging.info("warmup %s reached action cap", account_id)
+                    break
+                subscriptions = int(current.get('subscriptions_count') or 0)
+                reactions = int(current.get('reactions_count') or 0)
+                if subscriptions >= self.WARMUP_MAX_SUBSCRIPTIONS and reactions >= self.WARMUP_MAX_REACTIONS:
+                    logging.info("warmup %s reached subscription/reaction caps", account_id)
+                    break
+                action = 'subscribe' if random.random() < 0.62 else 'reaction'
+                if action == 'subscribe' and subscriptions >= self.WARMUP_MAX_SUBSCRIPTIONS:
+                    action = 'reaction'
+                elif action == 'reaction' and reactions >= self.WARMUP_MAX_REACTIONS:
+                    action = 'subscribe'
+                ok = await (
+                    self._warmup_subscribe(client, account_id)
+                    if action == 'subscribe'
+                    else self._warmup_react(client, account_id)
+                )
+                # Ошибка конкретного канала остаётся в логах/статистике, но
+                # не превращается в тревожное сообщение с техническим traceback.
+                next_at = int(time.time() + random.randint(120, 360))
+                db.update_account_warmup_action(
+                    account_id, action if ok else 'other', next_at,
+                    '' if ok else f'{action} skipped'
+                )
+                wait_for = min(max(30, next_at - int(time.time())),
+                               max(0, ends_at - int(time.time())))
+                if wait_for <= 0:
+                    break
+                await asyncio.sleep(wait_for)
+
+            if (db.get_account_warmup(account_id) or {}).get('status') == 'running':
+                db.finish_account_warmup(account_id, 'finished')
+                if bot:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"✅ [{acc_name}] Автопрогрев завершён."
+                    )
+        except asyncio.CancelledError:
+            if (db.get_account_warmup(account_id) or {}).get('status') == 'running':
+                db.finish_account_warmup(account_id, 'stopped')
+            raise
+        except AccountBlockedError:
+            db.finish_account_warmup(account_id, 'failed', 'telegram restriction')
+            if bot:
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"⚠️ [{acc_name}] Автопрогрев остановлен: Telegram попросил аккаунт сделать паузу."
+                )
+        except WarmupStopError:
+            db.finish_account_warmup(account_id, 'failed', 'network unavailable')
+            if bot:
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"⚠️ [{acc_name}] Автопрогрев остановлен: временно недоступна сеть или прокси."
+                )
+        except Exception as error:
+            logging.error("warmup worker %s failed: %s", account_id, error, exc_info=True)
+            db.finish_account_warmup(account_id, 'failed', type(error).__name__)
+            if bot:
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"⚠️ [{acc_name}] Автопрогрев остановлен из-за временной ошибки."
+                )
+        finally:
+            self.active_warmup_tasks.pop(account_id, None)
+            self.active_warmup_task_ids.pop(account_id, None)
+            if task_id:
+                warmup_status = (db.get_account_warmup(account_id) or {}).get('status')
+                db.finish_task(
+                    task_id,
+                    status='cancelled' if warmup_status == 'stopped' else 'finished'
+                )
+            await self._release_user_quota(user_id)
+
+    async def start_account_warmup(self, account_id: int, bot, user_id: int,
+                                   duration_minutes: int = 120):
+        if self.is_account_warming(account_id):
+            return False, 'Автопрогрев уже запущен'
+        account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(user_id):
+            return False, 'Аккаунт не найден'
+        if int(account.get('spam_status') or 0) == 1 or self._is_account_busy(account_id):
+            return False, 'Сначала остановите другие задачи аккаунта'
+        usable, reason = db.is_account_usable(account_id)
+        if not usable:
+            return False, reason
+        if self._running_tasks >= self._max_concurrent_tasks:
+            return False, f'Достигнут глобальный лимит одновременных задач ({self._max_concurrent_tasks})'
+        if not await self._acquire_user_quota(user_id):
+            return False, f'Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER})'
+        duration = max(15, min(int(duration_minutes), 14 * 24 * 60))
+        db.start_account_warmup(account_id, user_id, duration)
+        task_id = db.register_task(user_id, account_id, 'warmup', 'starting')
+        task = asyncio.create_task(
+            self._run_limited(self._warmup_worker(account_id, bot, user_id, task_id)),
+            name=f'warmup-{account_id}'
+        )
+        self.active_warmup_tasks[account_id] = task
+        self.active_warmup_task_ids[account_id] = task_id
+        self._bot = bot or self._bot
+        return True, f'Автопрогрев запущен на {duration} мин.'
+
+    async def stop_account_warmup(self, account_id: int, user_id: int = None):
+        account = db.get_account(account_id)
+        if not account:
+            return False
+        if user_id is not None and int(account.get('user_id') or 0) != int(user_id):
+            return False
+        db.finish_account_warmup(account_id, 'stopped')
+        task_id = self.active_warmup_task_ids.pop(account_id, None)
+        if task_id:
+            db.cancel_task(task_id)
+        task = self.active_warmup_tasks.pop(account_id, None)
+        if task and not task.done():
+            task.cancel()
+        return True
+
     # ==================== PER-ACCOUNT SPAM ENGINE ====================
     def is_account_spamming(self, account_id: int) -> bool:
         task = self.active_spam_tasks.get(account_id)
@@ -3102,6 +3489,8 @@ class AccountSessionManager:
     async def start_account_spam(self, account_id: int, bot, user_id: int):
         if self.is_account_spamming(account_id):
             return True, "Рассылка уже запущена"
+        if self.is_account_warming(account_id):
+            return False, "Сначала остановите автопрогрев аккаунта"
         usable, reason = db.is_account_usable(account_id)
         if not usable:
             return False, reason
@@ -3131,6 +3520,9 @@ class AccountSessionManager:
     async def _spam_worker(self, account_id: int, bot, user_id: int, task_id: int = None):
         account = db.get_account(account_id)
         if not account:
+            if task_id:
+                db.finish_task(task_id, status='failed')
+            await self._release_user_quota(user_id)
             return
 
         acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
@@ -3138,8 +3530,16 @@ class AccountSessionManager:
         client, err = await self.get_or_start_client(account_id)
         if not client:
             db.set_account_spam_status(account_id, 0)
+            if task_id:
+                db.finish_task(task_id, status='failed')
             if bot:
-                await bot.send_message(user_id, f"❌ [{acc_name}] Не удалось запустить сессию: {err}")
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f"⚠️ [{acc_name}] Не удалось запустить рассылку. Проверьте состояние аккаунта в панели."
+                )
+            await self._release_user_quota(user_id)
+            self.active_spam_task_ids.pop(account_id, None)
+            self.active_spam_tasks.pop(account_id, None)
             return
 
         cycle_count = 0
@@ -3170,8 +3570,8 @@ class AccountSessionManager:
                     if bot and not notifications_hidden:
                         await self._safe_bot_message(
                             bot, user_id,
-                            f"🛑 [{acc_name}] Рассылка остановлена.\n{cli_err}\n\n"
-                            "Проверьте прокси и сбросьте статус в панели аккаунта."
+                            f"🛑 [{acc_name}] Рассылка остановлена. "
+                            "Проверьте прокси и статус аккаунта в панели."
                         )
                     break
 
@@ -3221,6 +3621,30 @@ class AccountSessionManager:
                     acc_chk = db.get_account(account_id)
                     if not acc_chk or acc_chk.get('spam_status') != 1:
                         return
+
+                    # Smart safety gate: persistent hourly/daily counters and
+                    # a minimum delay are checked before every send. The
+                    # reservation is atomic inside DB, so a restart cannot
+                    # reset the account's safe budget.
+                    slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
+                    if not slot_ok:
+                        notices = self._autopost_notified.setdefault(account_id, set())
+                        if bot and not notifications_hidden and slot_reason not in notices:
+                            notices.add(slot_reason)
+                            if slot_reason == 'daily_limit':
+                                await self._safe_bot_message(
+                                    bot, user_id,
+                                    f"⏸️ [{acc_name}] Дневный лимит безопасной рассылки исчерпан. "
+                                    "Продолжу после сброса лимита."
+                                )
+                            elif slot_reason == 'hourly_limit':
+                                await self._safe_bot_message(
+                                    bot, user_id,
+                                    f"⏸️ [{acc_name}] Часовой лимит безопасной рассылки достигнут. "
+                                    f"Пауза примерно {max(1, slot_wait // 60)} мин."
+                                )
+                        await asyncio.sleep(max(5, min(slot_wait, 3600)))
+                        continue
 
                     chat_id_val = int(chat['chat_id']) if (chat['chat_id'].startswith("-") or chat['chat_id'].isdigit()) else chat['chat_id']
                     chat_title = chat.get('chat_title') or str(chat_id_val)
@@ -3334,10 +3758,14 @@ class AccountSessionManager:
                             db.update_report_stats(report_id, sent_delta=1)
                     except Exception as send_err:
                         print(f"⚠️ [{acc_name}] Ошибка отправки в {chat_title}: {send_err}")
-                        if bot and not notifications_hidden:
+                        if bot and not notifications_hidden and not _is_internal_noise_error(send_err):
                             try:
-                                await bot.send_message(user_id, f"⚠️ [{acc_name}] Ошибка в {chat_title}: {str(send_err)[:100]}")
-                            except:
+                                await self._safe_bot_message(
+                                    bot, user_id,
+                                    f"⚠️ [{acc_name}] Не удалось отправить пост в {chat_title}. "
+                                    "Подробности сохранены в журнале."
+                                )
+                            except Exception:
                                 pass
                         
                         if chat_id_val not in chats_added:
@@ -3346,7 +3774,11 @@ class AccountSessionManager:
                         else:
                             db.update_report_stats(report_id, error_delta=1)
 
-                    delay = random.randint(120, 200)
+                    limits = db.get_autopost_limits(account_id)
+                    delay = random.randint(
+                        max(30, int(limits.get('min_delay_seconds') or 120)),
+                        max(30, int(limits.get('max_delay_seconds') or 240))
+                    )
                     await asyncio.sleep(delay)
 
                 if bot:
@@ -3360,11 +3792,15 @@ class AccountSessionManager:
             print(f"🚫 Рассылка [{acc_name}] остановлена: {e}")
             db.set_account_spam_status(account_id, 0)
         except Exception as e:
-            print(f"❌ Критическая ошибка спама [{acc_name}]: {e}")
-            if bot:
+            logging.error(f"❌ Критическая ошибка спама [{acc_name}]: {e}", exc_info=True)
+            if bot and not _is_internal_noise_error(e):
                 try:
-                    await bot.send_message(user_id, f"❌ [{acc_name}] Ошибка рассылки: {e}")
-                except:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f"⚠️ [{acc_name}] Рассылка остановлена из-за временной ошибки. "
+                        "Подробности сохранены в журнале."
+                    )
+                except Exception:
                     pass
         finally:
             db.finish_report(report_id)
@@ -3372,6 +3808,7 @@ class AccountSessionManager:
             if task_id:
                 db.finish_task(task_id, status='finished')
             self.active_spam_task_ids.pop(account_id, None)
+            self._autopost_notified.pop(account_id, None)
             await self._release_user_quota(user_id)
 
     async def parse_chat_users(self, account_id: int, chat_id: str, bot, user_id: int,

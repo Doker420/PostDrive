@@ -1,0 +1,60 @@
+"""Regression checks for persistent autopost limits and warmup safety paths."""
+import pathlib
+import sys
+import tempfile
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import sqliter
+
+
+def test_persistent_autopost_limits_and_warmup_state():
+    path = tempfile.mktemp(suffix=".db")
+    db = sqliter.DBConnection(path)
+    try:
+        db.get_or_create_user(42)
+        account_id = db.add_account(42, "session", account_name="test")
+        db.configure_autopost_limits(
+            account_id, min_delay_seconds=30, max_delay_seconds=60,
+            hourly_limit=2, daily_limit=3
+        )
+
+        start = (1_700_000_000 // 86400) * 86400 + 100
+        assert db.reserve_autopost_slot(account_id, start) == (True, 0, "ok")
+        assert db.reserve_autopost_slot(account_id, start + 30) == (True, 0, "ok")
+        allowed, wait, reason = db.reserve_autopost_slot(account_id, start + 60)
+        assert not allowed and reason == "hourly_limit" and wait > 0
+
+        # The next hour has a fresh hourly bucket, but the daily counter remains.
+        assert db.reserve_autopost_slot(account_id, start + 3600) == (True, 0, "ok")
+        allowed, _wait, reason = db.reserve_autopost_slot(account_id, start + 7200)
+        assert not allowed and reason == "daily_limit"
+
+        state = db.start_account_warmup(account_id, 42, 1)
+        assert state["status"] == "running"
+        assert state["duration_minutes"] == 15  # lower bound is intentional
+        db.update_account_warmup_action(account_id, "subscribe", start + 100)
+        state = db.get_account_warmup(account_id)
+        assert state["action_count"] == 1
+        assert state["subscriptions_count"] == 1
+        db.finish_account_warmup(account_id, "stopped")
+        assert db.get_account_warmup(account_id)["status"] == "stopped"
+    finally:
+        db.close()
+        pathlib.Path(path).unlink(missing_ok=True)
+
+
+def test_user_safety_guards_are_present():
+    source = pathlib.Path("user.py").read_text(encoding="utf-8")
+    assert "def _is_internal_noise_error" in source
+    assert "def _safe_payload_text" in source
+    assert "TELEGRAM_CALL_TIMEOUT" in source
+    assert "stop_on_flood: bool = False" in source
+    assert "await asyncio.wait_for(factory(), timeout=TELEGRAM_CALL_TIMEOUT)" in source
+    assert "asyncio.wait_for(collect_one(), timeout=20)" in source
+    assert "warmup reaction" in source
+
+
+if __name__ == "__main__":
+    test_persistent_autopost_limits_and_warmup_state()
+    test_user_safety_guards_are_present()
+    print("SMART SAFETY TESTS PASSED")

@@ -308,6 +308,13 @@ def cancel_inline_keyboard():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
     ])
 
+
+def account_connected_keyboard(account_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Запустить автопрогрев", callback_data=f"warmup_start_{account_id}")],
+        [InlineKeyboardButton(text="📱 Открыть аккаунт", callback_data=f"manage_acc_{account_id}")],
+    ])
+
 def format_date(timestamp: int) -> str:
     if not timestamp or timestamp <= 0:
         return "Отсутствует"
@@ -551,6 +558,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     CRYPTO_BOT_TOKEN = config.get('CRYPTO_BOT_TOKEN', '')
     TESTNET = config.get('TESTNET', False)
     account_manager = config.get('account_manager')
+    if account_manager is not None:
+        # Needed by the watchdog when it resumes persisted warmups after a
+        # process restart, before the first user action reaches a handler.
+        account_manager._bot = bot
     USERNAME = config.get('USERNAME', 'bot')
     STARS_ENABLED = config.get('STARS_ENABLED', True)
     STARS_PER_USD = int(config.get('STARS_PER_USD', 50))
@@ -1307,7 +1318,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             try:
                 file = await bot.get_file(message.document.file_id)
                 content = await bot.download_file(file.file_path)
-                text = content.read().decode('utf-8')
+                text = content.read().decode('utf-8', errors='replace')
                 users = [l.strip() for l in text.split('\n') if l.strip()]
             except Exception as e:
                 await message.answer(f"❌ Ошибка чтения файла: {e}")
@@ -1363,7 +1374,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             try:
                 file = await bot.get_file(message.document.file_id)
                 content = await bot.download_file(file.file_path)
-                text = content.read().decode('utf-8')
+                text = content.read().decode('utf-8', errors='replace')
                 targets = [l.strip() for l in text.split('\n') if l.strip()]
             except Exception as e:
                 await message.answer(f"❌ Ошибка чтения файла: {e}")
@@ -2239,9 +2250,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     @dp.message(AddAccountStates.WAITING_2FA)
     async def process_auth_2fa(message: Message, state: FSMContext):
@@ -2261,9 +2276,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     @dp.callback_query(F.data == "auth_string_session", AddAccountStates.WAITING_METHOD)
     async def auth_string_session_callback(callback: CallbackQuery, state: FSMContext):
@@ -2289,9 +2308,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     # Активные опросы QR-входа: user_id -> asyncio.Task.
     # Раньше опрос стартовал ТОЛЬКО по кнопке «Я отсканировал». Пользователь
@@ -2338,10 +2361,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     await status_msg.edit_text(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
                     await state.clear()
                     return
-                db.add_account(user_id, session_str, phone=info.get('phone', ''),
-                               account_name=acc_name, proxy=proxy_str)
+                account_id = db.add_account(user_id, session_str, phone=info.get('phone', ''),
+                                             account_name=acc_name, proxy=proxy_str)
                 await state.clear()
-                await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен через QR!")
+                await status_msg.edit_text(
+                    f"✅ Аккаунт {acc_name} подключен через QR!\n\n"
+                    "Можно сразу запустить безопасный автопрогрев.",
+                    reply_markup=account_connected_keyboard(account_id)
+                )
                 return
         except asyncio.CancelledError:
             raise
@@ -2439,9 +2466,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подложен через QR!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен через QR!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
 
 
@@ -2565,9 +2596,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     @dp.message(AddAccountStates.WAITING_2FA)
     async def process_auth_2fa(message: Message, state: FSMContext):
@@ -2587,9 +2622,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     @dp.callback_query(F.data == "auth_string_session", AddAccountStates.WAITING_METHOD)
     async def auth_string_session_callback(callback: CallbackQuery, state: FSMContext):
@@ -2615,9 +2654,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer(f"🚫 {_reason}\n\nПовысьте тариф в «💳 Подписка».")
             await state.clear()
             return
-        db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
         await state.clear()
-        await status_msg.edit_text(f"✅ Аккаунт {acc_name} подключен!")
+        await status_msg.edit_text(
+            f"✅ Аккаунт {acc_name} подключен!\n\n"
+            "Можно сразу запустить безопасный автопрогрев.",
+            reply_markup=account_connected_keyboard(account_id)
+        )
 
     # ==================== PER-ACCOUNT CONTROL PANEL ====================
     async def render_account_dashboard(message_or_callback, account_id: int, user_id: int):
@@ -2630,11 +2673,19 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
 
         is_spamming = account_manager.is_account_spamming(account_id) if account_manager else False
+        is_warming = account_manager.is_account_warming(account_id) if account_manager else False
         spam_btn = (
-            InlineKeyboardButton(text="🛑 Остановить спам", callback_data=f"stop_spam_{account_id}")
+            InlineKeyboardButton(text="🛑 Остановить автопостинг", callback_data=f"stop_spam_{account_id}")
             if is_spamming else
-            InlineKeyboardButton(text="🚀 Запустить спам", callback_data=f"start_spam_{account_id}")
+            InlineKeyboardButton(text="🚀 Запустить автопостинг", callback_data=f"start_spam_{account_id}")
         )
+        warmup_btn = (
+            InlineKeyboardButton(text="🛑 Остановить автопрогрев", callback_data=f"warmup_stop_{account_id}")
+            if is_warming else
+            InlineKeyboardButton(text="🔥 Автопрогрев аккаунта", callback_data=f"warmup_start_{account_id}")
+        )
+        autopost_limits = db.get_autopost_limits(account_id)
+        warmup_state = db.get_account_warmup(account_id) or {}
 
         try:
             _, _parsed_total = db.get_parsed_users_paginated(account_id, user_id, page=0, per_page=1)
@@ -2652,6 +2703,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         buttons = [
             [spam_btn],
+            [warmup_btn],
+            [InlineKeyboardButton(
+                text=f"🛡 Умный режим: {autopost_limits.get('hourly_limit', 20)}/ч · {autopost_limits.get('daily_limit', 100)}/д",
+                callback_data=f"autopost_info_{account_id}"
+            )],
             [InlineKeyboardButton(text="📝 Настройки поста", callback_data=f"acc_post_{account_id}"),
              InlineKeyboardButton(text="⏱ Интервал", callback_data=f"acc_timeout_{account_id}")],
             [InlineKeyboardButton(text=f"💬 Выбор групп ({enabled_chats_count}/{total_groups})", callback_data=f"acc_chats_{account_id}_0"),
@@ -2686,7 +2742,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         text = (
             f"📱 <b>Панель управления: {acc_name}</b>\n\n"
-            f"• <b>Статус рассылки:</b> {'🚀 Работает' if is_spamming else '⏹ Остановлена'}\n"
+            f"• <b>Статус автопостинга:</b> {'🚀 Работает' if is_spamming else '⏹ Остановлен'}\n"
+            f"• <b>Лимиты:</b> {autopost_limits.get('hourly_limit', 20)} пост./час, {autopost_limits.get('daily_limit', 100)} пост./день; пауза {autopost_limits.get('min_delay_seconds', 120)}–{autopost_limits.get('max_delay_seconds', 240)} сек.\n"
             f"• <b>Телефон:</b> <code>{phone}</code>\n"
             f"• <b>Прокси:</b> <code>{proxy_str}</code>\n"
             f"• <b>Интервал цикла:</b> {account.get('timeout', 5)} мин\n"
@@ -2694,6 +2751,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"• <b>Текст поста:</b> {post_text_preview}\n"
             f"• <b>Медиа:</b> {has_photo}"
         )
+
+        if warmup_state.get('status') == 'running':
+            left = max(0, int(warmup_state.get('ends_at') or 0) - int(time.time()))
+            text += (f"\n\n🔥 <b>Автопрогрев:</b> выполняется, осталось "
+                     f"примерно {left // 3600} ч. {(left % 3600) // 60} мин.\n"
+                     f"Действий: {warmup_state.get('action_count', 0)} "
+                     f"(подписок: {warmup_state.get('subscriptions_count', 0)}, "
+                     f"реакций: {warmup_state.get('reactions_count', 0)})")
+        elif warmup_state.get('status') in ('finished', 'stopped', 'failed'):
+            warmup_labels = {
+                'finished': 'завершён',
+                'stopped': 'остановлен',
+                'failed': 'остановлен из-за временной ошибки',
+            }
+            warmup_status = warmup_labels.get(warmup_state.get('status'), 'завершён')
+            text += (f"\n\n🔥 <b>Автопрогрев:</b> {warmup_status} · "
+                     f"действий: {warmup_state.get('action_count', 0)}")
 
         # ── Здоровье аккаунта (FloodWait / ограничения) ──
         health = account.get('health') or 'ok'
@@ -2799,6 +2873,65 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         ok, msg = await account_manager.start_account_spam(account_id, bot, user_id)
         await _answer_callback(callback, msg, show_alert=True)
         await render_account_dashboard(callback, account_id, user_id)
+
+    @dp.callback_query(F.data.startswith('autopost_info_'))
+    async def autopost_info_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        account = db.get_account(account_id)
+        if not account or account.get('user_id') != callback.from_user.id:
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        limits = db.get_autopost_limits(account_id)
+        text = (
+            "🛡 <b>Умный автопостинг</b>\n\n"
+            f"• Не более <b>{limits.get('hourly_limit', 20)}</b> публикаций в час\n"
+            f"• Не более <b>{limits.get('daily_limit', 100)}</b> публикаций в день\n"
+            f"• Пауза между отправками: <b>{limits.get('min_delay_seconds', 120)}–{limits.get('max_delay_seconds', 240)} сек.</b>\n"
+            "• Счётчики сохраняются после перезапуска\n"
+            "• FloodWait останавливает задачу, а не запускает бесконечный цикл\n\n"
+            "Лимиты рассчитаны консервативно. Они снижают риск спам-блока, "
+            "но не могут гарантировать его отсутствие при агрессивном контенте "
+            "или жалобах пользователей."
+        )
+        await _answer_callback(callback)
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
+        ]))
+
+    @dp.callback_query(F.data.startswith('warmup_start_'))
+    async def warmup_start_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        account = db.get_account(account_id)
+        if not account or account.get('user_id') != callback.from_user.id:
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        await _answer_callback(callback)
+        await edit_message(callback, "🔥 <b>Автопрогрев аккаунта</b>\n\nВыберите длительность:", InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="30 минут", callback_data=f"warmup_duration_{account_id}_30"),
+             InlineKeyboardButton(text="2 часа", callback_data=f"warmup_duration_{account_id}_120")],
+            [InlineKeyboardButton(text="6 часов", callback_data=f"warmup_duration_{account_id}_360"),
+             InlineKeyboardButton(text="12 часов", callback_data=f"warmup_duration_{account_id}_720")],
+            [InlineKeyboardButton(text="24 часа", callback_data=f"warmup_duration_{account_id}_1440")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")]
+        ]))
+
+    @dp.callback_query(F.data.startswith('warmup_duration_'))
+    async def warmup_duration_callback(callback: CallbackQuery):
+        parts = callback.data.split('_')
+        account_id = int(parts[2])
+        duration = int(parts[3])
+        ok, message = await account_manager.start_account_warmup(
+            account_id, bot, callback.from_user.id, duration
+        )
+        await _answer_callback(callback, message, show_alert=not ok)
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
+
+    @dp.callback_query(F.data.startswith('warmup_stop_'))
+    async def warmup_stop_callback(callback: CallbackQuery):
+        account_id = int(callback.data.split('_')[2])
+        ok = await account_manager.stop_account_warmup(account_id, callback.from_user.id)
+        await _answer_callback(callback, "🛑 Автопрогрев остановлен" if ok else "❌ Аккаунт не найден", show_alert=not ok)
+        await render_account_dashboard(callback, account_id, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('stop_spam_'))
     async def stop_spam_callback(callback: CallbackQuery):
@@ -5402,7 +5535,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             try:
                 file = await bot.get_file(message.document.file_id)
                 content = await bot.download_file(file.file_path)
-                text = content.read().decode('utf-8')
+                text = content.read().decode('utf-8', errors='replace')
                 links = [l.strip() for l in text.split('\n') if l.strip()]
             except Exception as e:
                 await message.answer(f"❌ Ошибка чтения файла: {e}")

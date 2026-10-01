@@ -98,5 +98,8 @@ MAX_FLOOD_WAIT = 1800
 SESSION_CHECK_TIMEOUT = 25
 ; Таймаут запуска рабочего Pyrogram-клиента.
 CLIENT_START_TIMEOUT = 30
+; Верхний таймаут одного Telegram API вызова. Сетевые ошибки получают
+; ограниченный retry с backoff, бесконечного reconnect нет.
+TELEGRAM_CALL_TIMEOUT = 45
 ; Сколько сессий проверять параллельно в админ-панели.
 SESSION_CHECK_CONCURRENCY = 4
