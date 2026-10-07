@@ -15,6 +15,9 @@ def test_persistent_autopost_limits_and_warmup_state():
         account_id = db.add_account(42, "session", account_name="test")
         db.update_account_postbot(account_id, "63ff0f7189df5")
         assert db.get_account(account_id)["postbot_post_id"] == "63ff0f7189df5"
+        db.set_account_health(account_id, db.HEALTH_RESTRICTED, "UserBannedInChannel: target only")
+        assert db.clear_false_channel_bans() == 1
+        assert db.get_account_health(account_id)["health"] == db.HEALTH_OK
         db.configure_autopost_limits(
             account_id, min_delay_seconds=30, max_delay_seconds=60,
             hourly_limit=2, daily_limit=3
@@ -62,6 +65,9 @@ def test_user_safety_guards_are_present():
     assert "client.search_global(query=query, limit=50)" in source
     assert "chat = getattr(message, 'chat', None)" in source
     assert "successful_actions = subscriptions + reactions" in source
+    assert "SPAMBLOCK_ERRORS = tuple({PeerFlood}" in source
+    assert "UserBannedInChannel, UserAlreadyParticipant" in source
+    assert "record_flood_wait(account_id, cooldown)" in source
 
     handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")
     assert "📮 Через @PostBot" in handlers

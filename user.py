@@ -53,8 +53,10 @@ UserPrivacyRestricted = _err('UserPrivacyRestricted')
 
 # Ждём и повторяем
 FLOOD_ERRORS = tuple({FloodWait, SlowmodeWait, FloodPremiumWait} - {_NeverRaised})
-# Аккаунт под спам-блоком: останавливаем задачи, но сессия жива
-SPAMBLOCK_ERRORS = tuple({PeerFlood, UserBannedInChannel} - {_NeverRaised})
+# PeerFlood — временное ограничение на действие аккаунта. Оно не равно
+# UserBannedInChannel: последняя ошибка относится только к конкретному чату и
+# должна пропускать цель, а не объявлять весь аккаунт заблокированным.
+SPAMBLOCK_ERRORS = tuple({PeerFlood} - {_NeverRaised})
 # Сессия мертва: нужен повторный вход
 DEAD_SESSION_ERRORS = tuple({
     UserDeactivated, UserDeactivatedBan, AuthKeyUnregistered,
@@ -64,7 +66,7 @@ DEAD_SESSION_ERRORS = tuple({
 SKIP_TARGET_ERRORS = tuple({
     ChatWriteForbidden, ChatAdminRequired, ChannelPrivate, UsernameNotOccupied,
     InviteHashExpired, UserPrivacyRestricted, UserBlocked, UserIsBlocked,
-    UserAlreadyParticipant,
+    UserBannedInChannel, UserAlreadyParticipant,
 } - {_NeverRaised})
 
 
@@ -1707,22 +1709,26 @@ class AccountSessionManager:
                 continue
 
             except SPAMBLOCK_ERRORS as e:
-                msg = f"{type(e).__name__}: аккаунт ограничен Telegram за спам"
-                logging.error(f"🚫 [acc {account_id}] {label}: {msg}")
+                # PeerFlood is an action-level/temporary Telegram restriction,
+                # not proof of a permanent account spam block. Put the account
+                # into a finite cooldown and stop only the current task. A
+                # UserBannedInChannel never reaches this branch: it is a
+                # target-specific skip handled by SKIP_TARGET_ERRORS.
+                cooldown = 1800
+                msg = f"{type(e).__name__}: временное ограничение действия Telegram"
+                logging.warning(f"⏸️ [acc {account_id}] {label}: {msg}; cooldown={cooldown}s")
                 if account_id:
                     try:
-                        db.set_account_health(account_id, db.HEALTH_RESTRICTED, msg)
+                        db.record_flood_wait(account_id, cooldown)
                     except Exception:
-                        pass
+                        logging.debug("Не удалось записать cooldown PeerFlood", exc_info=True)
                 if notify and bot and user_id:
                     await self._safe_bot_message(
                         bot, user_id,
-                        f"🚫 <b>Аккаунт #{account_id} получил спам-блок Telegram.</b>\n\n"
-                        f"Все задачи по нему остановлены, чтобы не усугубить ограничение.\n\n"
-                        f"Что делать:\n"
-                        f"• не запускайте рассылки на этом аккаунте 24–48 часов;\n"
-                        f"• напишите @SpamBot и запросите снятие ограничения;\n"
-                        f"• увеличьте задержки и используйте разный текст (спинтакс)."
+                        f"⏸️ <b>Текущая задача аккаунта #{account_id} поставлена на паузу.</b>\n\n"
+                        "Telegram временно отклонил действие. Это не подтверждает постоянный "
+                        "спам-блок аккаунта. Другие задачи не помечаются как заблокированные.\n\n"
+                        "Пауза: 30 минут. При необходимости проверьте статус через @SpamBot."
                     )
                 raise AccountBlockedError(msg, kind='restricted')
 

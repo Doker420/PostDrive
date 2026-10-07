@@ -2376,6 +2376,18 @@ class DBConnection(metaclass=_PoolBoundMeta):
         )
         self.conn_ctx.commit()
 
+    def clear_false_channel_bans(self) -> int:
+        """Repair old false account-wide bans caused by UserBannedInChannel."""
+        self.c.execute(
+            """UPDATE accounts
+               SET health = 'ok', health_reason = '', restricted_until = 0
+               WHERE health = 'restricted'
+                 AND health_reason LIKE 'UserBannedInChannel:%'"""
+        )
+        changed = int(getattr(self.c, 'rowcount', 0) or 0)
+        self.conn_ctx.commit()
+        return changed
+
     def record_flood_wait(self, account_id: int, seconds: int):
         """Фиксирует FloodWait: статистика + окно ожидания."""
         now = int(time.time())

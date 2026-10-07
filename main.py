@@ -80,6 +80,15 @@ dp = Dispatcher(storage=_fsm_storage)
 
 # Use shared DB singleton
 db = get_db_sync()
+try:
+    repaired_channel_bans = db.clear_false_channel_bans()
+    if repaired_channel_bans:
+        logger.warning(
+            "Cleared %s stale account-wide restrictions caused by UserBannedInChannel",
+            repaired_channel_bans,
+        )
+except Exception:
+    logger.exception("Could not repair stale channel-ban health states")
 account_manager = AccountSessionManager(API_ID, API_HASH)
 
 # ── Payments / legal / miniapp ────────────────────────────────────
