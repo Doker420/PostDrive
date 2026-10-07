@@ -2388,6 +2388,22 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self.conn_ctx.commit()
         return changed
 
+    def move_legacy_peerflood_to_cooldown(self, seconds: int = 1800) -> int:
+        """Make old permanent PeerFlood flags finite instead of account bans."""
+        now = int(time.time())
+        self.c.execute(
+            """UPDATE accounts
+               SET health = 'cooldown',
+                   health_reason = 'PeerFlood: временная пауза после старой проверки',
+                   restricted_until = ?
+               WHERE health = 'restricted'
+                 AND health_reason LIKE 'PeerFlood:%'""",
+            (now + int(seconds),)
+        )
+        changed = int(getattr(self.c, 'rowcount', 0) or 0)
+        self.conn_ctx.commit()
+        return changed
+
     def record_flood_wait(self, account_id: int, seconds: int):
         """Фиксирует FloodWait: статистика + окно ожидания."""
         now = int(time.time())

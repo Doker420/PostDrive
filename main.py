@@ -82,13 +82,14 @@ dp = Dispatcher(storage=_fsm_storage)
 db = get_db_sync()
 try:
     repaired_channel_bans = db.clear_false_channel_bans()
-    if repaired_channel_bans:
+    repaired_peerfloods = db.move_legacy_peerflood_to_cooldown()
+    if repaired_channel_bans or repaired_peerfloods:
         logger.warning(
-            "Cleared %s stale account-wide restrictions caused by UserBannedInChannel",
-            repaired_channel_bans,
+            "Repaired stale account health states: channel_bans=%s, peerfloods_to_cooldown=%s",
+            repaired_channel_bans, repaired_peerfloods,
         )
 except Exception:
-    logger.exception("Could not repair stale channel-ban health states")
+    logger.exception("Could not repair stale account health states")
 account_manager = AccountSessionManager(API_ID, API_HASH)
 
 # ── Payments / legal / miniapp ────────────────────────────────────

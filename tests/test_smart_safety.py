@@ -18,6 +18,9 @@ def test_persistent_autopost_limits_and_warmup_state():
         db.set_account_health(account_id, db.HEALTH_RESTRICTED, "UserBannedInChannel: target only")
         assert db.clear_false_channel_bans() == 1
         assert db.get_account_health(account_id)["health"] == db.HEALTH_OK
+        db.set_account_health(account_id, db.HEALTH_RESTRICTED, "PeerFlood: аккаунт ограничен Telegram за спам")
+        assert db.move_legacy_peerflood_to_cooldown() == 1
+        assert db.get_account_health(account_id)["health"] == db.HEALTH_COOLDOWN
         db.configure_autopost_limits(
             account_id, min_delay_seconds=30, max_delay_seconds=60,
             hourly_limit=2, daily_limit=3
