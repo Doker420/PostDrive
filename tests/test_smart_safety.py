@@ -71,11 +71,22 @@ def test_user_safety_guards_are_present():
     assert "SPAMBLOCK_ERRORS = tuple({PeerFlood}" in source
     assert "UserBannedInChannel, UserAlreadyParticipant" in source
     assert "record_flood_wait(account_id, cooldown)" in source
+    assert "SKIP_TARGET_ERROR_NAMES" in source
+    assert "async def _invite_from_shared_queue" in source
+    assert "work_queue.get_nowait()" in source
+    assert "'privacy': 0" in source
+    assert "'already_member': 0" in source
+    assert "raise_on_skip=True" in source
+    assert "mode in ('prompt', 'post_prompt', 'auto')" in source
 
     handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")
     assert "📮 Через @PostBot" in handlers
     assert "set_postbot_" in handlers
     assert "MassActionStates.WAITING_POSTBOT_ID" in handlers
+    assert "nc_mode_auto_" in handlers
+    assert "Автоматически по посту" in handlers
+    assert "asyncio.Queue()" in handlers
+    assert "общей очереди пользователей" in handlers
 
 
 if __name__ == "__main__":

@@ -55,11 +55,14 @@ results.append("неудачный запуск не оставляет стат
 # 6. Отслеживание новых постов
 assert 'limit=self.NC_HISTORY_LIMIT' in U, "по-прежнему читается только 1 последний пост"
 assert 'fresh.reverse()' in U, "посты обрабатываются не от старого к новому"
-assert "if mode == 'post_prompt' and not post_text" in U, \
-    "пост без текста пропускается даже в режиме промта по теме"
+assert "if mode in ('auto', 'post_prompt') and not post_text" in U, \
+    "пост без текста пропускается в режимах, которым нужен текст поста"
 assert 'post_age < self.NC_POST_GRACE' in U, "свежесть поста всё ещё сравнивается с comment_delay"
 assert 'sleep_for = max(5, min(comment_delay, self.NC_CHECK_INTERVAL))' in U, \
     "период опроса всё ещё равен comment_delay"
+assert "elif mode == 'auto':" in U, "нет отдельной ветки автоматического режима"
+assert "generate_ai_comment('', post_text)" in U, "auto не работает по тексту поста без промта"
+assert "'auto': 'Автоматически по посту'" in H, "auto не отображается в меню"
 assert '_nc_last_comment' in U, "нет паузы между комментариями"
 assert "getattr(msg, 'service', None)" in U, "сервисные сообщения не отсеиваются"
 results.append("опрос каналов чаще, пачка последних постов, пауза между комментариями: OK")

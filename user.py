@@ -68,6 +68,27 @@ SKIP_TARGET_ERRORS = tuple({
     InviteHashExpired, UserPrivacyRestricted, UserBlocked, UserIsBlocked,
     UserBannedInChannel, UserAlreadyParticipant,
 } - {_NeverRaised})
+# Дополнительные target-level ошибки могут называться по-разному в версиях
+# Pyrogram. Они относятся к одному пользователю, а не к здоровью аккаунта.
+SKIP_TARGET_ERROR_NAMES = {
+    'UserNotMutualContact', 'UserIdInvalid', 'PeerIdInvalid',
+    'InputUserDeactivated', 'UserNotParticipant', 'UserChannelsTooMuch',
+    'UserRestricted',
+}
+
+
+def _is_target_skip_error(error: BaseException) -> bool:
+    """True для отказа Telegram, который нельзя считать спам-блоком аккаунта."""
+    name = type(error).__name__
+    if name in SKIP_TARGET_ERROR_NAMES:
+        return True
+    text = str(error).lower().replace('_', ' ')
+    return any(phrase in text for phrase in (
+        'user privacy restricted', 'privacy restricted',
+        'user already participant', 'already a participant',
+        'user not mutual contact', 'user id invalid', 'peer id invalid',
+        'input user deactivated', 'user is blocked', 'user restricted',
+    ))
 
 
 class AccountBlockedError(Exception):
@@ -1773,6 +1794,15 @@ class AccountSessionManager:
                 raise
 
             except Exception as e:
+                # В некоторых версиях Pyrogram часть отказов пользователя не
+                # экспортируется отдельным классом. Всё равно оставляем их на
+                # уровне одной цели: privacy/invalid peer не должны отключать
+                # аккаунт и не должны запускать повторный invite.
+                if _is_target_skip_error(e):
+                    logging.info(f"⏭ [acc {account_id}] {label}: {type(e).__name__} — цель пропущена")
+                    if raise_on_skip:
+                        raise TargetSkipError(f"{type(e).__name__}") from e
+                    return None
                 last_err = e
                 # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
                 error_text = str(e).lower()
@@ -2200,6 +2230,8 @@ class AccountSessionManager:
         if mode == 'post_prompt' and not nc.get('post_prompt'):
             logging.warning(f"⚠️ Post prompt not set for account {account_id}")
             return False, "Промт для постов не задан"
+        # auto — сценарий без пользовательской темы: модель работает только
+        # по тексту найденного поста и базовым правилам AI_SYSTEM_TEMPLATE.
         if not target_channels:
             logging.warning(f"⚠️ Target channels not set for account {account_id}")
             return False, "Целевые каналы не заданы"
@@ -2467,8 +2499,8 @@ class AccountSessionManager:
                             # Режим 'prompt' пишет по своей теме и не нуждается в
                             # тексте поста; раньше любой пост-картинка без
                             # подписи молча пропускался.
-                            if mode == 'post_prompt' and not post_text:
-                                logging.info(f"⏭️ [{acc_name}] Пост {msg.id} без текста — режиму «промт нового поста» нечего анализировать")
+                            if mode in ('auto', 'post_prompt') and not post_text:
+                                logging.info(f"⏭️ [{acc_name}] Пост {msg.id} без текста — автоматическому режиму нечего анализировать")
                                 self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
                                 continue
 
@@ -2496,7 +2528,7 @@ class AccountSessionManager:
                             channel_posts_found += 1
                             
                             # ── Проверка дневной квоты AI (только для AI-режимов) ──
-                            if mode in ('prompt', 'post_prompt'):
+                            if mode in ('prompt', 'post_prompt', 'auto'):
                                 ok_quota, used_q, limit_q = db.consume_ai_quota(user_id, amount=1)
                                 if not ok_quota:
                                     logging.warning(f"🚫 [{acc_name}] AI-квота исчерпана: {used_q}/{limit_q}")
@@ -2535,6 +2567,16 @@ class AccountSessionManager:
                                     base_comment = random.choice(custom_comments)
                                     variants = [v.strip() for v in base_comment.split('|') if v.strip()]
                                     comment_text = random.choice(variants) if variants else base_comment
+                            elif mode == 'auto':
+                                # Без пользовательского промта и темы: базовая
+                                # модель сама пишет короткую живую реакцию по
+                                # содержанию поста и не получает дополнительных
+                                # инструкций, способных «перекосить» ферму.
+                                logging.debug(f"🧠 [{acc_name}] Generating automatic post-based comment for {channel}")
+                                # В auto не используем старые custom_comments:
+                                # пользовательский сценарий не должен неожиданно
+                                # вернуться после переключения режима.
+                                comment_text = await self.generate_ai_comment('', post_text)
                             
                             # ⭐ ВСЕГДА ОБНОВЛЯЕМ last_seen, ЧТОБЫ НЕ ЗАЦИКЛИВАТЬСЯ НА ОДНОМ ПОСТЕ
                             self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
@@ -4236,7 +4278,189 @@ class AccountSessionManager:
             return None, f"Ошибка: {e}"
         return users, f"Найдено {len(users)} пользователей"
 
-    async def invite_users(self, account_id: int, chat_id: str, users: list, bot, user_id: int, auto_join: bool = True):
+    async def _invite_from_shared_queue(self, account_id: int, client, chat_obj, work_queue,
+                                        shared_state: dict, bot, user_id: int,
+                                        acc_name: str, notifications_hidden: bool):
+        """Обрабатывает общую очередь целей одним аккаунтом.
+
+        Цель извлекается из очереди ровно один раз. Аккаунты не получают
+        заранее закреплённые куски: быстрый и доступный аккаунт забирает
+        следующую цель, а аккаунт с PeerFlood/недействительной сессией выходит
+        из очереди, не блокируя остальных.
+        """
+        stats = shared_state.setdefault('stats', {
+            'invited': 0, 'skipped': 0, 'privacy': 0,
+            'already_member': 0, 'target_skipped': 0,
+            'errors': 0, 'duplicates': 0, 'account_errors': 0,
+        })
+        stats_lock = shared_state.setdefault('stats_lock', asyncio.Lock())
+        seen_ids = shared_state.setdefault('seen_ids', set())
+        seen_lock = shared_state.setdefault('seen_lock', asyncio.Lock())
+        local_stats = {'invited': 0, 'skipped': 0, 'privacy': 0,
+                       'already_member': 0, 'target_skipped': 0,
+                       'errors': 0, 'duplicates': 0, 'account_errors': 0}
+
+        async def bump(name: str, amount: int = 1):
+            async with stats_lock:
+                stats[name] = stats.get(name, 0) + amount
+                local_stats[name] = local_stats.get(name, 0) + amount
+
+        async def mark_target_skip(reason):
+            reason_text = str(reason).lower()
+            if 'privacy' in reason_text:
+                bucket = 'privacy'
+            elif 'already' in reason_text or 'participant' in reason_text:
+                bucket = 'already_member'
+            else:
+                bucket = 'target_skipped'
+            await bump('skipped')
+            await bump(bucket)
+
+        account_stopped = False
+        while True:
+            try:
+                raw_target = work_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            try:
+                # Сначала разрешаем цель текущим аккаунтом. Это позволяет
+                # обойти alias, недоступный одному аккаунту, без повторной
+                # постановки цели в бесконечный retry.
+                try:
+                    resolved = await self.tg_call(
+                        lambda: client.get_users(raw_target),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f"resolve invite target {raw_target}",
+                        notify=False, raise_on_skip=True,
+                    )
+                    if isinstance(resolved, list):
+                        resolved = resolved[0] if resolved else None
+                    target_id = getattr(resolved, 'id', None)
+                    if not target_id:
+                        logging.info(f"⏭ [{acc_name}] target {raw_target}: Telegram не вернул пользователя")
+                        await bump('skipped')
+                        continue
+                except TargetSkipError as exc:
+                    logging.info(f"⏭ [{acc_name}] target {raw_target}: пропуск ({exc})")
+                    await mark_target_skip(exc)
+                    continue
+                except asyncio.TimeoutError:
+                    # tg_call уже исчерпал ограниченный retry: аккаунт не
+                    # должен продолжать забирать цели, если Telegram/API не
+                    # отвечает стабильно.
+                    account_stopped = True
+                    await bump('account_errors')
+                    logging.warning(f"⏸ [{acc_name}] аккаунт исключён из общей очереди после timeout")
+                    break
+                except AccountBlockedError:
+                    # tg_call уже записал конечный cooldown/состояние сессии.
+                    # Не возвращаем текущую цель в очередь: это исключает
+                    # бесконечные повторы и оставляет её другим аккаунтам.
+                    account_stopped = True
+                    await bump('account_errors')
+                    logging.warning(f"⏸ [{acc_name}] аккаунт исключён из общей очереди при разрешении цели")
+                    break
+                except Exception as exc:
+                    logging.warning(f"⚠️ [{acc_name}] target {raw_target} не разрешён: {type(exc).__name__}: {exc}")
+                    await bump('skipped')
+                    continue
+
+                # Один и тот же пользователь мог попасть в файл как @username
+                # и как numeric id. Дедупликация по Telegram id атомарна.
+                async with seen_lock:
+                    if target_id in seen_ids:
+                        duplicate = True
+                    else:
+                        seen_ids.add(target_id)
+                        duplicate = False
+                if duplicate:
+                    await bump('duplicates')
+                    logging.info(f"⏭ [{acc_name}] target {raw_target} уже обработан другим worker")
+                    continue
+
+                first_name = getattr(resolved, 'first_name', None) or 'User'
+                last_name = getattr(resolved, 'last_name', None) or ''
+                try:
+                    await self.tg_call(
+                        lambda: client.add_contact(target_id, first_name, last_name),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f"add contact {target_id}",
+                        notify=False, raise_on_skip=True,
+                    )
+                    await self.tg_call(
+                        lambda: client.add_chat_members(
+                            chat_id=chat_obj.id, user_ids=[target_id]
+                        ),
+                        account_id=account_id, bot=bot, user_id=user_id,
+                        description=f"invite {target_id}",
+                        notify=not notifications_hidden, raise_on_skip=True,
+                    )
+                    await bump('invited')
+                    logging.info(f"✅ [{acc_name}] invited {target_id}")
+                except TargetSkipError as exc:
+                    # UserPrivacyRestricted, AlreadyParticipant, BannedInChannel
+                    # и аналоги — штатный пропуск одной цели.
+                    await mark_target_skip(exc)
+                    logging.info(f"⏭ [{acc_name}] {target_id}: target-level skip ({exc})")
+                except AccountBlockedError as exc:
+                    account_stopped = True
+                    await bump('account_errors')
+                    logging.warning(f"⏸ [{acc_name}] invite worker остановлен: {exc}")
+                    break
+                except asyncio.TimeoutError:
+                    # Здесь timeout уже означает исчерпанный ограниченный
+                    # retry внутри tg_call, поэтому аккаунт больше не берёт
+                    # цели из общей очереди.
+                    account_stopped = True
+                    await bump('account_errors')
+                    logging.warning(f"⏸ [{acc_name}] timeout inviting {target_id}; аккаунт исключён из очереди")
+                    break
+                except Exception as exc:
+                    # Не превращаем неизвестную ошибку одного target в
+                    # подтверждённый spam-block. Техническая ошибка только
+                    # фиксируется и worker продолжает безопасный обход.
+                    error_text = str(exc).lower()
+                    transport_error = isinstance(exc, (ConnectionError, OSError)) or any(
+                        marker in error_text for marker in (
+                            'connection reset', 'connection refused', 'client is not started'
+                        )
+                    )
+                    if transport_error:
+                        account_stopped = True
+                        await bump('account_errors')
+                        logging.warning(f"⏸ [{acc_name}] transport error; аккаунт исключён: {exc}")
+                        break
+                    await bump('errors')
+                    logging.warning(f"⚠️ [{acc_name}] invite {target_id} failed: {type(exc).__name__}: {exc}")
+                finally:
+                    try:
+                        await asyncio.wait_for(client.delete_contacts(target_id), timeout=5.0)
+                    except Exception as exc:
+                        logging.debug(f"[{acc_name}] contact cleanup {target_id}: {type(exc).__name__}: {exc}")
+
+                # Сохраняем прежний безопасный темп даже для пропусков: очередь
+                # не должна превращать несколько аккаунтов в burst-рассылку.
+                await asyncio.sleep(random.randint(5, 10))
+            finally:
+                work_queue.task_done()
+
+        async with stats_lock:
+            snapshot = dict(stats)
+        msg = (
+            f"✅ [{acc_name}] Инвайт завершён: +{local_stats['invited']} | "
+            f"пропущено {local_stats['skipped']} "
+            f"(privacy {local_stats['privacy']}, уже участники {local_stats['already_member']}) | "
+            f"ошибок {local_stats['errors']}"
+        )
+        if account_stopped:
+            msg += "\n⏸ Этот аккаунт временно исключён из общей очереди."
+        if bot and not notifications_hidden:
+            await self._safe_bot_message(bot, user_id, msg)
+        logging.info(f"📊 shared invite worker [{acc_name}] done: {snapshot}")
+
+    async def invite_users(self, account_id: int, chat_id: str, users: list, bot, user_id: int,
+                           auto_join: bool = True, work_queue=None, shared_state: dict = None):
         logging.info(f"📥 invite_users START | account={account_id} chat={chat_id} users={len(users)} auto_join={auto_join} user_id={user_id}")
         try:
             account = db.get_account(account_id)
@@ -4332,6 +4556,13 @@ class AccountSessionManager:
                     logging.warning(f"⚠️ [{acc_name}] Failed to check membership: {type(chat_err).__name__}: {chat_err}")
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось проверить членство в чате: {str(chat_err)[:100]}")
+            if work_queue is not None and shared_state is not None:
+                await self._invite_from_shared_queue(
+                    account_id, client, chat_obj, work_queue, shared_state,
+                    bot, user_id, acc_name, notifications_hidden
+                )
+                return
+
             normalized = []
             seen = set()
             for user_entry in users:
@@ -4411,6 +4642,7 @@ class AccountSessionManager:
                 await bot.send_message(user_id, f"📥 [{acc_name}] Добавлено контактов: {len(added_contacts)}. Начинаю инвайт...")
             success = 0
             errors = 0
+            skipped = 0
             try:
                 logging.debug(f"🔍 [{acc_name}] Pre-invite chat check: {chat_obj.id}")
                 chat_check = await asyncio.wait_for(
@@ -4438,10 +4670,17 @@ class AccountSessionManager:
                         ),
                         account_id=account_id, bot=bot, user_id=user_id,
                         description=f"invite {user_id_val}",
-                        notify=not notifications_hidden
+                        notify=not notifications_hidden, raise_on_skip=True
                     )
                     success += 1
                     logging.info(f"✅ [{acc_name}] Invited user {user_id_val} ({success}/{len(added_contacts)})")
+                except TargetSkipError as e:
+                    skipped += 1
+                    logging.info(f"⏭ [{acc_name}] User {user_id_val} пропущен: {e}")
+                    # Privacy/AlreadyParticipant/BannedInChannel — это отказ
+                    # одной цели, а не причина останавливать аккаунт.
+                    await asyncio.sleep(random.randint(5, 10))
+                    continue
                 except AccountBlockedError as e:
                     logging.warning(f"🛑 [{acc_name}] Инвайт остановлен: {e}")
                     break
@@ -4455,20 +4694,19 @@ class AccountSessionManager:
                             pass
                 except Exception as e:
                     errors += 1
-                    error_str = str(e).lower()
                     logging.error(f"❌ [{acc_name}] Error adding {user_id_val}: {type(e).__name__}: {e}")
-                    if any(kw in error_str for kw in ['flood', 'too many', 'wait', 'spam', 'restricted', 'banned']):
-                        logging.warning(f"🛑 [{acc_name}] Critical flood error, stopping invite")
-                        if bot and not notifications_hidden:
-                            await bot.send_message(user_id, f"🛑 [{acc_name}] Остановлен инвайт из-за ошибки: {str(e)[:100]}")
-                        break
+                    # AccountBlockedError (PeerFlood/FloodWait/мертвая
+                    # сессия) обрабатывается отдельной веткой выше. Не
+                    # классифицируем текст неизвестной ошибки как spam-block:
+                    # это может быть privacy/target-level отказ из новой версии
+                    # Telegram и он не должен остановить весь worker.
                     if bot and not notifications_hidden:
                         try:
                             await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось добавить {user_id_val}: {str(e)[:60]}")
                         except:
                             pass
                 await asyncio.sleep(random.randint(5, 10))
-            logging.info(f"📥 [{acc_name}] Invite loop complete: success={success} errors={errors}")
+            logging.info(f"📥 [{acc_name}] Invite loop complete: success={success} skipped={skipped} errors={errors}")
             for user_id_val in added_contacts:
                 try:
                     logging.debug(f"🗑 [{acc_name}] Deleting contact {user_id_val}")
@@ -4482,7 +4720,7 @@ class AccountSessionManager:
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Error deleting contact {user_id_val}: {type(e).__name__}: {e}")
                 await asyncio.sleep(random.randint(1, 2))
-            msg = f"✅ [{acc_name}] Инвайт завершен: +{success} | ошибок {errors} | контактов удалено {len(added_contacts)}"
+            msg = f"✅ [{acc_name}] Инвайт завершен: +{success} | пропущено {skipped} | ошибок {errors} | контактов удалено {len(added_contacts)}"
             logging.info(msg)
             if bot:
                 await bot.send_message(user_id, msg)

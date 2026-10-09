@@ -1370,25 +1370,77 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         await state.clear()
 
-        valid_account_ids = [aid for aid in account_ids if aid]
+        # Убираем дубли ещё до постановки в очередь. В частности, одна и та
+        # же цель часто встречается в TXT как @username и numeric id; второй
+        # уровень дедупликации по Telegram user id выполняют worker'ы.
+        unique_users = []
+        seen_targets = set()
+        for raw in users:
+            target = raw.strip()
+            if target.startswith('@'):
+                target = target[1:]
+            key = target.casefold() if not target.lstrip('-').isdigit() else target
+            if target and key not in seen_targets:
+                seen_targets.add(key)
+                unique_users.append(raw.strip())
+
+        valid_account_ids = []
+        for raw_account_id in account_ids:
+            if not raw_account_id:
+                continue
+            try:
+                account_id = int(raw_account_id)
+            except (TypeError, ValueError):
+                continue
+            if account_id in valid_account_ids:
+                continue
+            usable, reason = db.is_account_usable(account_id)
+            if usable:
+                valid_account_ids.append(account_id)
+            else:
+                logging.info(f"⏭ invite: account {account_id} excluded before start: {reason}")
+
         if not valid_account_ids:
-            await message.answer("❌ Не выбраны аккаунты для инвайта!")
+            await message.answer("❌ Нет доступных аккаунтов для инвайта (проверьте их статус и cooldown).")
+            return
+        if not unique_users:
+            await message.answer("❌ После удаления дублей не осталось пользователей для инвайта!")
             return
 
-        per_account = len(users) // len(valid_account_ids)
-        remainder = len(users) % len(valid_account_ids)
+        # Общая очередь вместо фиксированных chunks. Каждый свободный аккаунт
+        # атомарно забирает следующую цель; приватность/AlreadyParticipant
+        # отмечаются как пропуск, а аккаунт с cooldown просто прекращает свой
+        # worker и не удерживает оставшиеся цели.
+        work_queue = asyncio.Queue()
+        for target in unique_users:
+            work_queue.put_nowait(target)
+        shared_state = {
+            'stats': {'invited': 0, 'skipped': 0, 'privacy': 0,
+                      'already_member': 0, 'target_skipped': 0,
+                      'errors': 0, 'duplicates': 0, 'account_errors': 0},
+            'stats_lock': asyncio.Lock(),
+            'seen_ids': set(),
+            'seen_lock': asyncio.Lock(),
+        }
 
-        start = 0
         for idx, account_id in enumerate(valid_account_ids):
-            count = per_account + (1 if idx < remainder else 0)
-            chunk = users[start:start + count]
-            start += count
-            await message.answer(f"🚀 [{idx+1}/{len(valid_account_ids)}] Запускаю инвайт {len(chunk)} пользователей на аккаунт #{account_id}...")
-            asyncio.create_task(account_manager.run_limited(account_manager.invite_users(account_id, chat_id, list(chunk), bot, user_id, auto_join=True)))
+            await message.answer(
+                f"🚀 [{idx+1}/{len(valid_account_ids)}] Подключаю аккаунт #{account_id} "
+                "к общей очереди пользователей..."
+            )
+            asyncio.create_task(account_manager.run_limited(
+                account_manager.invite_users(
+                    account_id, chat_id, [], bot, user_id, auto_join=True,
+                    work_queue=work_queue, shared_state=shared_state
+                )
+            ))
 
         await state.clear()
         await message.answer(
-            "✅ Инвайт запущен в фоне. Вы получите уведомления о прогрессе и результате.",
+            f"✅ Инвайт запущен в фоне: {len(unique_users)} уникальных целей, "
+            f"{len(valid_account_ids)} аккаунтов в общей очереди.\n"
+            "Приватные/недоступные цели будут спокойно пропущены, а временно "
+            "ограниченный аккаунт исключён без остановки остальных.",
             reply_markup=main_menu_keyboard(user_id)
         )
 
@@ -3578,7 +3630,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         nc = db.get_neurocomment_settings(account_id)
         status = "🟢 Включен" if nc and nc.get('enabled') else "🔴 Выключен"
         mode = nc.get('mode', 'prompt') if nc else 'prompt'
-        mode_name = {'prompt': 'По промту', 'custom': 'Свои комментарии', 'post_prompt': 'Промт нового поста'}.get(mode, 'По промту')
+        mode_name = {
+            'prompt': 'По промту',
+            'custom': 'Свои комментарии',
+            'post_prompt': 'Промт нового поста',
+            'auto': 'Автоматически по посту',
+        }.get(mode, 'По промту')
         target_channels = nc.get('target_channels', '') if nc else ''
         channels_preview = ', '.join([c.strip() for c in target_channels.split(',') if c.strip()][:3]) if target_channels else 'Не заданы'
         if len([c.strip() for c in target_channels.split(',') if c.strip()]) > 3:
@@ -3593,6 +3650,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
         delay = nc.get('comment_delay', 60) if nc else 60
         markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Автоматически по посту", callback_data=f"nc_mode_auto_{account_id}")],
             [InlineKeyboardButton(text="✏️ По промту", callback_data=f"nc_mode_prompt_{account_id}"),
              InlineKeyboardButton(text="📝 Свои комментарии", callback_data=f"nc_mode_custom_{account_id}")],
             [InlineKeyboardButton(text="📰 Промт нового поста", callback_data=f"nc_mode_post_prompt_{account_id}")],
@@ -3613,6 +3671,34 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         "• <code>Задай уточняющий вопрос по теме поста</code>\n\n"
         "💡 Можно добавлять любые свои указания — они попадут в блок требований к нейросети."
     )
+
+    @dp.callback_query(F.data.startswith('nc_mode_auto_'))
+    async def nc_mode_auto_callback(callback: CallbackQuery, state: FSMContext):
+        """Enable the default post-based model behavior without a scenario."""
+        await _answer_callback(callback, "🤖 Автоматический режим включён")
+        account_id = int(callback.data.split('_')[3])
+        user_id = callback.from_user.id
+        nc = db.get_neurocomment_settings(account_id)
+        if not nc:
+            db.create_neurocomment_settings(
+                account_id, user_id, mode='auto', prompt='',
+                custom_comments='[]', post_prompt=''
+            )
+        else:
+            db.update_neurocomment_settings(
+                account_id, mode='auto', prompt='',
+                custom_comments='[]', post_prompt=''
+            )
+        await state.clear()
+        await edit_message(
+            callback,
+            "✅ <b>Автоматический режим включён</b>\n\n"
+            "Модель будет анализировать текст нового поста и писать короткую "
+            "естественную реакцию по базовым правилам. Промт и тему вводить не нужно.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ К настройкам", callback_data=f"nc_acc_{account_id}")]
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('nc_mode_prompt_'))
     async def nc_mode_prompt_callback(callback: CallbackQuery, state: FSMContext):
