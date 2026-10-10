@@ -6,6 +6,8 @@ import asyncio
 import logging
 import random
 import string
+import tempfile
+import shutil
 from datetime import datetime
 from html import escape as html_escape
 from typing import List, Dict, Optional, Any, Tuple
@@ -220,6 +222,8 @@ class AddAccountStates(StatesGroup):
     WAITING_2FA = State()
     WAITING_QR_2FA = State()
     WAITING_SESSION_STRING = State()
+    WAITING_SESSION_FILE = State()
+    WAITING_SESSION_JSON = State()
     WAITING_QR_SCAN = State()
 
 class AccountPostStates(StatesGroup):
@@ -1429,6 +1433,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         _stop_qr_poller(callback.from_user.id)
         if account_manager:
             account_manager.cancel_phone_auth(callback.from_user.id)
+        data = await state.get_data()
+        import_dir = data.get('pyro_import_dir')
+        if import_dir:
+            shutil.rmtree(import_dir, ignore_errors=True)
         await state.clear()
         await edit_message(callback, "❌ Действие отменено.")
 
@@ -2382,6 +2390,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📱 Вход по номеру телефона", callback_data="auth_phone")],
             [InlineKeyboardButton(text="📄 Вход по String Session", callback_data="auth_string_session")],
+            [InlineKeyboardButton(text="📦 Загрузить Pyrogram-сессию", callback_data="auth_pyrogram_file")],
             [InlineKeyboardButton(text="🔳 Вход по QR-коду", callback_data="auth_qr")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ])
@@ -2728,6 +2737,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📱 Вход по номеру телефона", callback_data="auth_phone")],
             [InlineKeyboardButton(text="📄 Вход по String Session", callback_data="auth_string_session")],
+            [InlineKeyboardButton(text="📦 Загрузить Pyrogram-сессию", callback_data="auth_pyrogram_file")],
             [InlineKeyboardButton(text="🔳 Вход по QR-коду", callback_data="auth_qr")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ])
@@ -2850,6 +2860,136 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             "Можно сразу запустить безопасный автопрогрев.",
             reply_markup=account_connected_keyboard(account_id)
         )
+
+    async def _download_pyrogram_document(message: Message, directory: str,
+                                           destination_name: str) -> str:
+        document = message.document
+        if not document:
+            raise ValueError('нужно отправить файл документом')
+        file_name = (document.file_name or '').lower()
+        if destination_name == 'imported.session' and file_name.endswith('.json'):
+            raise ValueError('сначала отправьте файл .session, а JSON — следующим сообщением')
+        if destination_name == 'imported.json' and not file_name.endswith('.json'):
+            raise ValueError('ожидался файл с расширением .json')
+        file = await bot.get_file(document.file_id)
+        content = await bot.download_file(file.file_path)
+        raw = content.read()
+        if len(raw) > 50 * 1024 * 1024:
+            raise ValueError('файл сессии слишком большой (максимум 50 МБ)')
+        path = os.path.join(directory, destination_name)
+        with open(path, 'wb') as output:
+            output.write(raw)
+        return path
+
+    async def _finish_pyrogram_file_import(target, state: FSMContext):
+        data = await state.get_data()
+        session_path = data.get('pyro_session_path')
+        json_path = data.get('pyro_json_path', '')
+        import_dir = data.get('pyro_import_dir')
+        proxy_str = data.get('proxy', '')
+        user_id = target.from_user.id
+        response = target.message if isinstance(target, CallbackQuery) else target
+        await state.clear()
+        status_msg = await response.answer('⏳ Импортирую Pyrogram-сессию и проверяю аккаунт...')
+        try:
+            ok, session_string, info, error = await account_manager.import_pyrogram_session_files(
+                session_path, json_path, proxy_str
+            )
+            if not ok:
+                await status_msg.edit_text(f"❌ Не удалось импортировать сессию: {error or 'неизвестная ошибка'}")
+                return
+            allowed, reason, _limits = db.can_add_account(user_id, ADMIN)
+            if not allowed:
+                await status_msg.edit_text(f"🚫 {reason}\n\nПовысьте тариф или докупите слот в разделе «💳 Подписка».")
+                return
+            acc_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip() or info.get('username') or f"ID:{info.get('id')}"
+            account_id = db.add_account(
+                user_id, session_string, phone=info.get('phone', ''),
+                account_name=acc_name, proxy=proxy_str
+            )
+            await status_msg.edit_text(
+                f"✅ <b>Аккаунт {acc_name} подключен!</b>\n\n"
+                "Pyrogram-сессия импортирована и сохранена в безопасном формате.\n"
+                "Исходные файлы сессии удалены после проверки.",
+                reply_markup=account_connected_keyboard(account_id)
+            )
+        except Exception as error:
+            logger.error('Pyrogram session upload handler failed: %s', type(error).__name__, exc_info=True)
+            try:
+                await status_msg.edit_text('❌ Не удалось обработать файл сессии. Проверьте формат и попробуйте ещё раз.')
+            except Exception:
+                pass
+        finally:
+            if import_dir:
+                shutil.rmtree(import_dir, ignore_errors=True)
+
+    @dp.callback_query(F.data == "auth_pyrogram_file", AddAccountStates.WAITING_METHOD)
+    async def auth_pyrogram_file_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(AddAccountStates.WAITING_SESSION_FILE)
+        await edit_message(
+            callback,
+            "📦 <b>Загрузка Pyrogram-сессии</b>\n\n"
+            "Отправьте файл <code>.session</code> документом.\n"
+            "Можно отправить ZIP с файлом <code>.session</code> и необязательным <code>.json</code>.\n\n"
+            "После .session бот предложит добавить JSON. Если JSON нет, его можно пропустить.",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(AddAccountStates.WAITING_SESSION_FILE)
+    async def process_pyrogram_session_file(message: Message, state: FSMContext):
+        if not message.document:
+            await message.answer('❌ Отправьте файл сессии именно как документ, а не текстом.')
+            return
+        import_dir = tempfile.mkdtemp(prefix='postdrive_pyrogram_upload_')
+        try:
+            file_name = (message.document.file_name or '').lower()
+            destination = 'imported.zip' if file_name.endswith('.zip') else 'imported.session'
+            session_path = await _download_pyrogram_document(message, import_dir, destination)
+            data = await state.get_data()
+            await state.update_data(
+                pyro_import_dir=import_dir, pyro_session_path=session_path,
+                pyro_json_path=data.get('pyro_json_path', '')
+            )
+            if destination == 'imported.zip':
+                await _finish_pyrogram_file_import(message, state)
+                return
+            await state.set_state(AddAccountStates.WAITING_SESSION_JSON)
+            await message.answer(
+                "✅ Файл .session получен.\n\n"
+                "Если у вас есть одноимённый .json — отправьте его сейчас. "
+                "Если JSON нет, нажмите «Продолжить без JSON».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➡️ Продолжить без JSON", callback_data="auth_session_skip_json")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
+                ])
+            )
+        except Exception as error:
+            shutil.rmtree(import_dir, ignore_errors=True)
+            await message.answer(f"❌ Не удалось принять файл: {error}")
+
+    @dp.callback_query(F.data == "auth_session_skip_json", AddAccountStates.WAITING_SESSION_JSON)
+    async def auth_session_skip_json_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await _finish_pyrogram_file_import(callback, state)
+
+    @dp.message(AddAccountStates.WAITING_SESSION_JSON)
+    async def process_pyrogram_session_json(message: Message, state: FSMContext):
+        if not message.document:
+            await message.answer('❌ Отправьте .json документом или нажмите «Продолжить без JSON».')
+            return
+        data = await state.get_data()
+        import_dir = data.get('pyro_import_dir')
+        if not import_dir or not os.path.isdir(import_dir):
+            await state.clear()
+            await message.answer('⌛ Временная загрузка истекла. Запустите импорт заново.')
+            return
+        try:
+            json_path = await _download_pyrogram_document(message, import_dir, 'imported.json')
+            await state.update_data(pyro_json_path=json_path)
+            await _finish_pyrogram_file_import(message, state)
+        except Exception as error:
+            await message.answer(f"❌ Не удалось принять JSON: {error}")
 
     # ==================== PER-ACCOUNT CONTROL PANEL ====================
     async def render_account_dashboard(message_or_callback, account_id: int, user_id: int):

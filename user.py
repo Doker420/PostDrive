@@ -7,6 +7,9 @@ import json
 import re
 import logging
 import configparser
+import tempfile
+import shutil
+import zipfile
 import aiohttp
 from typing import Optional, Dict, Any, List, Tuple
 from pyrogram import Client, enums, filters
@@ -974,6 +977,157 @@ class AccountSessionManager:
         if account_id not in self._client_locks:
             self._client_locks[account_id] = asyncio.Lock()
         return self._client_locks[account_id]
+
+    async def import_pyrogram_session_files(
+        self, session_path: str, json_path: str = '', proxy_str: str = '',
+        timeout: int = None,
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """Импортирует купленную Pyrogram file-session в String Session.
+
+        Поддерживаются нативные ``*.session`` SQLite-файлы с соседним
+        ``*.json``-метаданными и те же session-файлы без JSON. Также принимается
+        текстовый файл со String Session и ZIP с безопасным набором файлов.
+        Загруженные секреты используются только во временной директории и не
+        сохраняются в репозитории или логах.
+        """
+        if not session_path or not os.path.isfile(session_path):
+            return False, None, None, 'Файл сессии не найден'
+        workdir = os.path.dirname(os.path.abspath(session_path))
+        client = None
+        extracted_dir = None
+        try:
+            # Для удобства продавцы иногда присылают session+json архивом.
+            if session_path.lower().endswith('.zip'):
+                extracted_dir = tempfile.mkdtemp(prefix='postdrive_pyro_unpack_')
+                total_size = 0
+                with zipfile.ZipFile(session_path) as archive:
+                    for info in archive.infolist():
+                        name = os.path.normpath(info.filename)
+                        if (name.startswith('..') or os.path.isabs(name)
+                                or name == '.' or name.startswith(os.path.sep)):
+                            raise ValueError('архив содержит небезопасный путь')
+                        total_size += int(info.file_size or 0)
+                        if total_size > 50 * 1024 * 1024:
+                            raise ValueError('архив сессии слишком большой')
+                    archive.extractall(extracted_dir)
+                candidates = []
+                for root, _dirs, files in os.walk(extracted_dir):
+                    for filename in files:
+                        if filename.lower().endswith(('.session', '.sqlite', '.db')):
+                            candidates.append(os.path.join(root, filename))
+                if not candidates:
+                    return False, None, None, 'В архиве не найден файл .session'
+                session_path = candidates[0]
+                if not json_path:
+                    stem = os.path.splitext(os.path.basename(session_path))[0].lower()
+                    for root, _dirs, files in os.walk(extracted_dir):
+                        for filename in files:
+                            if filename.lower().endswith('.json') and (
+                                os.path.splitext(filename)[0].lower() == stem
+                                or len(files) == 1
+                            ):
+                                json_path = os.path.join(root, filename)
+                                break
+                        if json_path:
+                            break
+                workdir = os.path.dirname(os.path.abspath(session_path))
+
+            metadata = {}
+            if json_path and os.path.isfile(json_path):
+                try:
+                    with open(json_path, 'r', encoding='utf-8') as json_file:
+                        loaded = json.load(json_file)
+                    if isinstance(loaded, dict):
+                        metadata = loaded
+                        # Некоторые поставщики вкладывают готовую строку в JSON.
+                        for key in ('session_string', 'string_session', 'string'):
+                            candidate = loaded.get(key)
+                            if isinstance(candidate, str) and len(candidate.strip()) > 20:
+                                ok, session_string, info, error = await self.test_session_string(
+                                    candidate.strip(), proxy_str, timeout=timeout
+                                )
+                                return ok, session_string, info, error
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    logging.info('Pyrogram JSON metadata is unreadable; trying the session file')
+                except Exception as error:
+                    logging.debug('Pyrogram JSON metadata was not used: %s', error)
+
+            # Textовые session-файлы не являются SQLite. Такой файл можно
+            # проверить как уже готовый String Session без лишнего преобразования.
+            with open(session_path, 'rb') as session_file:
+                header = session_file.read(16)
+            if header != b'SQLite format 3\x00':
+                try:
+                    with open(session_path, 'r', encoding='utf-8') as session_file:
+                        candidate = session_file.read().strip()
+                    if len(candidate) > 20 and '\x00' not in candidate:
+                        ok, session_string, info, error = await self.test_session_string(
+                            candidate, proxy_str, timeout=timeout
+                        )
+                        return ok, session_string, info, error
+                except (UnicodeDecodeError, OSError):
+                    pass
+
+            # Pyrogram FileStorage ищет <name>.session и <name>.json в workdir.
+            # Приводим имена к предсказуемым, не меняя исходные файлы пользователя.
+            canonical_dir = tempfile.mkdtemp(prefix='postdrive_pyro_session_')
+            canonical_session = os.path.join(canonical_dir, 'imported.session')
+            shutil.copyfile(session_path, canonical_session)
+            if json_path and os.path.isfile(json_path):
+                shutil.copyfile(json_path, os.path.join(canonical_dir, 'imported.json'))
+
+            api_id = metadata.get('api_id') or metadata.get('app_id') or self.api_id
+            api_hash = metadata.get('api_hash') or metadata.get('app_hash') or self.api_hash
+            try:
+                api_id = int(api_id)
+            except (TypeError, ValueError):
+                api_id = self.api_id
+            api_hash = str(api_hash or self.api_hash)
+            client = Client(
+                name='imported', api_id=api_id, api_hash=api_hash,
+                workdir=canonical_dir, in_memory=False,
+                proxy=parse_proxy_string(proxy_str) if proxy_str else None,
+            )
+            check_timeout = max(5, int(timeout or SESSION_CHECK_TIMEOUT))
+            await asyncio.wait_for(client.start(), timeout=check_timeout)
+            me = await asyncio.wait_for(client.get_me(), timeout=check_timeout)
+            export_method = getattr(client, 'export_session_string', None)
+            if not export_method:
+                raise RuntimeError('эта версия Pyrogram не умеет экспортировать session string')
+            session_string = await asyncio.wait_for(
+                export_method(), timeout=check_timeout
+            )
+            info = {
+                'id': me.id,
+                'first_name': me.first_name or '',
+                'last_name': me.last_name or '',
+                'username': me.username or '',
+                'phone': me.phone_number or '',
+            }
+            return True, session_string, info, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.error('Pyrogram session import failed: %s', type(error).__name__)
+            return False, None, None, 'Не удалось импортировать Pyrogram-сессию. Проверьте файл, API-настройки и прокси.'
+        finally:
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=5)
+                except Exception:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=3)
+                    except Exception:
+                        pass
+            if extracted_dir:
+                shutil.rmtree(extracted_dir, ignore_errors=True)
+            # canonical_dir is created only after the native file is copied.
+            # Find it through the local variable without retaining credentials.
+            try:
+                if 'canonical_dir' in locals():
+                    shutil.rmtree(canonical_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     async def test_session_string(
         self,

@@ -92,6 +92,10 @@ def test_user_safety_guards_are_present():
     assert "operation_stop_" in handlers
     assert "operation_download_" in handlers
     assert "acc_proxy_check_" in handlers
+    assert "auth_pyrogram_file" in handlers
+    assert "WAITING_SESSION_FILE" in handlers
+    assert "WAITING_SESSION_JSON" in handlers
+    assert "import_pyrogram_session_files" in source
 
 
 if __name__ == "__main__":
