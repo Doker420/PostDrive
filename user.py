@@ -4283,7 +4283,7 @@ class AccountSessionManager:
                     chat_title = chat.get('chat_title') or str(chat_id_val)
                     addit = chat.get('additional_text') or ''
                     
-                    full_text = f"{post_text}{addit}"
+                    full_text = f"{post_text}\n\n{addit}" if post_text and addit else (post_text or addit)
 
                     # Stealth mention
                     mention_msg = None
@@ -4325,7 +4325,7 @@ class AccountSessionManager:
                         if spin_diff and entities:
                             for ent in entities:
                                 ent.offset = max(0, ent.offset + spin_diff)
-                        full_text = f"{post_text}{addit}"
+                        full_text = f"{post_text}\n\n{addit}" if post_text and addit else (post_text or addit)
                     except Exception as e:
                         print(f"⚠️ Ошибка рандомизации текста: {e}")
 

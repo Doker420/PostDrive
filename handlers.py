@@ -5880,6 +5880,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             InlineKeyboardButton(text="✅ Включить все", callback_data=f"enable_all_chats_{account_id}_{page}"),
             InlineKeyboardButton(text="❌ Отключить все", callback_data=f"disable_all_chats_{account_id}_{page}")
         ])
+        buttons.append([
+            InlineKeyboardButton(text="✏️ Добавить текст", callback_data=f"chat_text_menu_{account_id}_0")
+        ])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"manage_acc_{account_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await edit_message(
@@ -5888,6 +5891,153 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"Групп всего: {total} | Выбрано: {enabled_count}\n"
             f"Страница {page+1}/{total_pages}",
             reply_markup=markup
+        )
+
+    async def render_chat_text_menu(callback: CallbackQuery, account_id: int, page: int = 0):
+        """Меню выбора чата для индивидуального добавочного текста."""
+        account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(callback.from_user.id):
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        page_chats, total = db.get_account_chats_paginated(
+            account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+        )
+        if total == 0:
+            await _answer_callback(callback, "💬 Групп не найдено. Сначала синхронизируйте чаты.", show_alert=True)
+            return
+        total_pages = max(1, (total + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
+        page = min(max(0, page), total_pages - 1)
+        page_chats, _ = db.get_account_chats_paginated(
+            account_id, page=page, per_page=CHATS_PER_PAGE, chat_types=GROUP_TYPES
+        )
+        buttons = []
+        for chat in page_chats:
+            title = str(chat.get('chat_title') or chat['chat_id'])
+            marker = "📝" if (chat.get('additional_text') or '').strip() else "➕"
+            buttons.append([InlineKeyboardButton(
+                text=f"{marker} {title[:32]}",
+                callback_data=f"chat_text_set_{account_id}_{page}_{chat['chat_id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"chat_text_menu_{account_id}_{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"chat_text_menu_{account_id}_{page+1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="◀️ К выбору групп", callback_data=f"acc_chats_{account_id}_{page}")])
+        await edit_message(
+            callback,
+            "✏️ <b>Добавочный текст для чата</b>\n\n"
+            "Выберите группу. Текст будет добавлен к основному посту только в этом чате.\n"
+            "Например: контакт поддержки, правила группы или локальный призыв к действию.\n\n"
+            "📝 — текст уже задан, ➕ — текст пока не задан.",
+            InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+
+    @dp.callback_query(F.data.startswith('chat_text_menu_'))
+    async def chat_text_menu_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        await render_chat_text_menu(callback, account_id, page)
+
+    @dp.callback_query(F.data.startswith('chat_text_set_'))
+    async def chat_text_set_callback(callback: CallbackQuery, state: FSMContext):
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        chat_id = '_'.join(parts[5:])
+        account = db.get_account(account_id)
+        chat = db.get_account_chat(account_id, chat_id)
+        if (
+            not account
+            or int(account.get('user_id') or 0) != int(callback.from_user.id)
+            or not chat
+            or chat.get('chat_type') not in GROUP_TYPES
+        ):
+            await _answer_callback(callback, "❌ Чат не найден!", show_alert=True)
+            return
+        await _answer_callback(callback)
+        await state.update_data(
+            chat_text_account_id=account_id,
+            chat_text_chat_id=chat_id,
+            chat_text_page=page,
+        )
+        await state.set_state(ChatTextStates.WAITING_CHAT_TEXT)
+        current = (chat.get('additional_text') or '').strip()
+        preview = html_escape(current[:500]) if current else 'Не задан'
+        chat_title = html_escape(str(chat.get('chat_title') or chat_id))
+        await edit_message(
+            callback,
+            f"✏️ <b>Добавочный текст</b>\n\n"
+            f"Чат: <b>{chat_title[:80]}</b>\n\n"
+            f"Текущий текст:\n<code>{preview}</code>\n\n"
+            "Отправьте текст, который нужно добавлять после основного поста. "
+            "Для удаления отправьте слово <code>удалить</code>.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Удалить текст", callback_data=f"chat_text_clear_{account_id}_{page}_{chat_id}")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data=f"chat_text_menu_{account_id}_{page}")],
+            ])
+        )
+
+    @dp.callback_query(F.data.startswith('chat_text_clear_'))
+    async def chat_text_clear_callback(callback: CallbackQuery, state: FSMContext):
+        parts = callback.data.split('_')
+        account_id = int(parts[3])
+        page = int(parts[4]) if len(parts) > 4 else 0
+        chat_id = '_'.join(parts[5:])
+        account = db.get_account(account_id)
+        chat = db.get_account_chat(account_id, chat_id)
+        if (
+            not account
+            or int(account.get('user_id') or 0) != int(callback.from_user.id)
+            or not chat
+            or chat.get('chat_type') not in GROUP_TYPES
+        ):
+            await _answer_callback(callback, "❌ Чат не найден!", show_alert=True)
+            return
+        db.update_chat_additional_text(account_id, chat_id, '')
+        await state.clear()
+        await _answer_callback(callback, "🗑 Добавочный текст удалён")
+        await render_chat_text_menu(callback, account_id, page)
+
+    @dp.message(ChatTextStates.WAITING_CHAT_TEXT)
+    async def process_chat_additional_text(message: Message, state: FSMContext):
+        data = await state.get_data()
+        account_id = data.get('chat_text_account_id')
+        chat_id = data.get('chat_text_chat_id')
+        page = int(data.get('chat_text_page') or 0)
+        account = db.get_account(account_id) if account_id else None
+        if not account or int(account.get('user_id') or 0) != int(message.from_user.id):
+            await state.clear()
+            await message.answer("❌ Аккаунт не найден!")
+            return
+        text = (message.text or '').strip()
+        if not text:
+            await message.answer("❌ Текст не должен быть пустым.")
+            return
+        if text.lower() in ('удалить', 'delete', 'убрать'):
+            text = ''
+        elif len(text) > 2000:
+            await message.answer("❌ Максимальная длина добавочного текста — 2000 символов.")
+            return
+        chat = db.get_account_chat(account_id, chat_id)
+        if not chat or chat.get('chat_type') not in GROUP_TYPES:
+            await state.clear()
+            await message.answer("❌ Чат больше не найден. Синхронизируйте чаты заново.")
+            return
+        db.update_chat_additional_text(account_id, chat_id, text)
+        await state.clear()
+        await message.answer(
+            "✅ Добавочный текст сохранён и будет добавляться только в выбранный чат."
+            if text else "🗑 Добавочный текст удалён.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ К другим чатам", callback_data=f"chat_text_menu_{account_id}_{page}")],
+                [InlineKeyboardButton(text="◀️ К выбору групп", callback_data=f"acc_chats_{account_id}_{page}")],
+            ])
         )
 
     @dp.callback_query(F.data == "noop")
