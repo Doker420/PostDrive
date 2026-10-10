@@ -71,6 +71,9 @@ def test_user_safety_guards_are_present():
     assert "SPAMBLOCK_ERRORS = tuple({PeerFlood}" in source
     assert "UserBannedInChannel, UserAlreadyParticipant" in source
     assert "record_flood_wait(account_id, cooldown)" in source
+    assert "create_operation_report" in source
+    assert "start_invite_job" in source
+    assert "check_account_proxy" in source
     assert "SKIP_TARGET_ERROR_NAMES" in source
     assert "async def _invite_from_shared_queue" in source
     assert "work_queue.get_nowait()" in source
@@ -85,8 +88,10 @@ def test_user_safety_guards_are_present():
     assert "MassActionStates.WAITING_POSTBOT_ID" in handlers
     assert "nc_mode_auto_" in handlers
     assert "Автоматически по посту" in handlers
-    assert "asyncio.Queue()" in handlers
-    assert "общей очереди пользователей" in handlers
+    assert "общей очереди" in handlers
+    assert "operation_stop_" in handlers
+    assert "operation_download_" in handlers
+    assert "acc_proxy_check_" in handlers
 
 
 if __name__ == "__main__":

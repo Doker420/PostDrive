@@ -13,6 +13,7 @@ from pyrogram import Client, enums, filters
 from pyrogram import utils
 from pyrogram.handlers import MessageHandler
 from pyrogram.types import MessageEntity
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # ── Telegram error taxonomy ───────────────────────────────────────
 # Имена классов различаются между версиями Pyrogram, поэтому импортируем
@@ -697,6 +698,13 @@ class AccountSessionManager:
         self._last_bot_message: Dict[int, float] = {}
         self._bot_message_interval = 1.0
         self._spam_progress: Dict[int, Dict] = {}  # account_id -> {success, errors, total, running}
+        # Runtime handles for status bars and cooperative cancellation of
+        # invite/neurocomment jobs. The durable report remains in SQLite so it
+        # can still be viewed or downloaded after a restart.
+        self.active_operation_reports: Dict[int, Dict[str, Any]] = {}
+        self.active_invite_jobs: Dict[int, Dict[str, Any]] = {}
+        self.active_comment_report_ids: Dict[int, int] = {}
+        self._operation_status_last_update: Dict[int, float] = {}
         self._autopost_notified: Dict[int, set] = {}
         self._user_task_counts: Dict[int, int] = {}  # user_id -> active task count
         self._user_task_lock = asyncio.Lock()
@@ -1024,6 +1032,8 @@ class AccountSessionManager:
             if account_id:
                 try:
                     if kind in ('proxy', 'network'):
+                        if kind == 'proxy' and proxy_str:
+                            db.update_account_proxy(account_id, '')
                         db.set_account_health(account_id, db.HEALTH_PROXY_ERROR, detail)
                     else:
                         db.set_account_health(account_id, db.HEALTH_BANNED, detail)
@@ -1402,6 +1412,38 @@ class AccountSessionManager:
             logger.error(f"Error changing bio for acc {account_id}: {e}")
             return False, str(e)
 
+    async def check_account_proxy(self, account_id: int, user_id: int = None):
+        """Проверяет прокси аккаунта одним bounded-запуском.
+
+        Нерабочий адрес сразу отсоединяется от аккаунта и фиксируется как
+        proxy_error. Сессию/аккаунт не удаляем: владелец может подключить новый
+        прокси и повторить проверку.
+        """
+        account = db.get_account(account_id)
+        if not account:
+            return False, 'Аккаунт не найден'
+        if user_id is not None and int(account.get('user_id') or 0) != int(user_id):
+            return False, 'Доступ запрещён'
+        proxy_str = (account.get('proxy') or '').strip()
+        if not proxy_str:
+            return False, 'Прокси не задан'
+        ok, _info, error = await self.test_session_string(
+            account.get('session_string', ''), proxy_str, account_id=account_id
+        )
+        if ok:
+            return True, 'Прокси работает, сессия отвечает'
+        error = error or 'Прокси не отвечает'
+        if error.startswith((SESSION_CHECK_PROXY_PREFIX, SESSION_CHECK_NETWORK_PREFIX)):
+            # Удаляем только транспорт, а не Telegram-сессию. Это не даст
+            # следующим задачам бесконечно стучаться в тот же мёртвый SOCKS5.
+            db.update_account_proxy(account_id, '')
+            db.set_account_health(
+                account_id, db.HEALTH_PROXY_ERROR,
+                f'Прокси удалён после проверки: {error[:250]}'
+            )
+            return False, 'Прокси не работает и удалён из аккаунта. Подключите новый адрес.'
+        return False, error
+
     async def get_or_start_client(self, account_id: int, user_id: int = None) -> Tuple[Optional[Client], Optional[str]]:
         """Получить клиент без бесконечных повторов подключения.
 
@@ -1469,6 +1511,9 @@ class AccountSessionManager:
                 kind, detail = _session_error_message(error, proxy_str)
                 if kind == 'proxy':
                     reason = f"{SESSION_CHECK_PROXY_PREFIX}{detail}"
+                    if proxy_str:
+                        db.update_account_proxy(account_id, '')
+                        reason += ' (прокси отключён и удалён из аккаунта)'
                     db.set_account_health(account_id, db.HEALTH_PROXY_ERROR, reason)
                 elif kind == 'network':
                     reason = f"{SESSION_CHECK_NETWORK_PREFIX}{detail}"
@@ -2201,6 +2246,231 @@ class AccountSessionManager:
             logging.error("❌ g4f: все провайдеры недоступны")
         return ""
 
+    # ==================== OPERATION STATUS / REPORTS ====================
+    @staticmethod
+    def _operation_status_markup(report_id: int, running: bool = True):
+        if running:
+            return InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🛑 Остановить задачу", callback_data=f"operation_stop_{report_id}")],
+                [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"operation_report_{report_id}")],
+            ])
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"operation_report_{report_id}"),
+             InlineKeyboardButton(text="📥 Скачать", callback_data=f"operation_download_{report_id}")],
+        ])
+
+    @staticmethod
+    def _operation_status_text(report: dict) -> str:
+        status_labels = {
+            'running': '🟢 выполняется',
+            'finished': '✅ завершена',
+            'stopped': '🛑 остановлена',
+            'failed': '⚠️ завершена с ошибкой',
+            'interrupted': '⏸ прервана после перезапуска',
+        }
+        operation_labels = {
+            'invite': 'Инвайтинг',
+            'neurocomment': 'Нейрокомментинг',
+        }
+        total = int(report.get('total') or 0)
+        processed = int(report.get('processed') or 0)
+        success = int(report.get('success_count') or 0)
+        skipped = int(report.get('skipped_count') or 0)
+        errors = int(report.get('error_count') or 0)
+        if total > 0:
+            current = min(processed, total)
+            percent = min(100, int(current * 100 / total))
+            filled = min(10, percent // 10)
+            bar = '█' * filled + '░' * (10 - filled)
+            progress = f"[{bar}] {percent}% ({current}/{total})"
+        else:
+            progress = f"[⏳] обработано: {processed}"
+        return (
+            f"📊 <b>{operation_labels.get(report.get('operation_type'), report.get('title') or 'Задача')}</b>\n\n"
+            f"Статус: <b>{status_labels.get(report.get('status'), report.get('status', 'unknown'))}</b>\n"
+            f"Прогресс: {progress}\n"
+            f"✅ Успешно: {success}\n"
+            f"⏭ Пропущено: {skipped}\n"
+            f"🔒 Privacy: {int(report.get('privacy_count') or 0)} · "
+            f"уже участники: {int(report.get('already_member_count') or 0)}\n"
+            f"❌ Ошибок: {errors} · ошибок аккаунта: "
+            f"{int(report.get('account_error_count') or 0)}\n\n"
+            "Подробный отчёт сохраняется и доступен после завершения."
+        )
+
+    async def _send_operation_status(self, report_id: int, bot=None, user_id: int = None,
+                                      force: bool = False):
+        report = db.get_operation_report(report_id)
+        if not report:
+            return
+        entry = self.active_operation_reports.get(report_id)
+        if not entry:
+            return
+        now = time.time()
+        if not force and now - self._operation_status_last_update.get(report_id, 0) < 2:
+            return
+        self._operation_status_last_update[report_id] = now
+        message = entry.get('status_message')
+        bot = bot or entry.get('bot') or self._bot
+        user_id = user_id or entry.get('user_id') or report.get('user_id')
+        markup = self._operation_status_markup(
+            report_id, report.get('status') == 'running'
+        )
+        try:
+            if message:
+                await message.edit_text(
+                    self._operation_status_text(report), reply_markup=markup
+                )
+            elif bot and user_id:
+                entry['status_message'] = await bot.send_message(
+                    user_id,
+                    self._operation_status_text(report),
+                    reply_markup=markup,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A deleted status message must not stop a Telegram worker.
+            logging.debug("operation status update failed for %s: %s", report_id, exc)
+
+    async def _open_operation_report(self, user_id: int, operation_type: str,
+                                     title: str, total: int = 0,
+                                     account_id: int = 0, bot=None) -> int:
+        report_id = db.create_operation_report(
+            user_id, operation_type, title=title, total=total,
+            account_id=account_id
+        )
+        self.active_operation_reports[report_id] = {
+            'user_id': user_id, 'bot': bot or self._bot,
+            'operation_type': operation_type, 'account_id': account_id,
+            'status_message': None,
+        }
+        await self._send_operation_status(report_id, bot=bot, user_id=user_id, force=True)
+        return report_id
+
+    async def _record_operation_result(self, report_id: int, account_id: int,
+                                       target: str, target_title: str,
+                                       result: str, detail: str = ''):
+        detail_text = str(detail or '').lower()
+        if result == 'success':
+            success, skipped, errors = 1, 0, 0
+        elif result == 'skipped':
+            success, skipped, errors = 0, 1, 0
+        else:
+            success, skipped, errors = 0, 0, 1
+        privacy = int('privacy' in detail_text)
+        already_member = int(
+            'already' in detail_text or 'participant' in detail_text
+        )
+        account_error = int(
+            'аккаунт' in detail_text or 'account' in detail_text
+        ) if result == 'error' else 0
+        db.add_operation_report_item(
+            report_id, account_id=account_id, target=target,
+            target_title=target_title, result=result, detail=detail
+        )
+        db.update_operation_report(
+            report_id, processed_delta=1, success_delta=success,
+            skipped_delta=skipped, error_delta=errors,
+            privacy_delta=privacy, already_member_delta=already_member,
+            account_error_delta=account_error,
+        )
+        await self._send_operation_status(report_id)
+
+    async def _finish_operation_report(self, report_id: int, status: str = 'finished'):
+        if not report_id:
+            return
+        db.finish_operation_report(report_id, status)
+        await self._send_operation_status(report_id, force=True)
+        self._operation_status_last_update.pop(report_id, None)
+        self.active_operation_reports.pop(report_id, None)
+
+    def get_active_operation_report(self, operation_type: str, account_id: int) -> int:
+        for report_id, entry in self.active_operation_reports.items():
+            if (entry.get('operation_type') == operation_type
+                    and int(entry.get('account_id') or 0) == int(account_id)):
+                report = db.get_operation_report(report_id)
+                if report and report.get('status') == 'running':
+                    return report_id
+        return 0
+
+    async def stop_operation_report(self, report_id: int, user_id: int) -> Tuple[bool, str]:
+        report = db.get_operation_report(report_id, user_id=user_id)
+        if not report:
+            return False, 'Отчёт не найден'
+        if report.get('status') != 'running':
+            return True, 'Задача уже завершена'
+        operation = report.get('operation_type')
+        if operation == 'invite':
+            job = self.active_invite_jobs.get(report_id)
+            if job:
+                job['stop_requested'] = True
+                for task in list(job.get('tasks', set())):
+                    if task and not task.done():
+                        task.cancel()
+            await self._finish_operation_report(report_id, 'stopped')
+            return True, 'Инвайтинг остановлен'
+        if operation == 'neurocomment':
+            await self.stop_neurocomment(int(report.get('account_id') or 0), user_id)
+            if db.get_operation_report(report_id, user_id=user_id).get('status') == 'running':
+                await self._finish_operation_report(report_id, 'stopped')
+            return True, 'Нейрокомментинг остановлен'
+        await self._finish_operation_report(report_id, 'stopped')
+        return True, 'Задача остановлена'
+
+    async def start_invite_job(self, account_ids: list, chat_id: str, users: list,
+                               bot, user_id: int, auto_join: bool = True):
+        """Запускает инвайтинг с общей очередью и одним отчётом/status bar."""
+        work_queue = asyncio.Queue()
+        for target in users:
+            work_queue.put_nowait(target)
+        report_id = await self._open_operation_report(
+            user_id, 'invite', 'Инвайтинг', total=len(users), bot=bot
+        )
+        # A user may press Stop immediately after the status message arrives.
+        # Do not create workers if that callback already closed the report.
+        if (db.get_operation_report(report_id) or {}).get('status') != 'running':
+            return report_id
+        shared_state = {
+            'report_id': report_id,
+            'stats': {'invited': 0, 'skipped': 0, 'privacy': 0,
+                      'already_member': 0, 'target_skipped': 0,
+                      'errors': 0, 'duplicates': 0, 'account_errors': 0},
+            'stats_lock': asyncio.Lock(),
+            'seen_ids': set(),
+            'seen_lock': asyncio.Lock(),
+            'workers_remaining': len(account_ids),
+        }
+        job = {'tasks': set(), 'shared_state': shared_state,
+               'user_id': user_id, 'stop_requested': False}
+        self.active_invite_jobs[report_id] = job
+        for account_id in account_ids:
+            task = asyncio.create_task(
+                self.run_limited(self.invite_users(
+                    account_id, chat_id, [], bot, user_id,
+                    auto_join=auto_join, work_queue=work_queue,
+                    shared_state=shared_state
+                )),
+                name=f'invite-{report_id}-{account_id}'
+            )
+            job['tasks'].add(task)
+        return report_id
+
+    async def _invite_job_worker_done(self, shared_state: dict):
+        report_id = int(shared_state.get('report_id') or 0)
+        if not report_id:
+            return
+        shared_state['workers_remaining'] = max(
+            0, int(shared_state.get('workers_remaining', 1)) - 1
+        )
+        if shared_state['workers_remaining'] == 0:
+            job = self.active_invite_jobs.get(report_id, {})
+            report = db.get_operation_report(report_id)
+            if report and report.get('status') == 'running':
+                status = 'stopped' if job.get('stop_requested') else 'finished'
+                await self._finish_operation_report(report_id, status)
+            self.active_invite_jobs.pop(report_id, None)
+
     async def start_neurocomment(self, account_id: int, bot, user_id: int):
         logging.info(f"🟢 start_neurocomment called for account {account_id}")
         if account_id in self.active_comment_tasks:
@@ -2248,23 +2518,43 @@ class AccountSessionManager:
         logging.info(f"✅ Starting neurocomment for account {account_id} on channels: {channels}")
         self.comment_listeners[account_id] = {}
         task_id = db.register_task(user_id, account_id, 'neurocomment', 'starting')
+        report_id = await self._open_operation_report(
+            user_id, 'neurocomment', 'Нейрокомментинг',
+            total=len(channels), account_id=account_id, bot=bot
+        )
+        self.active_comment_report_ids[account_id] = report_id
         self.active_comment_task_ids[account_id] = task_id
-        task = asyncio.create_task(self._run_limited(self._neurocomment_worker(account_id, bot, user_id, nc, task_id)))
+        task = asyncio.create_task(
+            self._run_limited(
+                self._neurocomment_worker(
+                    account_id, bot, user_id, nc, task_id, report_id
+                )
+            )
+        )
         self.active_comment_tasks[account_id] = task
         return True, f"Нейрокомментинг запущен на {len(channels)} каналах"
 
     async def stop_neurocomment(self, account_id: int, user_id: int = None):
         # Note: quota is released in _neurocomment_worker's finally block
+        account = db.get_account(account_id)
+        if user_id is not None and account and int(account.get('user_id') or 0) != int(user_id):
+            return False
         self._nc_intentional_stop.add(account_id)
         task = self.active_comment_tasks.pop(account_id, None)
         task_id = self.active_comment_task_ids.pop(account_id, None)
+        report_id = self.active_comment_report_ids.pop(account_id, None)
         if task and not task.done():
             task.cancel()
         self.comment_listeners.pop(account_id, None)
         if task_id:
             db.cancel_task(task_id)
+        if report_id:
+            await self._finish_operation_report(report_id, 'stopped')
+        return True
 
-    async def _neurocomment_worker(self, account_id: int, bot, user_id: int, nc: dict, task_id: int = None):
+    async def _neurocomment_worker(self, account_id: int, bot, user_id: int,
+                                   nc: dict, task_id: int = None,
+                                   report_id: int = None):
         from pyrogram.raw import types as raw_types
         from pyrogram import utils as pyrogram_utils
         
@@ -2287,6 +2577,14 @@ class AccountSessionManager:
         account = db.get_account(account_id)
         if not account:
             logging.error(f"❌ Account {account_id} not found in worker")
+            if task_id:
+                db.finish_task(task_id, status='failed')
+            if report_id:
+                await self._finish_operation_report(report_id, 'failed')
+            self.active_comment_task_ids.pop(account_id, None)
+            self.active_comment_report_ids.pop(account_id, None)
+            self.active_comment_tasks.pop(account_id, None)
+            await self._release_user_quota(user_id)
             return
         
         acc_name = account.get('account_name') or f"Аккаунт #{account_id}"
@@ -2296,6 +2594,7 @@ class AccountSessionManager:
         # При аварии (сеть, мёртвая сессия, исключение) настройка остаётся
         # включённой, и сторож поднимет воркер заново.
         disable_on_exit = False
+        operation_status = 'finished'
         logging.info(f"🧠 Starting neurocomment worker for {acc_name} | user_id={user_id} | notifications_hidden={notifications_hidden}")
 
         parallel = self.active_task_names(account_id, exclude='active_comment_tasks')
@@ -2314,11 +2613,25 @@ class AccountSessionManager:
                     bot, user_id,
                     f"⚠️ [{acc_name}] Не удалось запустить сессию. Проверьте состояние аккаунта в панели."
                 )
+            if task_id:
+                db.finish_task(task_id, status='failed')
+            if report_id:
+                await self._finish_operation_report(report_id, 'failed')
+            self.active_comment_task_ids.pop(account_id, None)
+            self.active_comment_report_ids.pop(account_id, None)
+            self.active_comment_tasks.pop(account_id, None)
+            await self._release_user_quota(user_id)
             return
         
         logging.info(f"✅ [{acc_name}] Client started successfully")
         if bot and not notifications_hidden:
             await bot.send_message(user_id, f"🧠 [{acc_name}] Нейрокомментинг запущен! Проверяю каналы...")
+
+        async def nc_result(target, result, detail=''):
+            if report_id:
+                await self._record_operation_result(
+                    report_id, account_id, str(target), str(target), result, detail
+                )
         
         try:
             target_channels = [c.strip() for c in nc.get('target_channels', '').split(',') if c.strip()]
@@ -2502,6 +2815,7 @@ class AccountSessionManager:
                             if mode in ('auto', 'post_prompt') and not post_text:
                                 logging.info(f"⏭️ [{acc_name}] Пост {msg.id} без текста — автоматическому режиму нечего анализировать")
                                 self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
+                                await nc_result(channel, 'skipped', 'Пост без текста')
                                 continue
 
                             # Небольшая пауза, чтобы копия поста успела появиться
@@ -2540,6 +2854,7 @@ class AccountSessionManager:
                                             f"({used_q}/{limit_q}).\n\nПовысьте тариф или докупите AI-пакет "
                                             f"в разделе «💳 Подписка»."
                                         )
+                                    await nc_result(channel, 'skipped', 'AI-квота исчерпана')
                                     continue
 
                             comment_text = ""
@@ -2585,6 +2900,7 @@ class AccountSessionManager:
                                 logging.warning(f"⚠️ [{acc_name}] Failed to generate comment for {channel} (no fallback)")
                                 if bot and not notifications_hidden:
                                     await bot.send_message(user_id, f"⚠️ [{acc_name}] Не удалось сгенерировать комментарий (нет fallback)")
+                                await nc_result(channel, 'error', 'Не удалось сгенерировать комментарий')
                                 continue
                             
                             try:
@@ -2601,6 +2917,7 @@ class AccountSessionManager:
                                         logging.warning(f"⚠️ [{acc_name}] No discussion chat for {channel}: {access_msg}")
                                         if bot and not notifications_hidden:
                                             await bot.send_message(user_id, f"⚠️ [{acc_name}] Нет чата обсуждений в {channel}")
+                                        await nc_result(channel, 'skipped', access_msg or 'Нет чата обсуждений')
                                         continue
 
                                 # Отправка комментария: сначала штатный API
@@ -2616,6 +2933,7 @@ class AccountSessionManager:
                                     logging.warning(f"⚠️ [{acc_name}] Не найден пост в чате обсуждений {discussion_chat_id} — комментарий не отправлен")
                                     if bot and not notifications_hidden:
                                         await bot.send_message(user_id, f"⚠️ [{acc_name}] Пост из {channel} ещё не появился в чате комментариев — пропускаю")
+                                    await nc_result(channel, 'skipped', 'Копия поста не найдена в чате обсуждений')
                                 
                                 if comment_sent:
                                     self.comment_listeners.setdefault(account_id, {})[str(channel)] = msg.id
@@ -2623,8 +2941,10 @@ class AccountSessionManager:
                                     self._nc_last_comment[account_id] = time.time()
                                     if bot and not notifications_hidden:
                                         await bot.send_message(user_id, f"✅ [{acc_name}] Прокомментирован пост в {channel}")
+                                    await nc_result(channel, 'success')
 
                             except Exception as send_err:
+                                await nc_result(channel, 'error', str(send_err))
                                 logging.error(f"❌ [{acc_name}] Failed to send comment to {channel}: {type(send_err).__name__}: {send_err}")
                                 if bot and not notifications_hidden and not _is_internal_noise_error(send_err):
                                     await self._safe_bot_message(
@@ -2636,6 +2956,7 @@ class AccountSessionManager:
                             break
                     
                     except Exception as e:
+                        await nc_result(channel, 'error', str(e))
                         logging.error(f"❌ [{acc_name}] Error processing channel {channel}: {type(e).__name__}: {e}")
                         if bot and not notifications_hidden and not _is_internal_noise_error(e):
                             await self._safe_bot_message(
@@ -2652,8 +2973,10 @@ class AccountSessionManager:
                 await asyncio.sleep(sleep_for)
         
         except asyncio.CancelledError:
+            operation_status = 'stopped' if account_id in self._nc_intentional_stop else 'interrupted'
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
         except AccountBlockedError as e:
+            operation_status = 'failed'
             # Раньше владелец не получал ничего: задача молча умирала, тумблер
             # гас, и выглядело это как «нейрокомментинг не работает».
             disable_on_exit = True
@@ -2668,6 +2991,7 @@ class AccountSessionManager:
                 except Exception:
                     pass
         except Exception as e:
+            operation_status = 'failed'
             logging.error(f"❌ [{acc_name}] Critical error in neurocomment worker: {e}", exc_info=True)
             if bot and not notifications_hidden and not _is_internal_noise_error(e):
                 try:
@@ -2689,6 +3013,11 @@ class AccountSessionManager:
             self.comment_listeners.pop(account_id, None)
             if task_id:
                 db.finish_task(task_id, status='finished')
+            if report_id:
+                report = db.get_operation_report(report_id)
+                if report and report.get('status') == 'running':
+                    await self._finish_operation_report(report_id, operation_status)
+            self.active_comment_report_ids.pop(account_id, None)
             self.active_comment_task_ids.pop(account_id, None)
             await self._release_user_quota(user_id)
 
@@ -4316,6 +4645,14 @@ class AccountSessionManager:
             await bump('skipped')
             await bump(bucket)
 
+        report_id = int(shared_state.get('report_id') or 0)
+
+        async def record_result(target, result, detail=''):
+            if report_id:
+                await self._record_operation_result(
+                    report_id, account_id, str(target), '', result, detail
+                )
+
         account_stopped = False
         while True:
             try:
@@ -4340,10 +4677,12 @@ class AccountSessionManager:
                     if not target_id:
                         logging.info(f"⏭ [{acc_name}] target {raw_target}: Telegram не вернул пользователя")
                         await bump('skipped')
+                        await record_result(raw_target, 'skipped', 'Telegram не вернул пользователя')
                         continue
                 except TargetSkipError as exc:
                     logging.info(f"⏭ [{acc_name}] target {raw_target}: пропуск ({exc})")
                     await mark_target_skip(exc)
+                    await record_result(raw_target, 'skipped', str(exc))
                     continue
                 except asyncio.TimeoutError:
                     # tg_call уже исчерпал ограниченный retry: аккаунт не
@@ -4351,6 +4690,7 @@ class AccountSessionManager:
                     # отвечает стабильно.
                     account_stopped = True
                     await bump('account_errors')
+                    await record_result(raw_target, 'error', 'Аккаунт временно недоступен (timeout)')
                     logging.warning(f"⏸ [{acc_name}] аккаунт исключён из общей очереди после timeout")
                     break
                 except AccountBlockedError:
@@ -4359,11 +4699,13 @@ class AccountSessionManager:
                     # бесконечные повторы и оставляет её другим аккаунтам.
                     account_stopped = True
                     await bump('account_errors')
+                    await record_result(raw_target, 'error', 'Аккаунт ограничен или сессия недоступна')
                     logging.warning(f"⏸ [{acc_name}] аккаунт исключён из общей очереди при разрешении цели")
                     break
                 except Exception as exc:
                     logging.warning(f"⚠️ [{acc_name}] target {raw_target} не разрешён: {type(exc).__name__}: {exc}")
                     await bump('skipped')
+                    await record_result(raw_target, 'skipped', str(exc))
                     continue
 
                 # Один и тот же пользователь мог попасть в файл как @username
@@ -4376,6 +4718,8 @@ class AccountSessionManager:
                         duplicate = False
                 if duplicate:
                     await bump('duplicates')
+                    await bump('skipped')
+                    await record_result(raw_target, 'skipped', 'Дубликат Telegram user id')
                     logging.info(f"⏭ [{acc_name}] target {raw_target} уже обработан другим worker")
                     continue
 
@@ -4397,15 +4741,18 @@ class AccountSessionManager:
                         notify=not notifications_hidden, raise_on_skip=True,
                     )
                     await bump('invited')
+                    await record_result(target_id, 'success')
                     logging.info(f"✅ [{acc_name}] invited {target_id}")
                 except TargetSkipError as exc:
                     # UserPrivacyRestricted, AlreadyParticipant, BannedInChannel
                     # и аналоги — штатный пропуск одной цели.
                     await mark_target_skip(exc)
+                    await record_result(target_id, 'skipped', str(exc))
                     logging.info(f"⏭ [{acc_name}] {target_id}: target-level skip ({exc})")
                 except AccountBlockedError as exc:
                     account_stopped = True
                     await bump('account_errors')
+                    await record_result(target_id, 'error', str(exc))
                     logging.warning(f"⏸ [{acc_name}] invite worker остановлен: {exc}")
                     break
                 except asyncio.TimeoutError:
@@ -4414,6 +4761,7 @@ class AccountSessionManager:
                     # цели из общей очереди.
                     account_stopped = True
                     await bump('account_errors')
+                    await record_result(target_id, 'error', 'Timeout после ограниченных попыток')
                     logging.warning(f"⏸ [{acc_name}] timeout inviting {target_id}; аккаунт исключён из очереди")
                     break
                 except Exception as exc:
@@ -4429,9 +4777,11 @@ class AccountSessionManager:
                     if transport_error:
                         account_stopped = True
                         await bump('account_errors')
+                        await record_result(target_id, 'error', str(exc))
                         logging.warning(f"⏸ [{acc_name}] transport error; аккаунт исключён: {exc}")
                         break
                     await bump('errors')
+                    await record_result(target_id, 'error', str(exc))
                     logging.warning(f"⚠️ [{acc_name}] invite {target_id} failed: {type(exc).__name__}: {exc}")
                 finally:
                     try:
@@ -4727,6 +5077,9 @@ class AccountSessionManager:
             logging.info(f"📥 invite_users END | account={account_id} success={success} errors={errors}")
         except Exception as e:
             logging.error(f"❌ invite_users unhandled exception for account {account_id}: {type(e).__name__}: {e}", exc_info=True)
+        finally:
+            if shared_state is not None:
+                await self._invite_job_worker_done(shared_state)
 
     async def get_account_contacts(self, account_id: int) -> Tuple[List[dict], str]:
         """Контакты аккаунта — цели для рассылки «по контактам».

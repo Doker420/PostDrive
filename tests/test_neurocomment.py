@@ -41,8 +41,8 @@ assert '_send_post_comment(' in U.split('async def _send_post_comment')[0], \
 results.append("комментарий через get_discussion_message + fallback: OK")
 
 # 4. Блокировка аккаунта сообщается владельцу
-tail = U[U.index('except AccountBlockedError as e:\n            # Раньше владелец'):]
-assert 'bot.send_message' in tail[:900], "AccountBlockedError гасит воркер молча"
+tail = U[U.index('except AccountBlockedError as e:'):]
+assert 'bot.send_message' in tail[:1100], "AccountBlockedError гасит воркер молча"
 results.append("уведомление об ограничении аккаунта: OK")
 
 # 5. Неудачный старт снимает enabled

@@ -1407,40 +1407,19 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("❌ После удаления дублей не осталось пользователей для инвайта!")
             return
 
-        # Общая очередь вместо фиксированных chunks. Каждый свободный аккаунт
-        # атомарно забирает следующую цель; приватность/AlreadyParticipant
-        # отмечаются как пропуск, а аккаунт с cooldown просто прекращает свой
-        # worker и не удерживает оставшиеся цели.
-        work_queue = asyncio.Queue()
-        for target in unique_users:
-            work_queue.put_nowait(target)
-        shared_state = {
-            'stats': {'invited': 0, 'skipped': 0, 'privacy': 0,
-                      'already_member': 0, 'target_skipped': 0,
-                      'errors': 0, 'duplicates': 0, 'account_errors': 0},
-            'stats_lock': asyncio.Lock(),
-            'seen_ids': set(),
-            'seen_lock': asyncio.Lock(),
-        }
-
-        for idx, account_id in enumerate(valid_account_ids):
-            await message.answer(
-                f"🚀 [{idx+1}/{len(valid_account_ids)}] Подключаю аккаунт #{account_id} "
-                "к общей очереди пользователей..."
-            )
-            asyncio.create_task(account_manager.run_limited(
-                account_manager.invite_users(
-                    account_id, chat_id, [], bot, user_id, auto_join=True,
-                    work_queue=work_queue, shared_state=shared_state
-                )
-            ))
+        # Общая очередь и status bar создаются внутри менеджера. Каждый
+        # свободный аккаунт атомарно забирает следующую цель; в статусном
+        # сообщении доступны остановка и отчёт с выгрузкой CSV.
+        report_id = await account_manager.start_invite_job(
+            valid_account_ids, chat_id, unique_users, bot, user_id,
+            auto_join=True
+        )
 
         await state.clear()
         await message.answer(
             f"✅ Инвайт запущен в фоне: {len(unique_users)} уникальных целей, "
             f"{len(valid_account_ids)} аккаунтов в общей очереди.\n"
-            "Приватные/недоступные цели будут спокойно пропущены, а временно "
-            "ограниченный аккаунт исключён без остановки остальных.",
+            "Статус, остановка и отчёт доступны в отдельном сообщении задачи.",
             reply_markup=main_menu_keyboard(user_id)
         )
 
@@ -2924,7 +2903,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
              InlineKeyboardButton(text="🚪 Массовый выход", callback_data=f"acc_massleave_{account_id}_0")],
             [InlineKeyboardButton(text="📥 Вступить в чаты", callback_data=f"acc_join_{account_id}"),
              InlineKeyboardButton(text="📦 Вступить из пака", callback_data=f"acc_join_pack_{account_id}")],
-            [InlineKeyboardButton(text="🌐 Прокси", callback_data=f"acc_proxy_{account_id}")],
+            [InlineKeyboardButton(text="🌐 Прокси", callback_data=f"acc_proxy_{account_id}"),
+             InlineKeyboardButton(text="🔎 Проверить прокси", callback_data=f"acc_proxy_check_{account_id}")],
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data=f"acc_autoresponder_{account_id}"),
              InlineKeyboardButton(text="👤 Изменить BIO", callback_data=f"acc_bio_{account_id}")],
             [InlineKeyboardButton(text="💬 Ответить в ЛС", callback_data=f"acc_pms_{account_id}")],
@@ -3236,6 +3216,107 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         from aiogram.types import BufferedInputFile
         file = BufferedInputFile(output.getvalue().encode('utf-8'), filename=f"report_{report_id}.csv")
         await callback.message.answer_document(file, caption=f"📊 Отчет #{report_id}")
+
+    # ==================== INVITE / NEURO OPERATION REPORTS ====================
+    @dp.callback_query(F.data.startswith('operation_status_'))
+    async def operation_status_callback(callback: CallbackQuery):
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        report = db.get_operation_report(report_id, callback.from_user.id)
+        if not report:
+            await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
+            return
+        await _answer_callback(callback)
+        await edit_message(
+            callback,
+            account_manager._operation_status_text(report),
+            account_manager._operation_status_markup(
+                report_id, report.get('status') == 'running'
+            )
+        )
+
+    @dp.callback_query(F.data.startswith('operation_report_'))
+    async def operation_report_callback(callback: CallbackQuery):
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        report = db.get_operation_report(report_id, callback.from_user.id)
+        if not report:
+            await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
+            return
+        items = db.get_operation_report_items(report_id, limit=12)
+        labels = {
+            'running': '🟢 выполняется', 'finished': '✅ завершена',
+            'stopped': '🛑 остановлена', 'failed': '⚠️ ошибка',
+            'interrupted': '⏸ прервана',
+        }
+        text = (
+            f"📊 <b>Отчёт: {report.get('title') or report.get('operation_type')}</b>\n\n"
+            f"Статус: {labels.get(report.get('status'), report.get('status'))}\n"
+            f"Обработано: {report.get('processed', 0)}"
+            f" / {report.get('total', 0) or '∞'}\n"
+            f"✅ Успешно: {report.get('success_count', 0)}\n"
+            f"⏭ Пропущено: {report.get('skipped_count', 0)}\n"
+            f"🔒 Privacy: {report.get('privacy_count', 0)} · уже участники: "
+            f"{report.get('already_member_count', 0)}\n"
+            f"❌ Ошибок: {report.get('error_count', 0)} · ошибок аккаунта: "
+            f"{report.get('account_error_count', 0)}\n"
+            f"📅 Запущена: {format_date(report.get('started_at', 0))}\n"
+        )
+        if report.get('finished_at'):
+            text += f"🏁 Завершена: {format_date(report.get('finished_at', 0))}\n"
+        if items:
+            text += "\n<b>Последние результаты:</b>\n"
+            for item in items[-8:]:
+                icon = {'success': '✅', 'skipped': '⏭', 'error': '❌'}.get(item.get('result'), '•')
+                target = item.get('target_title') or item.get('target') or 'цель'
+                text += f"{icon} {str(target)[:50]}"
+                if item.get('detail'):
+                    text += f" — {str(item['detail'])[:70]}"
+                text += "\n"
+        buttons = [
+            [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"operation_download_{report_id}")],
+        ]
+        if report.get('status') == 'running':
+            buttons.append([InlineKeyboardButton(text="🛑 Остановить задачу", callback_data=f"operation_stop_{report_id}")])
+            buttons.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"operation_report_{report_id}")])
+        else:
+            buttons.append([InlineKeyboardButton(text="◀️ К статусу", callback_data=f"operation_status_{report_id}")])
+        await _answer_callback(callback)
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+    @dp.callback_query(F.data.startswith('operation_download_'))
+    async def operation_download_callback(callback: CallbackQuery):
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        report = db.get_operation_report(report_id, callback.from_user.id)
+        if not report:
+            await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
+            return
+        items = db.get_operation_report_items(report_id, limit=50000)
+        import csv
+        import io
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Report ID', 'Operation', 'Account ID', 'Target', 'Target title', 'Result', 'Details', 'Created'])
+        for item in items:
+            writer.writerow([
+                report_id, report.get('operation_type', ''), item.get('account_id', 0),
+                item.get('target', ''), item.get('target_title', ''),
+                item.get('result', ''), item.get('detail', ''),
+                format_date(item.get('created_at', 0)),
+            ])
+        output.seek(0)
+        file = BufferedInputFile(
+            output.getvalue().encode('utf-8-sig'),
+            filename=f"operation_report_{report_id}.csv"
+        )
+        await _answer_callback(callback, "📥 Отчёт готов")
+        await callback.message.answer_document(file, caption=f"📊 Отчёт задачи #{report_id}")
+
+    @dp.callback_query(F.data.startswith('operation_stop_'))
+    async def operation_stop_callback(callback: CallbackQuery):
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        ok, message = await account_manager.stop_operation_report(
+            report_id, callback.from_user.id
+        )
+        await _answer_callback(callback, ("🛑 " if ok else "❌ ") + message, show_alert=not ok)
 
     PARSE_DEPTH_OPTIONS = [500, 1000, 5000, 10000, 50000]
 
@@ -5860,12 +5941,47 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await message.answer(f"🚀 Вступление запущено на {len(account_ids)} аккаунтах! Обрабатываю {len(links)} ссылок...")
 
     # ==================== PROXY MANAGEMENT ====================
+    @dp.callback_query(F.data.startswith('acc_proxy_check_'))
+    async def acc_proxy_check_callback(callback: CallbackQuery):
+        account_id = int(callback.data.rsplit('_', 1)[1])
+        account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(callback.from_user.id):
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        if not (account.get('proxy') or '').strip():
+            await _answer_callback(callback, "ℹ️ Прокси не задан. Подключите новый адрес.", show_alert=True)
+            return
+        await _answer_callback(callback, "⏳ Проверяю прокси...", show_alert=False)
+        await edit_message(
+            callback,
+            "⏳ <b>Проверка прокси</b>\n\n"
+            "Проверяю соединение с Telegram. Повторных бесконечных подключений не будет."
+        )
+        ok, result = await account_manager.check_account_proxy(
+            account_id, callback.from_user.id
+        )
+        if ok:
+            text = f"✅ <b>Прокси работает</b>\n\n{result}"
+        else:
+            text = f"⚠️ <b>Прокси отключён</b>\n\n{result}"
+        await edit_message(
+            callback,
+            text,
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌐 Подключить другой прокси", callback_data=f"acc_proxy_{account_id}")],
+                [InlineKeyboardButton(text="◀️ К аккаунту", callback_data=f"manage_acc_{account_id}")],
+            ])
+        )
+
     @dp.callback_query(F.data.startswith('acc_proxy_'))
     async def acc_proxy_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
         account_id = int(callback.data.split('_')[2])
-        await state.update_data(proxy_account_id=account_id)
         account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(callback.from_user.id):
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        await state.update_data(proxy_account_id=account_id)
         current_proxy = account.get('proxy', '') if account else 'Не задан'
         await state.set_state(AddAccountStates.WAITING_PROXY)
         await edit_message(callback,
@@ -5878,19 +5994,31 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def process_new_proxy(message: Message, state: FSMContext):
         data = await state.get_data()
         account_id = data.get('proxy_account_id')
-        proxy_str = message.text.strip()
+        account = db.get_account(account_id) if account_id else None
+        if not account or int(account.get('user_id') or 0) != int(message.from_user.id):
+            await state.clear()
+            await message.answer("❌ Аккаунт не найден!")
+            return
+        proxy_str = (message.text or '').strip()
         if proxy_str.lower() in ('удалить', 'delete', 'убрать'):
             db.update_account_proxy(account_id, '')
             await state.clear()
-            await message.answer("✅ Прокси удалён!")
+            await message.answer("✅ Прокси удалён! Аккаунт переведён на прямое соединение.")
             return
         parsed = parse_proxy_string(proxy_str)
         if not parsed:
             await message.answer("❌ Неверный формат прокси!")
             return
         db.update_account_proxy(account_id, proxy_str)
+        if account.get('health') == db.HEALTH_PROXY_ERROR:
+            db.clear_account_health(account_id)
+            if account.get('status') == 'error':
+                db.update_account_status(account_id, 'active')
         await state.clear()
-        await message.answer("✅ Прокси обновлён!")
+        await message.answer(
+            "✅ Новый прокси подключён. Нажмите «🔎 Проверить прокси», "
+            "чтобы проверить его до запуска задач."
+        )
 
     # ==================== BIO & AUTORESPONDER ====================
     @dp.callback_query(F.data.startswith('acc_bio_'))

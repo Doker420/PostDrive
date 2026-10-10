@@ -743,6 +743,43 @@ class DBConnection(metaclass=_PoolBoundMeta):
             FOREIGN KEY(report_id) REFERENCES account_reports(id) ON DELETE CASCADE
         )''')
 
+        # Reports for long-running invite and neurocomment jobs. Unlike the
+        # legacy account_reports table (which is tied to chat posting), this
+        # table stores target-level outcomes and can be updated by several
+        # account workers sharing one invite queue.
+        c.execute('''CREATE TABLE IF NOT EXISTS operation_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            account_id INTEGER DEFAULT 0,
+            operation_type TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            status TEXT DEFAULT 'running',
+            total INTEGER DEFAULT 0,
+            processed INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            skipped_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            privacy_count INTEGER DEFAULT 0,
+            already_member_count INTEGER DEFAULT 0,
+            account_error_count INTEGER DEFAULT 0,
+            started_at INTEGER DEFAULT (strftime('%s', 'now')),
+            finished_at INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS operation_report_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL,
+            account_id INTEGER DEFAULT 0,
+            target TEXT DEFAULT '',
+            target_title TEXT DEFAULT '',
+            result TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(report_id) REFERENCES operation_reports(id) ON DELETE CASCADE
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_operation_reports_user ON operation_reports(user_id, started_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_operation_report_items_report ON operation_report_items(report_id, created_at)')
+
         c.execute('''CREATE TABLE IF NOT EXISTS parsed_users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             account_id INTEGER NOT NULL,
@@ -867,6 +904,9 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._safe_ddl(c, 'ALTER TABLE account_chats ADD COLUMN chat_type TEXT DEFAULT \'unknown\'')
         self._safe_ddl(c, 'ALTER TABLE account_chats ADD COLUMN synced_at INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE neurocomment_settings ADD COLUMN comment_delay INTEGER DEFAULT 60')
+        self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN privacy_count INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN already_member_count INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN account_error_count INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN user_id_val INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
         for _ddl in (
@@ -2135,6 +2175,92 @@ class DBConnection(metaclass=_PoolBoundMeta):
     def finish_report(self, report_id: int):
         self.c.execute('UPDATE account_reports SET finished_at = ? WHERE id = ?', (int(time.time()), report_id))
         self.conn_ctx.commit()
+
+    # ==================== LONG-RUNNING OPERATION REPORTS ====================
+    def create_operation_report(self, user_id: int, operation_type: str,
+                                title: str = '', total: int = 0,
+                                account_id: int = 0) -> int:
+        self.c.execute(
+            'INSERT INTO operation_reports '
+            '(user_id, account_id, operation_type, title, status, total, started_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (user_id, account_id or 0, operation_type, title[:200],
+             'running', max(0, int(total or 0)), int(time.time()))
+        )
+        self.conn_ctx.commit()
+        return self.c.lastrowid
+
+    def get_operation_report(self, report_id: int, user_id: int = None) -> Optional[Dict[str, Any]]:
+        query = 'SELECT * FROM operation_reports WHERE id = ?'
+        params = [int(report_id)]
+        if user_id is not None:
+            query += ' AND user_id = ?'
+            params.append(int(user_id))
+        self.c.execute(query, tuple(params))
+        return self._dict_fetchone()
+
+    def get_user_operation_reports(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM operation_reports WHERE user_id = ? '
+            'ORDER BY started_at DESC LIMIT ?',
+            (int(user_id), max(1, int(limit)))
+        )
+        return self._dict_fetchall()
+
+    def set_operation_report_total(self, report_id: int, total: int):
+        self.c.execute(
+            'UPDATE operation_reports SET total = ? WHERE id = ?',
+            (max(0, int(total or 0)), int(report_id))
+        )
+        self.conn_ctx.commit()
+
+    def update_operation_report(self, report_id: int, processed_delta: int = 0,
+                                success_delta: int = 0, skipped_delta: int = 0,
+                                error_delta: int = 0, privacy_delta: int = 0,
+                                already_member_delta: int = 0,
+                                account_error_delta: int = 0):
+        self.c.execute(
+            'UPDATE operation_reports SET processed = processed + ?, '
+            'success_count = success_count + ?, skipped_count = skipped_count + ?, '
+            'error_count = error_count + ?, privacy_count = privacy_count + ?, '
+            'already_member_count = already_member_count + ?, '
+            'account_error_count = account_error_count + ? WHERE id = ?',
+            (int(processed_delta or 0), int(success_delta or 0),
+             int(skipped_delta or 0), int(error_delta or 0),
+             int(privacy_delta or 0), int(already_member_delta or 0),
+             int(account_error_delta or 0), int(report_id))
+        )
+        self.conn_ctx.commit()
+
+    def finish_operation_report(self, report_id: int, status: str = 'finished'):
+        allowed = {'finished', 'stopped', 'failed', 'interrupted'}
+        status = status if status in allowed else 'finished'
+        self.c.execute(
+            'UPDATE operation_reports SET status = ?, finished_at = ? WHERE id = ?',
+            (status, int(time.time()), int(report_id))
+        )
+        self.conn_ctx.commit()
+
+    def add_operation_report_item(self, report_id: int, account_id: int = 0,
+                                  target: str = '', target_title: str = '',
+                                  result: str = '', detail: str = ''):
+        self.c.execute(
+            'INSERT INTO operation_report_items '
+            '(report_id, account_id, target, target_title, result, detail, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (int(report_id), int(account_id or 0), str(target)[:300],
+             str(target_title or '')[:300], str(result or '')[:80],
+             str(detail or '')[:500], int(time.time()))
+        )
+        self.conn_ctx.commit()
+
+    def get_operation_report_items(self, report_id: int, limit: int = 10000) -> List[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM operation_report_items WHERE report_id = ? '
+            'ORDER BY created_at ASC, id ASC LIMIT ?',
+            (int(report_id), max(1, int(limit)))
+        )
+        return self._dict_fetchall()
 
     # ==================== PARSED USERS ====================
     def _migrate_parsed_users_unique(self, c):
