@@ -271,17 +271,42 @@ async def main():
     else:
         logger.info("YooMoney payments disabled: receiver or notification secret is not configured")
 
-    # Wait for shutdown signal
-    await _shutdown_event.wait()
+    # Wait for either a shutdown signal or a polling failure. Previously a
+    # failed start_polling task was left unobserved while this coroutine waited
+    # forever for SIGTERM, leaving a running but completely unresponsive
+    # process after a deploy/configuration error.
+    shutdown_wait = asyncio.create_task(_shutdown_event.wait())
+    polling_error = None
+    done, _pending = await asyncio.wait(
+        {polling_task, shutdown_wait},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if polling_task in done:
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            polling_error = error
+            logger.exception("Telegram polling stopped unexpectedly")
+        _shutdown_event.set()
+    else:
+        polling_task.cancel()
+        try:
+            await polling_task
+        except asyncio.CancelledError:
+            pass
 
-    # Cancel polling and run shutdown
-    polling_task.cancel()
-    try:
-        await polling_task
-    except asyncio.CancelledError:
-        pass
+    if not shutdown_wait.done():
+        shutdown_wait.cancel()
+        try:
+            await shutdown_wait
+        except asyncio.CancelledError:
+            pass
 
     await _shutdown()
+    if polling_error is not None:
+        raise polling_error
 
 if __name__ == '__main__':
     try:
