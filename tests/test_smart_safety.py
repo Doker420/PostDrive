@@ -117,6 +117,18 @@ def test_user_safety_guards_are_present():
     assert "acc_spambot_check_" in handlers
     assert "🛡 Проверить спамблок" in handlers
 
+    # Account selection menus must stay bounded even when a user has many
+    # accounts. The selected IDs are kept in FSM data while only one page is
+    # rendered, so moving between pages must not clear the selection.
+    assert "ACCOUNT_PAGE_SIZE = 8" in handlers
+    assert "def _account_page" in handlers
+    assert "accounts_page_" in handlers
+    assert "mass_account_page_" in handlers
+    assert "selected_accounts=selected" in handlers
+    assert "nc_page_" in handlers
+    assert "join_pack_page_" in handlers
+    assert "await render_accounts_screen(message, user_id, page=0)" in handlers
+
     transport = pathlib.Path("telegram_transport.py").read_text(encoding="utf-8")
     assert "MESSAGE_TOO_LONG" in transport
     assert "_split_text" in transport

@@ -695,6 +695,63 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 pass
             await msg.answer(text, reply_markup=reply_markup)
 
+    ACCOUNT_PAGE_SIZE = 8
+
+    def _account_page(items: list, page: int, per_page: int = ACCOUNT_PAGE_SIZE):
+        total_pages = max(1, (len(items) + per_page - 1) // per_page)
+        page = max(0, min(int(page or 0), total_pages - 1))
+        start = page * per_page
+        return items[start:start + per_page], page, total_pages
+
+    async def render_accounts_screen(target, user_id: int, page: int = 0):
+        """Render the account dashboard in pages instead of one huge keyboard."""
+        accounts = db.get_user_accounts(user_id)
+        if not accounts:
+            text = "📱 У вас нет аккаунтов! Добавьте аккаунт в меню «Автопостинг»."
+            if isinstance(target, Message):
+                await target.answer(text)
+            else:
+                await edit_message(target, text)
+            return
+        visible, page, total_pages = _account_page(accounts, page)
+        buttons = []
+        warned = 0
+        for acc in visible:
+            spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
+            status_icon = "🟢" if acc['status'] == 'active' else "🔴"
+            health = acc.get('health') or 'ok'
+            if health == 'cooldown':
+                status_icon, spam_icon = "⏳", "Пауза (FloodWait)"
+                warned += 1
+            elif health == 'restricted':
+                status_icon, spam_icon = "⚠️", "Ограничен Telegram"
+                warned += 1
+            elif health == 'banned':
+                status_icon, spam_icon = "🚫", "Сессия недействительна"
+                warned += 1
+            name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
+            phone = f"({acc['phone']})" if acc.get('phone') else ""
+            buttons.append([InlineKeyboardButton(
+                text=f"{status_icon} {name} {phone} | {spam_icon}",
+                callback_data=f"manage_acc_{acc['id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"accounts_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"accounts_page_{page + 1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        title = f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})\nСтраница: {page + 1}/{total_pages}"
+        if warned:
+            title += f"\n⚠️ Требуют внимания на странице: {warned}"
+        if isinstance(target, Message):
+            await send_photo(target, 'acc.jpg', title, markup)
+        else:
+            await edit_message(target, title, markup)
+
     # ==================== GLOBAL ERROR HANDLER ====================
     @dp.errors()
     async def global_error_handler(event) -> bool:
@@ -1040,7 +1097,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         except Exception as e:
             await message.answer(f"⚠️ Не удалось показать промо: {e}")
 
-    async def show_account_selection(message_or_callback, action: str, state: FSMContext):
+    async def show_account_selection(message_or_callback, action: str, state: FSMContext, page: int = None):
         user_id = message_or_callback.from_user.id if hasattr(message_or_callback, 'from_user') else message_or_callback.message.from_user.id
         accounts = db.get_user_accounts(user_id)
         if not accounts:
@@ -1052,24 +1109,41 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
 
         data = await state.get_data()
-        selected = data.get('selected_accounts', [])
+        selected = list(data.get('selected_accounts') or data.get(f'{action}_account_ids') or [])
+        if page is None:
+            page = data.get(f'{action}_account_page', 0)
+        visible, page, total_pages = _account_page(accounts, page)
 
         await state.set_state(MassActionStates.SELECTING_ACCOUNTS)
-        await state.update_data(action_type=action, selected_accounts=selected)
+        await state.update_data(
+            action_type=action,
+            selected_accounts=selected,
+            **{f'{action}_account_page': page},
+        )
 
         buttons = []
-        for acc in accounts:
+        for acc in visible:
             icon = "☑️" if acc['id'] in selected else "⬜"
             name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
             phone = f"({acc['phone']})" if acc.get('phone') else ""
             buttons.append([InlineKeyboardButton(text=f"{icon} {name} {phone}", callback_data=f"toggle_mass_{action}_{acc['id']}")])
 
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mass_account_page_{action}_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mass_account_page_{action}_{page + 1}"))
+        buttons.append(nav)
         buttons.append([InlineKeyboardButton(text="✅ Далее", callback_data=f"mass_action_next_{action}")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         action_name = "📨 Рассылка" if action == "spam" else "📥 Инвайтинг"
-        text = f"{action_name}\n\nВыберите аккаунты:"
+        text = (
+            f"{action_name}\n\nВыберите аккаунты:\n"
+            f"Выбрано: {len(selected)}\nСтраница: {page + 1}/{total_pages}"
+        )
         photo = 'acc.jpg' if action == 'spam' else 'catalog.jpg'
 
         if isinstance(message_or_callback, Message):
@@ -1194,6 +1268,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("🔒 Для инвайтинга требуется активная подписка.")
             return
         await show_account_selection(message, 'invite', state)
+
+    @dp.callback_query(F.data.startswith('mass_account_page_'))
+    async def mass_account_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        parts = callback.data.split('_')
+        action = parts[3]
+        page = int(parts[4])
+        await show_account_selection(callback, action, state, page=page)
 
     @dp.callback_query(F.data.startswith('toggle_mass_spam_'))
     async def toggle_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
@@ -2320,29 +2402,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("🔒 Для использования аккаунтов требуется активная подписка.")
             return
 
-        accounts = db.get_user_accounts(user_id)
-        buttons = []
-        warned = 0
-        for acc in accounts:
-            spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
-            status_icon = "🟢" if acc['status'] == 'active' else "🔴"
-            health = (acc.get('health') or 'ok')
-            if health == 'cooldown':
-                status_icon, spam_icon, warned = "⏳", "Пауза (FloodWait)", warned + 1
-            elif health == 'restricted':
-                status_icon, spam_icon, warned = "⚠️", "Ограничен Telegram", warned + 1
-            elif health == 'banned':
-                status_icon, spam_icon, warned = "🚫", "Сессия недействительна", warned + 1
-            name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
-            phone = f"({acc['phone']})" if acc.get('phone') else ""
-            buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} | {spam_icon}", callback_data=f"manage_acc_{acc['id']}")])
-
-        buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        _title = f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})"
-        if warned:
-            _title += f"\n\n⚠️ Требуют внимания: {warned}. Откройте аккаунт, чтобы увидеть причину."
-        await send_photo(message, 'acc.jpg', _title, markup)
+        await render_accounts_screen(message, user_id, page=0)
 
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
@@ -2679,18 +2739,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await message.answer("🔒 Для использования аккаунтов требуется активная подписка.")
             return
 
-        accounts = db.get_user_accounts(user_id)
-        buttons = []
-        for acc in accounts:
-            spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
-            status_icon = "🟢" if acc['status'] == 'active' else "🔴"
-            name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
-            phone = f"({acc['phone']})" if acc.get('phone') else ""
-            buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} | {spam_icon}", callback_data=f"manage_acc_{acc['id']}")])
-
-        buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await send_photo(message, 'acc.jpg', f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})", markup)
+        await render_accounts_screen(message, user_id, page=0)
 
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
@@ -3591,18 +3640,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def back_to_accounts_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
         await state.clear()
-        user_id = callback.from_user.id
-        accounts = db.get_user_accounts(user_id)
-        buttons = []
-        for acc in accounts:
-            spam_icon = "🚀 Спамит" if account_manager and account_manager.is_account_spamming(acc['id']) else "⏹ Стоит"
-            status_icon = "🟢" if acc['status'] == 'active' else "🔴"
-            name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
-            phone = f"({acc['phone']})" if acc.get('phone') else ""
-            buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} | {spam_icon}", callback_data=f"manage_acc_{acc['id']}")])
-        buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style= "success", callback_data="add_account_start")])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(callback, f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})", markup)
+        await render_accounts_screen(callback, callback.from_user.id, page=0)
+
+    @dp.callback_query(F.data.startswith('accounts_page_'))
+    async def accounts_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        page = int(callback.data.rsplit('_', 1)[1])
+        await render_accounts_screen(callback, callback.from_user.id, page=page)
 
     @dp.callback_query(F.data.startswith('start_spam_'))
     async def start_spam_callback(callback: CallbackQuery, state: FSMContext):
@@ -4276,7 +4321,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     # ==================== NEUROCOMMENTING ====================
     @dp.message(F.text == '🧠 Нейрокомментинг')
-    async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None):
+    async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None, page: int = 0):
         # ВАЖНО: при вызове из callback сюда передаётся callback.message — его
         # from_user это САМ БОТ, а не пользователь. Без явного user_id проверка
         # подписки выполнялась для id бота и всегда падала с «нет подписки»,
@@ -4289,20 +4334,42 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
 
         accounts = db.get_user_accounts(user_id)
+        if not accounts:
+            await message.answer("📱 У вас нет аккаунтов!")
+            return
+        visible, page, total_pages = _account_page(accounts, page)
         buttons = []
-        for acc in accounts:
+        for acc in visible:
             status_icon = "🟢" if acc['status'] == 'active' else "🔴"
             name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
             phone = f"({acc['phone']})" if acc.get('phone') else ""
             nc = db.get_neurocomment_settings(acc['id'])
             nc_icon = "🧠" if nc and nc.get('enabled') else "⬜"
             buttons.append([InlineKeyboardButton(text=f"{status_icon} {name} {phone} {nc_icon}", callback_data=f"nc_acc_{acc['id']}")])
-        if not buttons:
-            await message.answer("📱 У вас нет аккаунтов!")
-            return
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"nc_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nc_page_{page + 1}"))
+        buttons.append(nav)
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await send_photo(message, 'acc.jpg', f"🧠 <b>Нейрокомментинг</b>\n\nВыберите аккаунт:", markup)
+        await send_photo(
+            message, 'acc.jpg',
+            f"🧠 <b>Нейрокомментинг</b>\n\nВыберите аккаунт:\nСтраница: {page + 1}/{total_pages}",
+            markup
+        )
+
+    @dp.callback_query(F.data.startswith('nc_page_'))
+    async def nc_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        page = int(callback.data.rsplit('_', 1)[1])
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await neurocomment_menu_handler(callback.message, state, callback.from_user.id, page=page)
 
     @dp.callback_query(F.data.startswith('nc_acc_'))
     async def nc_account_callback(callback: CallbackQuery, state: FSMContext):
@@ -6068,10 +6135,40 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         ])
         await edit_message(callback, text, reply_markup=markup)
 
+    async def render_join_pack_account_selection(callback: CallbackQuery, pack_id: int, page: int = 0):
+        accounts = db.get_user_accounts(callback.from_user.id)
+        if not accounts:
+            await _answer_callback(callback, "📱 У вас нет аккаунтов!", show_alert=True)
+            return
+        visible, page, total_pages = _account_page(accounts, page)
+        buttons = []
+        for acc in visible:
+            name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
+            buttons.append([InlineKeyboardButton(
+                text=f"📱 {name}",
+                callback_data=f"join_pack_acc_{pack_id}_{acc['id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"join_pack_page_{pack_id}_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="➡️", callback_data=f"join_pack_page_{pack_id}_{page + 1}"))
+        buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"user_pack_{pack_id}")])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await edit_message(
+            callback,
+            f"📱 <b>Выберите аккаунт для вступления:</b>\nСтраница: {page + 1}/{total_pages}",
+            markup
+        )
+
     @dp.callback_query(lambda c: c.data and c.data.startswith('join_pack_') and c.data.split('_')[2].isdigit())
     async def join_pack_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         await state.clear()
-        pack_id = int(callback.data.split('_')[2])
+        parts = callback.data.split('_')
+        pack_id = int(parts[2])
         pack = db.get_pack(pack_id)
         if not pack:
             await _answer_callback(callback, "❌ Пак не найден!", show_alert=True)
@@ -6091,13 +6188,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             asyncio.create_task(account_manager.run_limited(account_manager.join_chats_batch(account_id, chat_urls, bot, user_id)))
             await _answer_callback(callback, f"🚀 Вступление запущено на аккаунте {accounts[0].get('account_name', f'#{account_id}')}", show_alert=True)
         else:
-            buttons = []
-            for acc in accounts:
-                name = acc.get('account_name') or f"Аккаунт #{acc['id']}"
-                buttons.append([InlineKeyboardButton(text=f"📱 {name}", callback_data=f"join_pack_acc_{pack_id}_{acc['id']}")])
-            buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"user_pack_{pack_id}")])
-            markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-            await edit_message(callback, "📱 <b>Выберите аккаунт для вступления:</b>", markup)
+            await render_join_pack_account_selection(callback, pack_id, page=0)
+
+    @dp.callback_query(F.data.startswith('join_pack_page_'))
+    async def join_pack_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        parts = callback.data.split('_')
+        pack_id = int(parts[3])
+        page = int(parts[4])
+        await state.clear()
+        pack = db.get_pack(pack_id)
+        if not pack:
+            await _answer_callback(callback, "❌ Пак не найден!", show_alert=True)
+            return
+        if not db.get_pack_chats(pack_id):
+            await _answer_callback(callback, "📭 В паке нет чатов!", show_alert=True)
+            return
+        await render_join_pack_account_selection(callback, pack_id, page=page)
 
     @dp.callback_query(F.data.startswith('join_pack_acc_'))
     async def join_pack_acc_callback(callback: CallbackQuery, state: FSMContext):
