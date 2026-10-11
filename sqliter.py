@@ -537,6 +537,8 @@ class DBConnection(metaclass=_PoolBoundMeta):
             session_string TEXT NOT NULL,
             account_name TEXT,
             proxy TEXT DEFAULT '',
+            api_id INTEGER DEFAULT 0,
+            api_hash TEXT DEFAULT '',
             status TEXT DEFAULT 'active',
             post_text TEXT DEFAULT '',
             post_photo TEXT DEFAULT '',
@@ -887,6 +889,8 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN proxy TEXT DEFAULT \'\'')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN api_id INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN api_hash TEXT DEFAULT \'\'')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN post_entities TEXT DEFAULT NULL')
         self._safe_ddl(c, 'ALTER TABLE accounts ADD COLUMN postbot_post_id TEXT DEFAULT \'\'')
         self._safe_ddl(c, 'CREATE UNIQUE INDEX IF NOT EXISTS idx_account_chats_acc_chat ON account_chats(account_id, chat_id)')
@@ -1424,11 +1428,22 @@ class DBConnection(metaclass=_PoolBoundMeta):
                 raise
 
     # ==================== ACCOUNTS ====================
-    def add_account(self, user_id: int, session_string: str, phone: str = "", account_name: str = "", proxy: str = "") -> int:
+    def add_account(
+        self, user_id: int, session_string: str, phone: str = "",
+        account_name: str = "", proxy: str = "", api_id: int = 0,
+        api_hash: str = "",
+    ) -> int:
         self.c.execute('''
-            INSERT INTO accounts (user_id, phone, session_string, account_name, proxy, status, post_text, post_photo, parse_mode, timeout, spam_status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'active', '', '', 'HTML', 5, 0, ?)
-        ''', (user_id, phone, session_string, account_name, proxy, int(time.time())))
+            INSERT INTO accounts (
+                user_id, phone, session_string, account_name, proxy, api_id,
+                api_hash, status, post_text, post_photo, parse_mode, timeout,
+                spam_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', '', '', 'HTML', 5, 0, ?)
+        ''', (
+            user_id, phone, session_string, account_name, proxy,
+            int(api_id or 0), str(api_hash or ''), int(time.time()),
+        ))
         self.conn_ctx.commit()
         return self.c.lastrowid
 
@@ -1439,6 +1454,20 @@ class DBConnection(metaclass=_PoolBoundMeta):
     def get_account(self, account_id: int) -> Optional[Dict[str, Any]]:
         self.c.execute('SELECT * FROM accounts WHERE id = ?', (account_id,))
         return self._dict_fetchone()
+
+    def update_account_api(self, account_id: int, api_id: int, api_hash: str):
+        self.c.execute(
+            'UPDATE accounts SET api_id = ?, api_hash = ? WHERE id = ?',
+            (int(api_id), str(api_hash or ''), int(account_id)),
+        )
+        self.conn_ctx.commit()
+
+    def get_assigned_api_credentials(self) -> List[Dict[str, Any]]:
+        self.c.execute(
+            "SELECT api_id, api_hash FROM accounts "
+            "WHERE COALESCE(api_id, 0) > 0 AND COALESCE(api_hash, '') <> ''"
+        )
+        return self._dict_fetchall()
 
     def update_account_status(self, account_id: int, status: str):
         self.c.execute('UPDATE accounts SET status = ? WHERE id = ?', (status, account_id))

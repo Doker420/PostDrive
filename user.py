@@ -10,6 +10,7 @@ import configparser
 import tempfile
 import shutil
 import zipfile
+import threading
 import aiohttp
 from typing import Optional, Dict, Any, List, Tuple
 from pyrogram import Client, enums, filters
@@ -709,6 +710,39 @@ async def autoresponder_callback(client: Client, message):
     except Exception as e:
         logger.error(f"Error in autoresponder_callback: {e}")
 
+def parse_api_hash_lines(lines):
+    """Parse ``api_id:api_hash`` lines from the optional credential pool.
+
+    The file is intentionally line-oriented: it can contain hundreds of
+    thousands of entries without any fragile JSON/CSV parsing. Blank lines and
+    comments are ignored, malformed entries are skipped, and duplicate pairs
+    are removed while preserving their order. API hashes are never logged.
+    """
+    credentials = []
+    seen = set()
+    for raw_line in lines or ():
+        line = str(raw_line).strip().lstrip('\ufeff')
+        if not line or line.startswith('#'):
+            continue
+        line = line.split('#', 1)[0].strip()
+        if ':' not in line:
+            continue
+        raw_id, raw_hash = line.split(':', 1)
+        raw_id = raw_id.strip()
+        api_hash = raw_hash.strip()
+        try:
+            api_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if api_id <= 0 or not api_hash or any(ch.isspace() for ch in api_hash):
+            continue
+        pair = (api_id, api_hash)
+        if pair not in seen:
+            seen.add(pair)
+            credentials.append(pair)
+    return credentials
+
+
 class AccountSessionManager:
     # ── Configurable limits ───────────────────────────────────────
     MAX_ACTIVE_CLIENTS = int(os.environ.get('MAX_ACTIVE_CLIENTS', '5000'))    # max Pyrogram clients in memory
@@ -716,9 +750,20 @@ class AccountSessionManager:
     MAX_GLOBAL_TASKS   = int(os.environ.get('MAX_GLOBAL_TASKS', '5000'))      # global concurrent task limit
     CLIENT_IDLE_TTL    = int(os.environ.get('CLIENT_IDLE_TTL', '18000'))     # 30 min idle before eviction
 
-    def __init__(self, api_id: int, api_hash: str):
-        self.api_id = api_id
-        self.api_hash = api_hash
+    def __init__(self, api_id: int, api_hash: str, api_hashes_file: str = ''):
+        self.api_id = int(api_id)
+        self.api_hash = str(api_hash or '')
+        configured_pool = api_hashes_file or os.environ.get('API_HASHES_FILE', '')
+        if configured_pool and not os.path.isabs(configured_pool):
+            configured_pool = os.path.join(os.path.dirname(os.path.abspath(__file__)), configured_pool)
+        self.api_hashes_file = configured_pool or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'hashs.txt'
+        )
+        self._api_pool_cache: Optional[List[Tuple[int, str]]] = None
+        self._api_pool_signature = None
+        self._assigned_api_pairs = None
+        self._api_assignment_lock = threading.RLock()
+        self._api_pool_warning_logged = False
         self.active_clients: Dict[int, Client] = {}
         self._client_last_used: Dict[int, float] = {}           # account_id -> last access timestamp
         self._client_owner: Dict[int, int] = {}                 # account_id -> user_id
@@ -762,12 +807,97 @@ class AccountSessionManager:
         # Бот для служебных уведомлений сторожа воркеров
         self._bot = None
 
-    def create_client(self, session_string: str, proxy_str: str = "", name: str = "session") -> Client:
+    def _load_api_pool(self) -> List[Tuple[int, str]]:
+        """Load and cache the optional large ``hashs.txt`` credential pool."""
+        try:
+            stat = os.stat(self.api_hashes_file)
+            signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            signature = None
+        if signature == self._api_pool_signature and self._api_pool_cache is not None:
+            return self._api_pool_cache
+
+        pool = []
+        if signature is not None:
+            try:
+                with open(self.api_hashes_file, 'r', encoding='utf-8-sig') as handle:
+                    pool = parse_api_hash_lines(handle)
+            except (OSError, UnicodeError) as error:
+                logging.warning(
+                    'Не удалось прочитать пул Telegram API (%s): %s',
+                    os.path.basename(self.api_hashes_file), type(error).__name__,
+                )
+        self._api_pool_signature = signature
+        self._api_pool_cache = pool
+        if not pool and not self._api_pool_warning_logged:
+            logging.info(
+                'Пул API не найден или пуст (%s); используется USER_API_ID/USER_API_HASH',
+                os.path.basename(self.api_hashes_file),
+            )
+            self._api_pool_warning_logged = True
+        elif pool:
+            self._api_pool_warning_logged = False
+        return pool
+
+    def bind_account_api(self, account_id: int, account: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
+        """Persist a distinct API pair for an account when a pool is available.
+
+        Existing assignments are never overwritten. If the pool is exhausted,
+        pairs are reused round-robin; this keeps the service functional while a
+        smaller-than-account-count ``hashs.txt`` is being used.
+        """
+        account = account or db.get_account(account_id) or {}
+        try:
+            stored_id = int(account.get('api_id') or 0)
+        except (TypeError, ValueError):
+            stored_id = 0
+        stored_hash = str(account.get('api_hash') or '').strip()
+        if stored_id > 0 and stored_hash:
+            return stored_id, stored_hash
+
+        with self._api_assignment_lock:
+            pool = self._load_api_pool()
+            if not pool:
+                return self.api_id, self.api_hash
+            if self._assigned_api_pairs is None:
+                self._assigned_api_pairs = set()
+                for row in db.get_assigned_api_credentials():
+                    try:
+                        pair = (int(row.get('api_id') or 0), str(row.get('api_hash') or '').strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if pair[0] > 0 and pair[1]:
+                        self._assigned_api_pairs.add(pair)
+
+            selected = next((pair for pair in pool if pair not in self._assigned_api_pairs), None)
+            if selected is None:
+                selected = pool[(max(1, int(account_id)) - 1) % len(pool)]
+            db.update_account_api(account_id, selected[0], selected[1])
+            self._assigned_api_pairs.add(selected)
+            return selected
+
+    def bind_all_account_apis(self) -> int:
+        """Assign pool entries to all existing accounts without starting them."""
+        if not self._load_api_pool():
+            return 0
+        bound = 0
+        pool = self._api_pool_cache or []
+        for account in db.get_all_accounts():
+            before = str(account.get('api_hash') or '').strip()
+            selected = self.bind_account_api(int(account['id']), account)
+            if not before and selected in pool:
+                bound += 1
+        return bound
+
+    def create_client(
+        self, session_string: str, proxy_str: str = "", name: str = "session",
+        api_id: int = None, api_hash: str = None,
+    ) -> Client:
         proxy_dict = parse_proxy_string(proxy_str) if proxy_str else None
         client = Client(
             name=name,
-            api_id=self.api_id,
-            api_hash=self.api_hash,
+            api_id=int(api_id or self.api_id),
+            api_hash=str(api_hash or self.api_hash),
             session_string=session_string,
             in_memory=True,
             proxy=proxy_dict
@@ -1359,7 +1489,14 @@ class AccountSessionManager:
         check_timeout = max(5, int(timeout or SESSION_CHECK_TIMEOUT))
         client = None
         try:
-            client = self.create_client(session_string, proxy_str, name="temp_test")
+            api_id, api_hash = (
+                self.bind_account_api(account_id)
+                if account_id else (self.api_id, self.api_hash)
+            )
+            client = self.create_client(
+                session_string, proxy_str, name="temp_test",
+                api_id=api_id, api_hash=api_hash,
+            )
             await asyncio.wait_for(client.start(), timeout=check_timeout)
             me = await asyncio.wait_for(client.get_me(), timeout=check_timeout)
             info = {
@@ -1968,10 +2105,13 @@ class AccountSessionManager:
             client = None
             proxy_str = account.get('proxy', '') or ''
             try:
+                api_id, api_hash = self.bind_account_api(account_id, account)
                 client = self.create_client(
                     session_string=account['session_string'],
                     proxy_str=proxy_str,
-                    name=f"acc_{account_id}"
+                    name=f"acc_{account_id}",
+                    api_id=api_id,
+                    api_hash=api_hash,
                 )
                 await asyncio.wait_for(client.start(), timeout=CLIENT_START_TIMEOUT)
                 self.active_clients[account_id] = client

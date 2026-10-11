@@ -1,5 +1,6 @@
 # Config with secrets
 config.ini
+hashs.txt
 
 # Databases
 *.db

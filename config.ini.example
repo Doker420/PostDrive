@@ -3,6 +3,7 @@
 # Environment variables override config.ini values (recommended for production).
 #
 # Env vars: BOT_TOKEN, BOT_ADMIN, BOT_USERNAME, USER_API_ID, USER_API_HASH,
+#           API_HASHES_FILE,
 #           CRYPTOBOT_TOKEN, CRYPTOBOT_TESTNET, REDIS_URL,
 #           YOOMONEY_RECEIVER, YOOMONEY_NOTIFICATION_SECRET, YOOMONEY_TOKEN,
 #           YOOMONEY_RUB_PER_USD, YOOMONEY_WEBHOOK_HOST, YOOMONEY_WEBHOOK_PORT,
@@ -27,6 +28,9 @@ MAX_GLOBAL_TASKS = 500
 
 API_ID = ВАШ_API_ID
 API_HASH = ВАШ_API_HASH
+; Optional large pool: one Telegram API pair per line in hashs.txt.
+; Existing accounts are assigned unique pairs until the pool is exhausted.
+API_HASHES_FILE = hashs.txt
 
 [CRYPTOBOT]
 TOKEN = ВАШ_ТОКЕН_КРИПТОБОТА

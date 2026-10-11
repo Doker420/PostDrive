@@ -86,9 +86,23 @@ def test_user_safety_guards_are_present():
     assert "while not slot_ok and slot_reason == 'minimum_delay'" in source
     assert "mode in ('prompt', 'post_prompt', 'auto')" in source
 
+    # The API pool parser accepts large line-oriented files, skips malformed
+    # rows and preserves the first occurrence of duplicate credentials.
+    tree = ast.parse(source)
+    parser_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "parse_api_hash_lines"
+    )
+    parser_ns = {}
+    exec(compile(ast.Module(body=[parser_node], type_ignores=[]), "user.py", "exec"), parser_ns)
+    parse_api_hash_lines = parser_ns["parse_api_hash_lines"]
+    assert parse_api_hash_lines([
+        "123:abc", "123:abc", "bad", "456:def # comment", "0:nope", "789:ghi"
+    ]) == [(123, "abc"), (456, "def"), (789, "ghi")]
+
     # Regression: the Russian healthy reply contains the word SpamBot, so it
     # must not be classified as a restriction merely because of "spam".
-    tree = ast.parse(source)
     classifier_node = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
@@ -129,6 +143,9 @@ def test_user_safety_guards_are_present():
     assert "'proxy': parse_proxy_string(proxy_str)" in source
     assert "check_proxy_endpoint" in source
     assert "async def check_spam_block" in source
+    assert "def parse_api_hash_lines" in source
+    assert "api_hashes_file" in source
+    assert "bind_all_account_apis" in source
     assert "def _classify_spambot_response" in source
     assert "свободен от каких-либо ограничений" in source
     assert "status = _classify_spambot_response(response)" in source
@@ -136,6 +153,11 @@ def test_user_safety_guards_are_present():
     assert "allow_restricted=True" in source
     assert "acc_spambot_check_" in handlers
     assert "🛡 Проверить спамблок" in handlers
+
+    sqliter_source = pathlib.Path("sqliter.py").read_text(encoding="utf-8")
+    assert "api_id INTEGER DEFAULT 0" in sqliter_source
+    assert "def update_account_api" in sqliter_source
+    assert "def get_assigned_api_credentials" in sqliter_source
 
     # Account selection menus must stay bounded even when a user has many
     # accounts. The selected IDs are kept in FSM data while only one page is

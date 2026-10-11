@@ -2505,6 +2505,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2531,6 +2532,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2563,6 +2565,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2617,6 +2620,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     return
                 account_id = db.add_account(user_id, session_str, phone=info.get('phone', ''),
                                              account_name=acc_name, proxy=proxy_str)
+                account_manager.bind_account_api(account_id)
                 await state.clear()
                 await status_msg.edit_text(
                     f"✅ Аккаунт {acc_name} подключен через QR!\n\n"
@@ -2721,6 +2725,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=info.get('phone', ''), account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен через QR!\n\n"
@@ -2842,6 +2847,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2868,6 +2874,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2900,6 +2907,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await state.clear()
             return
         account_id = db.add_account(user_id, session_str, phone=phone, account_name=acc_name, proxy=proxy_str)
+        account_manager.bind_account_api(account_id)
         await state.clear()
         await status_msg.edit_text(
             f"✅ Аккаунт {acc_name} подключен!\n\n"
@@ -2953,6 +2961,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 user_id, session_string, phone=info.get('phone', ''),
                 account_name=acc_name, proxy=proxy_str
             )
+            account_manager.bind_account_api(account_id)
             await status_msg.edit_text(
                 f"✅ <b>Аккаунт {acc_name} подключен!</b>\n\n"
                 "Pyrogram-сессия импортирована и сохранена в безопасном формате.\n"
@@ -3374,6 +3383,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                         account_name=name,
                         proxy=proxy if proxy_lines else '',
                     )
+                    account_manager.bind_account_api(account_id)
                     if proxy_lines:
                         proxy_usage[proxy] = proxy_usage.get(proxy, 0) + 1
                     imported.append(name)

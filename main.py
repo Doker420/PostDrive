@@ -40,6 +40,10 @@ ADMIN = int(os.environ.get('BOT_ADMIN', config['BOT']['ADMIN']))
 USERNAME = os.environ.get('BOT_USERNAME', config['BOT'].get('USERNAME', 'bot')).strip("'\"")
 API_ID = int(os.environ.get('USER_API_ID', config['USER']['API_ID']))
 API_HASH = os.environ.get('USER_API_HASH', config['USER']['API_HASH'])
+API_HASHES_FILE = os.environ.get(
+    'API_HASHES_FILE',
+    config.get('USER', 'API_HASHES_FILE', fallback='hashs.txt'),
+).strip()
 CRYPTO_BOT_TOKEN = os.environ.get('CRYPTOBOT_TOKEN', config.get('CRYPTOBOT', 'TOKEN', fallback=''))
 TESTNET = os.environ.get('CRYPTOBOT_TESTNET', config.get('CRYPTOBOT', 'TESTNET', fallback='False')).lower() in ('true', '1', 'yes')
 TELEGRAM_API_TIMEOUT = _safe_int(
@@ -90,7 +94,13 @@ try:
         )
 except Exception:
     logger.exception("Could not repair stale account health states")
-account_manager = AccountSessionManager(API_ID, API_HASH)
+account_manager = AccountSessionManager(API_ID, API_HASH, api_hashes_file=API_HASHES_FILE)
+try:
+    bound_api_accounts = account_manager.bind_all_account_apis()
+    if bound_api_accounts:
+        logger.info('Назначены отдельные Telegram API для аккаунтов: %s', bound_api_accounts)
+except Exception:
+    logger.exception('Не удалось назначить пул Telegram API аккаунтам')
 
 # ── Payments / legal / miniapp ────────────────────────────────────
 def _cfg(section, key, fallback=''):
