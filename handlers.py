@@ -3462,6 +3462,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
              InlineKeyboardButton(text="📦 Вступить из пака", callback_data=f"acc_join_pack_{account_id}")],
             [InlineKeyboardButton(text="🌐 Прокси", callback_data=f"acc_proxy_{account_id}"),
              InlineKeyboardButton(text="🔎 Проверить прокси", callback_data=f"acc_proxy_check_{account_id}")],
+            [InlineKeyboardButton(text="🛡 Проверить спамблок", callback_data=f"acc_spambot_check_{account_id}")],
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data=f"acc_autoresponder_{account_id}"),
              InlineKeyboardButton(text="👤 Изменить BIO", callback_data=f"acc_bio_{account_id}")],
             [InlineKeyboardButton(text="💬 Ответить в ЛС", callback_data=f"acc_pms_{account_id}")],
@@ -6694,6 +6695,32 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await message.answer(f"🚀 Вступление запущено на {len(account_ids)} аккаунтах! Обрабатываю {len(links)} ссылок...")
 
     # ==================== PROXY MANAGEMENT ====================
+    @dp.callback_query(F.data.startswith('acc_spambot_check_'))
+    async def acc_spambot_check_callback(callback: CallbackQuery):
+        account_id = int(callback.data.rsplit('_', 1)[1])
+        account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(callback.from_user.id):
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        await _answer_callback(callback, "⏳ Проверяю статус через @SpamBot...", show_alert=False)
+        await edit_message(
+            callback,
+            "⏳ <b>Проверка спамблока</b>\n\n"
+            "Отправляю /start в @SpamBot через соединение аккаунта."
+        )
+        ok, result = await account_manager.check_spam_block(
+            account_id, callback.from_user.id
+        )
+        title = "✅ <b>Спамблок не обнаружен</b>" if ok else "⚠️ <b>Проверка SpamBot</b>"
+        await edit_message(
+            callback,
+            f"{title}\n\n{html_escape(result)}",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Проверить ещё раз", callback_data=f"acc_spambot_check_{account_id}")],
+                [InlineKeyboardButton(text="◀️ К аккаунту", callback_data=f"manage_acc_{account_id}")],
+            ])
+        )
+
     @dp.callback_query(F.data.startswith('acc_proxy_check_'))
     async def acc_proxy_check_callback(callback: CallbackQuery):
         account_id = int(callback.data.rsplit('_', 1)[1])

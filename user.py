@@ -979,6 +979,57 @@ class AccountSessionManager:
             self._client_locks[account_id] = asyncio.Lock()
         return self._client_locks[account_id]
 
+    async def _build_tdata_pyrogram_client(
+        self, account: Any, api: Any, name: str, proxy_str: str = '', timeout: int = None,
+    ):
+        """Build a Pyrogram client from an opentele account.
+
+        opentele-ng's bridge forwards newer Pyrogram-only fields such as
+        ``system_lang_code`` and ``lang_pack``. Vanilla ``pyrogram==2.0.106``
+        (used by this project) rejects those fields with ``TypeError`` even
+        though the tdata itself is valid. Export the credentials through the
+        bridge, then pass only constructor arguments supported by the installed
+        Pyrogram distribution. This also keeps the code compatible with
+        pyrofork/kurigram, whose constructor accepts more of the fingerprint.
+        """
+        from inspect import signature
+        from opentele.tl.pyrogram_bridge import export_session_string
+
+        account_api = getattr(account, 'api', None) or api
+        export_timeout = max(5, int(timeout or SESSION_CHECK_TIMEOUT))
+        session_string = await asyncio.wait_for(
+            export_session_string(
+                api_id=int(getattr(account_api, 'api_id')),
+                dc_id=int(getattr(account, 'MainDcId')),
+                auth_key=getattr(getattr(account, 'authKey'), 'key'),
+                user_id=int(getattr(account, 'UserId')),
+                name=name,
+            ),
+            timeout=export_timeout,
+        )
+        params = {
+            'api_id': getattr(account_api, 'api_id'),
+            'api_hash': getattr(account_api, 'api_hash'),
+            'app_version': getattr(account_api, 'app_version', None),
+            'device_model': getattr(account_api, 'device_model', None),
+            'system_version': getattr(account_api, 'system_version', None),
+            'lang_code': getattr(account_api, 'lang_code', None),
+            'system_lang_code': getattr(account_api, 'system_lang_code', None),
+            'lang_pack': getattr(account_api, 'lang_pack', None),
+            'proxy': parse_proxy_string(proxy_str) if proxy_str else None,
+        }
+        supported = signature(Client.__init__).parameters
+        params = {
+            key: value for key, value in params.items()
+            if key in supported and value is not None
+        }
+        return Client(
+            name,
+            session_string=session_string,
+            in_memory=True,
+            **params,
+        )
+
     async def get_tdata_account_count(self, tdata_path: str) -> Tuple[int, Optional[str]]:
         """Read how many authorized accounts a tdata folder contains."""
         if not tdata_path or not os.path.isdir(tdata_path):
@@ -1029,17 +1080,16 @@ class AccountSessionManager:
                 return False, None, None, f'В tdata нет аккаунта с индексом {account_index + 1}'
             # TDesktop.ToPyrogram() always selects mainAccount. Calling the
             # account bridge directly is required for secondary desktop
-            # accounts in the same tdata directory.
+            # accounts in the same tdata directory. Build the client through a
+            # compatibility wrapper because vanilla Pyrogram rejects fields
+            # added by the newer opentele bridge.
             account = accounts[account_index]
-            # Pass the selected proxy into the bridge itself: starting the
-            # converted client without it would silently make a direct
-            # Telegram connection before the later session-string check.
-            proxy_config = parse_proxy_string(proxy_str) if proxy_str else None
-            client = await account.ToPyrogram(
-                name=f'postdrive_tdata_{account_index}',
-                api=API.TelegramDesktop,
-                in_memory=True,
-                proxy=proxy_config,
+            client = await self._build_tdata_pyrogram_client(
+                account,
+                API.TelegramDesktop,
+                f'postdrive_tdata_{account_index}',
+                proxy_str=proxy_str,
+                timeout=timeout,
             )
             await asyncio.wait_for(client.start(), timeout=max(5, int(timeout or SESSION_CHECK_TIMEOUT)))
             me = await asyncio.wait_for(
@@ -1069,8 +1119,17 @@ class AccountSessionManager:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logging.error('tdata import failed: %s', type(error).__name__)
-            return False, None, None, 'Не удалось прочитать tdata. Проверьте архив и локальный пароль Telegram Desktop.'
+            logging.error('tdata import failed: %s: %s', type(error).__name__, error, exc_info=True)
+            if isinstance(error, TypeError):
+                return (
+                    False, None, None,
+                    'Несовместимость конвертера tdata с установленным Pyrogram: '
+                    f'{str(error)[:240]}'
+                )
+            return False, None, None, (
+                'Не удалось прочитать tdata. Проверьте архив, локальный пароль '
+                'Telegram Desktop и совместимость зависимостей.'
+            )
         finally:
             if client is not None:
                 try:
@@ -1716,6 +1775,82 @@ class AccountSessionManager:
         except Exception as error:
             return False, f'{type(error).__name__}: прокси не отвечает'
 
+    async def check_spam_block(
+        self, account_id: int, user_id: int = None, timeout: int = 12,
+    ) -> Tuple[bool, str]:
+        """Ask Telegram's @SpamBot about the account restriction status.
+
+        This is an informational check through the account's configured proxy.
+        A positive restriction result is persisted in account health so the
+        existing task guards stop bulk actions until the user resolves it.
+        """
+        account = db.get_account(account_id)
+        if not account:
+            return False, 'Аккаунт не найден'
+        if user_id is not None and int(account.get('user_id') or 0) != int(user_id):
+            return False, 'Доступ запрещён'
+
+        client, error = await self.get_or_start_client(
+            account_id, user_id, allow_restricted=True
+        )
+        if not client:
+            return False, error or 'Не удалось подключить аккаунт'
+
+        try:
+            sent = await asyncio.wait_for(
+                client.send_message('SpamBot', '/start'), timeout=CLIENT_START_TIMEOUT
+            )
+            sent_id = int(getattr(sent, 'id', 0) or 0)
+            deadline = time.monotonic() + max(3, int(timeout))
+            response = None
+
+            async def read_response():
+                async for item in client.get_chat_history('SpamBot', limit=10):
+                    item_id = int(getattr(item, 'id', 0) or 0)
+                    text = (getattr(item, 'text', None) or getattr(item, 'caption', None) or '').strip()
+                    if item_id > sent_id and text:
+                        return text
+                return ''
+
+            while time.monotonic() < deadline:
+                response = await asyncio.wait_for(read_response(), timeout=CLIENT_START_TIMEOUT)
+                if response:
+                    break
+                await asyncio.sleep(1)
+
+            if not response:
+                return False, 'SpamBot не прислал ответ за отведённое время'
+
+            normalized = response.casefold()
+            clear_markers = (
+                'no limits', 'no limitation', 'not limited', 'good news',
+                'ограничений нет', 'ограничения отсутствуют', 'лимитов нет',
+            )
+            restricted_markers = (
+                'limited', 'limitation', 'spam', 'can\'t send', 'cannot send',
+                'ограничен', 'ограничение', 'спам', 'не можете отправлять',
+            )
+            if any(marker in normalized for marker in clear_markers):
+                health = db.get_account_health(account_id)
+                if (
+                    health.get('health') == db.HEALTH_RESTRICTED
+                    and str(health.get('health_reason') or '').startswith('SpamBot:')
+                ):
+                    db.clear_account_health(account_id)
+                return True, response[:1000]
+
+            if any(marker in normalized for marker in restricted_markers):
+                reason = f'SpamBot: {response[:260]}'
+                db.set_account_health(account_id, db.HEALTH_RESTRICTED, reason)
+                return False, response[:1000]
+
+            return False, f'Не удалось однозначно определить статус SpamBot:\n{response[:900]}'
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.error('SpamBot check failed for account %s: %s', account_id, error, exc_info=True)
+            return False, f'Ошибка проверки SpamBot: {type(error).__name__}'
+
     async def check_account_proxy(self, account_id: int, user_id: int = None):
         """Проверяет прокси аккаунта одним bounded-запуском.
 
@@ -1748,7 +1883,9 @@ class AccountSessionManager:
             return False, 'Прокси не работает и удалён из аккаунта. Подключите новый адрес.'
         return False, error
 
-    async def get_or_start_client(self, account_id: int, user_id: int = None) -> Tuple[Optional[Client], Optional[str]]:
+    async def get_or_start_client(
+        self, account_id: int, user_id: int = None, allow_restricted: bool = False,
+    ) -> Tuple[Optional[Client], Optional[str]]:
         """Получить клиент без бесконечных повторов подключения.
 
         Один вызов делает максимум одну попытку восстановления. Если транспорт
@@ -1763,7 +1900,9 @@ class AccountSessionManager:
 
             usable, health_reason = db.is_account_usable(account_id)
             if not usable:
-                return None, health_reason
+                health = db.get_account_health(account_id)
+                if not (allow_restricted and health.get('health') == db.HEALTH_RESTRICTED):
+                    return None, health_reason
 
             if account_id in self.active_clients:
                 client = self.active_clients[account_id]

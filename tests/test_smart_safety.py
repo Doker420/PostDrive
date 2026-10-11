@@ -104,9 +104,15 @@ def test_user_safety_guards_are_present():
     assert "максимум к 5 аккаунтам" in handlers
     assert "find_duplicate_account" in handlers
     assert "get_tdata_account_count" in source
+    assert "_build_tdata_pyrogram_client" in source
+    assert "supported = signature(Client.__init__).parameters" in source
     assert "import_tdata_session" in source
-    assert "proxy=proxy_config" in source
+    assert "'proxy': parse_proxy_string(proxy_str)" in source
     assert "check_proxy_endpoint" in source
+    assert "async def check_spam_block" in source
+    assert "allow_restricted=True" in source
+    assert "acc_spambot_check_" in handlers
+    assert "🛡 Проверить спамблок" in handlers
 
 
 if __name__ == "__main__":
