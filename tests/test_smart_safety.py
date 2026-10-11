@@ -80,6 +80,9 @@ def test_user_safety_guards_are_present():
     assert "'privacy': 0" in source
     assert "'already_member': 0" in source
     assert "raise_on_skip=True" in source
+    assert "privacy premium required" in source
+    assert "minimum_delay is a pacing rule" in source
+    assert "while not slot_ok and slot_reason == 'minimum_delay'" in source
     assert "mode in ('prompt', 'post_prompt', 'auto')" in source
 
     handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")

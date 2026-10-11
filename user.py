@@ -92,6 +92,7 @@ def _is_target_skip_error(error: BaseException) -> bool:
         'user already participant', 'already a participant',
         'user not mutual contact', 'user id invalid', 'peer id invalid',
         'input user deactivated', 'user is blocked', 'user restricted',
+        'privacy premium required', 'premium required',
     ))
 
 
@@ -3031,16 +3032,32 @@ class AccountSessionManager:
                         continue
 
                     if selected_postbot_id:
-                        slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
-                        if not slot_ok:
-                            # This target has not been sent. Return it to the
-                            # shared queue so another account can process it.
-                            requeue = True
-                            account_stopped = True
-                            logging.warning(
-                                '[%s] лимит безопасности %s, аккаунт исключён из очереди',
-                                acc_name, slot_reason
+                        # minimum_delay is a pacing rule, not an account
+                        # failure. Wait for this account and retry the same
+                        # target; otherwise every worker sends exactly one
+                        # PostBot message and then leaves the queue, which
+                        # makes the mailing look finished prematurely. Hourly
+                        # and daily limits still remove the account from this
+                        # run and return the target to another worker.
+                        while True:
+                            slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
+                            if slot_ok:
+                                break
+                            if slot_reason != 'minimum_delay' or shared_state.get('stop_requested'):
+                                requeue = True
+                                account_stopped = True
+                                logging.warning(
+                                    '[%s] лимит безопасности %s, аккаунт исключён из очереди',
+                                    acc_name, slot_reason
+                                )
+                                break
+                            wait_for = max(1, int(slot_wait or 1))
+                            logging.info(
+                                '[%s] minimum_delay: следующий PostBot слот через %ss',
+                                acc_name, wait_for
                             )
+                            await asyncio.sleep(wait_for)
+                        if not slot_ok:
                             break
 
                     text_to_send = post_text
@@ -5977,8 +5994,8 @@ class AccountSessionManager:
                     # публикацией аккаунта: применяем persistent budget и не
                     # обходим hourly/daily safety limits через другой маршрут.
                     slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
-                    if not slot_ok and slot_reason == 'minimum_delay':
-                        await asyncio.sleep(max(5, min(slot_wait, 3600)))
+                    while not slot_ok and slot_reason == 'minimum_delay':
+                        await asyncio.sleep(max(1, int(slot_wait or 1)))
                         slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
                     if not slot_ok:
                         errors += 1
