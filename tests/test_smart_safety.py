@@ -117,6 +117,12 @@ def test_user_safety_guards_are_present():
     assert "acc_spambot_check_" in handlers
     assert "🛡 Проверить спамблок" in handlers
 
+    transport = pathlib.Path("telegram_transport.py").read_text(encoding="utf-8")
+    assert "MESSAGE_TOO_LONG" in transport
+    assert "_split_text" in transport
+    assert "_utf16_units" in transport
+    assert "_CAPTION_SAFE_LIMIT" in transport
+
 
 if __name__ == "__main__":
     test_persistent_autopost_limits_and_warmup_state()
