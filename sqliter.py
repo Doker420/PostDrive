@@ -2262,6 +2262,15 @@ class DBConnection(metaclass=_PoolBoundMeta):
         )
         return self._dict_fetchall()
 
+    def count_operation_report_items(self, report_id: int, result: str = None) -> int:
+        query = 'SELECT COUNT(*) FROM operation_report_items WHERE report_id = ?'
+        params = [int(report_id)]
+        if result is not None:
+            query += ' AND result = ?'
+            params.append(str(result))
+        self.c.execute(query, tuple(params))
+        return int(self.c.fetchone()[0] or 0)
+
     # ==================== PARSED USERS ====================
     def _migrate_parsed_users_unique(self, c):
         """Чинит UNIQUE-ограничение таблицы parsed_users.

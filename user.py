@@ -706,6 +706,7 @@ class AccountSessionManager:
         # can still be viewed or downloaded after a restart.
         self.active_operation_reports: Dict[int, Dict[str, Any]] = {}
         self.active_invite_jobs: Dict[int, Dict[str, Any]] = {}
+        self.active_spam_jobs: Dict[int, Dict[str, Any]] = {}
         self.active_comment_report_ids: Dict[int, int] = {}
         self._operation_status_last_update: Dict[int, float] = {}
         self._autopost_notified: Dict[int, set] = {}
@@ -2402,16 +2403,22 @@ class AccountSessionManager:
 
     # ==================== OPERATION STATUS / REPORTS ====================
     @staticmethod
-    def _operation_status_markup(report_id: int, running: bool = True):
+    def _operation_status_markup(report_id: int, running: bool = True,
+                                 has_remaining: bool = False):
         if running:
             return InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🛑 Остановить задачу", callback_data=f"operation_stop_{report_id}")],
                 [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"operation_report_{report_id}")],
             ])
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"operation_report_{report_id}"),
-             InlineKeyboardButton(text="📥 Скачать", callback_data=f"operation_download_{report_id}")],
-        ])
+        buttons = [[
+            InlineKeyboardButton(text="📊 Открыть отчёт", callback_data=f"operation_report_{report_id}"),
+            InlineKeyboardButton(text="📥 Скачать", callback_data=f"operation_download_{report_id}"),
+        ]]
+        if has_remaining:
+            buttons.append([
+                InlineKeyboardButton(text="📥 Скачать остаток", callback_data=f"operation_remaining_{report_id}")
+            ])
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
 
     @staticmethod
     def _operation_status_text(report: dict) -> str:
@@ -2424,6 +2431,7 @@ class AccountSessionManager:
         }
         operation_labels = {
             'invite': 'Инвайтинг',
+            'spam': 'Рассылка',
             'neurocomment': 'Нейрокомментинг',
         }
         total = int(report.get('total') or 0)
@@ -2431,6 +2439,7 @@ class AccountSessionManager:
         success = int(report.get('success_count') or 0)
         skipped = int(report.get('skipped_count') or 0)
         errors = int(report.get('error_count') or 0)
+        remaining = int(report.get('remaining_count') or 0)
         if total > 0:
             current = min(processed, total)
             percent = min(100, int(current * 100 / total))
@@ -2439,6 +2448,10 @@ class AccountSessionManager:
             progress = f"[{bar}] {percent}% ({current}/{total})"
         else:
             progress = f"[⏳] обработано: {processed}"
+        remaining_line = (
+            f"📥 Осталось для скачивания: {remaining}\n"
+            if report.get('operation_type') == 'spam' and remaining else ''
+        )
         return (
             f"📊 <b>{operation_labels.get(report.get('operation_type'), report.get('title') or 'Задача')}</b>\n\n"
             f"Статус: <b>{status_labels.get(report.get('status'), report.get('status', 'unknown'))}</b>\n"
@@ -2448,7 +2461,8 @@ class AccountSessionManager:
             f"🔒 Privacy: {int(report.get('privacy_count') or 0)} · "
             f"уже участники: {int(report.get('already_member_count') or 0)}\n"
             f"❌ Ошибок: {errors} · ошибок аккаунта: "
-            f"{int(report.get('account_error_count') or 0)}\n\n"
+            f"{int(report.get('account_error_count') or 0)}\n"
+            f"{remaining_line}\n"
             "Подробный отчёт сохраняется и доступен после завершения."
         )
 
@@ -2464,11 +2478,16 @@ class AccountSessionManager:
         if not force and now - self._operation_status_last_update.get(report_id, 0) < 2:
             return
         self._operation_status_last_update[report_id] = now
+        if report.get('operation_type') == 'spam':
+            report = dict(report)
+            report['remaining_count'] = db.count_operation_report_items(report_id, 'remaining')
         message = entry.get('status_message')
         bot = bot or entry.get('bot') or self._bot
         user_id = user_id or entry.get('user_id') or report.get('user_id')
         markup = self._operation_status_markup(
-            report_id, report.get('status') == 'running'
+            report_id,
+            report.get('status') == 'running',
+            bool(report.get('remaining_count')),
         )
         try:
             if message:
@@ -2507,24 +2526,32 @@ class AccountSessionManager:
                                        result: str, detail: str = ''):
         detail_text = str(detail or '').lower()
         if result == 'success':
-            success, skipped, errors = 1, 0, 0
+            processed, success, skipped, errors = 1, 1, 0, 0
         elif result == 'skipped':
-            success, skipped, errors = 0, 1, 0
+            processed, success, skipped, errors = 1, 0, 1, 0
+        elif result == 'remaining':
+            # A remainder was never attempted. Keep it out of the processed
+            # counter so the status bar can show the exact downloadable tail.
+            processed, success, skipped, errors = 0, 0, 0, 0
         else:
-            success, skipped, errors = 0, 0, 1
+            processed, success, skipped, errors = 1, 0, 0, 1
         privacy = int('privacy' in detail_text)
         already_member = int(
             'already' in detail_text or 'participant' in detail_text
         )
         account_error = int(
-            'аккаунт' in detail_text or 'account' in detail_text
+            any(marker in detail_text for marker in (
+                'аккаунт', 'account', 'floodwait', 'peerflood',
+                'временноe ограничение', 'временное ограничение',
+                'сессия недоступна', 'сессия отозвана',
+            ))
         ) if result == 'error' else 0
         db.add_operation_report_item(
             report_id, account_id=account_id, target=target,
             target_title=target_title, result=result, detail=detail
         )
         db.update_operation_report(
-            report_id, processed_delta=1, success_delta=success,
+            report_id, processed_delta=processed, success_delta=success,
             skipped_delta=skipped, error_delta=errors,
             privacy_delta=privacy, already_member_delta=already_member,
             account_error_delta=account_error,
@@ -2564,6 +2591,17 @@ class AccountSessionManager:
                         task.cancel()
             await self._finish_operation_report(report_id, 'stopped')
             return True, 'Инвайтинг остановлен'
+        if operation == 'spam':
+            job = self.active_spam_jobs.get(report_id)
+            if job:
+                job['stop_requested'] = True
+                if job.get('shared_state'):
+                    job['shared_state']['stop_requested'] = True
+                for task in list(job.get('tasks', set())):
+                    if task and not task.done():
+                        task.cancel()
+            await self._finish_operation_report(report_id, 'stopped')
+            return True, 'Рассылка остановлена'
         if operation == 'neurocomment':
             await self.stop_neurocomment(int(report.get('account_id') or 0), user_id)
             if db.get_operation_report(report_id, user_id=user_id).get('status') == 'running':
@@ -2571,6 +2609,273 @@ class AccountSessionManager:
             return True, 'Нейрокомментинг остановлен'
         await self._finish_operation_report(report_id, 'stopped')
         return True, 'Задача остановлена'
+
+    async def start_spam_job(self, account_ids: list, targets: list, bot, user_id: int,
+                             mode: str = 'post', custom_text: str = '',
+                             custom_entities: str = None, delay_min: int = 30,
+                             delay_max: int = 90, postbot_id: str = ''):
+        """Run a multi-account mailing with one status bar and a shared queue.
+
+        An account that receives FloodWait/PeerFlood leaves the queue. Other
+        accounts continue taking targets. Unclaimed targets are persisted as
+        ``remaining`` report items and can be downloaded after completion.
+        """
+        account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids if account_id))
+        targets = list(targets or [])
+        if not account_ids or not targets:
+            return 0, 'Нет аккаунтов или целей для рассылки'
+        if self._running_tasks >= self._max_concurrent_tasks:
+            return 0, f'Достигнут глобальный лимит одновременных задач ({self._max_concurrent_tasks})'
+        if not await self._acquire_user_quota(user_id):
+            return 0, f'Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER})'
+
+        report_id = await self._open_operation_report(
+            user_id, 'spam', 'Рассылка', total=len(targets), bot=bot
+        )
+        if (db.get_operation_report(report_id) or {}).get('status') != 'running':
+            await self._release_user_quota(user_id)
+            return report_id, 'Задача уже остановлена'
+
+        work_queue = asyncio.Queue()
+        for target in targets:
+            work_queue.put_nowait(target)
+        shared_state = {
+            'report_id': report_id,
+            'work_queue': work_queue,
+            'workers_remaining': len(account_ids),
+            'stats_lock': asyncio.Lock(),
+            'stop_requested': False,
+        }
+        job = {
+            'tasks': set(), 'shared_state': shared_state,
+            'user_id': user_id, 'stop_requested': False,
+        }
+        self.active_spam_jobs[report_id] = job
+        for account_id in account_ids:
+            task = asyncio.create_task(
+                self.run_limited(self._spam_shared_worker(
+                    account_id, work_queue, shared_state, bot, user_id,
+                    mode, custom_text, custom_entities, delay_min, delay_max,
+                    postbot_id
+                )),
+                name=f'spam-{report_id}-{account_id}'
+            )
+            job['tasks'].add(task)
+        return report_id, ''
+
+    async def _spam_shared_worker(self, account_id: int, work_queue, shared_state: dict,
+                                  bot, user_id: int, mode: str, custom_text: str,
+                                  custom_entities: str, delay_min: int, delay_max: int,
+                                  postbot_id: str):
+        """Process the shared mailing queue for one account only."""
+        report_id = int(shared_state.get('report_id') or 0)
+        account = db.get_account(account_id) or {}
+        acc_name = account.get('account_name') or f'Аккаунт #{account_id}'
+        notifications_hidden = account.get('notifications_hidden', 0) == 1
+        local_success = 0
+        local_errors = 0
+        account_stopped = False
+
+        async def record(target, result, detail=''):
+            if report_id:
+                await self._record_operation_result(
+                    report_id, account_id, str(target), '', result, detail
+                )
+
+        try:
+            if not account:
+                account_stopped = True
+                return
+            client, err = await self.get_or_start_client(account_id)
+            if not client:
+                account_stopped = True
+                if bot and not notifications_hidden:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f'⚠️ [{acc_name}] Аккаунт исключён из рассылки: {err}'
+                    )
+                return
+
+            selected_postbot_id = normalize_postbot_id(postbot_id)
+            if mode == 'postbot' and not selected_postbot_id:
+                selected_postbot_id = normalize_postbot_id(account.get('postbot_post_id', ''))
+            post_text = account.get('post_text', '') if mode == 'post' else custom_text
+            post_photo = account.get('post_photo', '') if mode == 'post' else ''
+            if mode == 'postbot' and not selected_postbot_id:
+                account_stopped = True
+                if bot and not notifications_hidden:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f'⚠️ [{acc_name}] Нет ID поста @PostBot — аккаунт исключён'
+                    )
+                return
+            if not post_text and not selected_postbot_id:
+                account_stopped = True
+                if bot and not notifications_hidden:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f'⚠️ [{acc_name}] Не задан текст поста — аккаунт исключён'
+                    )
+                return
+
+            entities = None
+            entities_json = account.get('post_entities') if mode == 'post' else custom_entities
+            if entities_json:
+                try:
+                    entities = await convert_entities_to_pyrogram(entities_json, client)
+                except Exception as exc:
+                    logging.warning(f'[{acc_name}] Не удалось применить entities: {exc}')
+                    entities = None
+
+            while not shared_state.get('stop_requested'):
+                try:
+                    target = work_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                requeue = False
+                try:
+                    if isinstance(target, int):
+                        peer = target
+                    elif isinstance(target, str):
+                        peer = target if target.startswith('@') else f'@{target}'
+                    else:
+                        await record(target, 'skipped', 'Некорректная цель')
+                        continue
+
+                    if selected_postbot_id:
+                        slot_ok, slot_wait, slot_reason = db.reserve_autopost_slot(account_id)
+                        if not slot_ok:
+                            # This target has not been sent. Return it to the
+                            # shared queue so another account can process it.
+                            requeue = True
+                            account_stopped = True
+                            logging.warning(
+                                '[%s] лимит безопасности %s, аккаунт исключён из очереди',
+                                acc_name, slot_reason
+                            )
+                            break
+
+                    text_to_send = post_text
+                    entities_to_send = entities
+                    if text_to_send and '{rand}' in text_to_send:
+                        text_to_send = re.sub(
+                            r'\{rand\}',
+                            lambda _m: ''.join(random.choices(
+                                'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=6
+                            )),
+                            text_to_send,
+                        )
+                    if text_to_send and '{' in text_to_send and '|' in text_to_send:
+                        text_to_send = re.sub(
+                            r'\{([^{}]*\|[^{}]*)\}',
+                            lambda m: random.choice(m.group(1).split('|')),
+                            text_to_send,
+                        )
+                    if entities_to_send and text_to_send != post_text:
+                        entities_to_send = None
+
+                    if selected_postbot_id:
+                        await self.send_via_postbot(
+                            client, peer, selected_postbot_id, account_id,
+                            bot=bot, user_id=user_id,
+                            notify=not notifications_hidden,
+                        )
+                    elif post_photo and os.path.exists(post_photo) and mode == 'post':
+                        await self.tg_call(
+                            lambda: client.send_photo(
+                                peer, post_photo, caption=text_to_send,
+                                caption_entities=entities_to_send if entities_to_send else None,
+                                parse_mode=None,
+                            ),
+                            account_id=account_id, bot=bot, user_id=user_id,
+                            description=f'spam -> {peer}',
+                            notify=not notifications_hidden,
+                            raise_on_skip=True,
+                        )
+                    else:
+                        await self.tg_call(
+                            lambda: client.send_message(
+                                peer, text_to_send,
+                                entities=entities_to_send if entities_to_send else None,
+                                parse_mode=None,
+                            ),
+                            account_id=account_id, bot=bot, user_id=user_id,
+                            description=f'spam -> {peer}',
+                            notify=not notifications_hidden,
+                            raise_on_skip=True,
+                        )
+                    local_success += 1
+                    await record(target, 'success')
+                except TargetSkipError as exc:
+                    await record(target, 'skipped', str(exc))
+                except AccountBlockedError as exc:
+                    # Do not cancel sibling account workers. The current target
+                    # is recorded once; all later unclaimed targets remain
+                    # available for another account or the remainder download.
+                    account_stopped = True
+                    local_errors += 1
+                    await record(target, 'error', str(exc))
+                    logging.warning(f'⏸ [{acc_name}] исключён после ограничения: {exc}')
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    local_errors += 1
+                    await record(target, 'error', str(exc))
+                    logging.warning(
+                        f'⚠️ [{acc_name}] ошибка цели {target}: '
+                        f'{type(exc).__name__}: {exc}'
+                    )
+                finally:
+                    if requeue:
+                        work_queue.put_nowait(target)
+                    work_queue.task_done()
+
+                if not shared_state.get('stop_requested'):
+                    lo, hi = sorted((max(1, int(delay_min)), max(1, int(delay_max))))
+                    await asyncio.sleep(random.randint(lo, hi))
+        finally:
+            if bot and not notifications_hidden and account_stopped:
+                await self._safe_bot_message(
+                    bot, user_id,
+                    f'⏸ [{acc_name}] исключён из текущей рассылки; другие аккаунты продолжают работу.'
+                )
+            await self._spam_job_worker_done(shared_state)
+
+    async def _spam_job_worker_done(self, shared_state: dict):
+        report_id = int(shared_state.get('report_id') or 0)
+        if not report_id:
+            return
+        shared_state['workers_remaining'] = max(
+            0, int(shared_state.get('workers_remaining', 1)) - 1
+        )
+        if shared_state['workers_remaining'] != 0:
+            return
+        job = self.active_spam_jobs.get(report_id, {})
+        report = db.get_operation_report(report_id)
+        if report and report.get('status') == 'running':
+            if job.get('stop_requested'):
+                status = 'stopped'
+            else:
+                # No worker can consume these targets now. Persist them as
+                # unattempted so the user can download the exact remainder.
+                queue = shared_state.get('work_queue')
+                while queue is not None:
+                    try:
+                        target = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    try:
+                        await self._record_operation_result(
+                            report_id, 0, str(target), '', 'remaining',
+                            'Не обработано: аккаунты получили FloodWait или недоступны'
+                        )
+                    finally:
+                        queue.task_done()
+                status = 'finished'
+            await self._finish_operation_report(report_id, status)
+        self.active_spam_jobs.pop(report_id, None)
+        await self._release_user_quota(int(job.get('user_id') or 0))
 
     async def start_invite_job(self, account_ids: list, chat_id: str, users: list,
                                bot, user_id: int, auto_join: bool = True):

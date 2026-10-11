@@ -1506,29 +1506,20 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await answer_to.answer("❌ Не выбрано ни одного аккаунта.")
             return
 
-        await answer_to.answer(
-            f"🚀 Запускаю рассылку на {len(unique_targets)} уникальных целей "
-            f"из {len(account_ids)} аккаунтов.\n"
-            f"Пауза между сообщениями: {delay_min}–{delay_max} сек.")
-
-        per_account = len(unique_targets) // len(account_ids)
-        remainder = len(unique_targets) % len(account_ids)
-        start_idx = 0
-        for i, account_id in enumerate(account_ids):
-            end_idx = start_idx + per_account + (1 if i < remainder else 0)
-            account_targets = unique_targets[start_idx:end_idx]
-            start_idx = end_idx
-            if account_targets:
-                asyncio.create_task(account_manager.run_limited(
-                    account_manager.spam_to_users(
-                        account_id, account_targets, bot, user_id,
-                        mode=mode, custom_text=custom_text,
-                        custom_entities=custom_entities,
-                        delay_min=delay_min, delay_max=delay_max,
-                        postbot_id=postbot_id)))
+        report_id, start_error = await account_manager.start_spam_job(
+            account_ids, unique_targets, bot, user_id,
+            mode=mode, custom_text=custom_text,
+            custom_entities=custom_entities,
+            delay_min=delay_min, delay_max=delay_max,
+            postbot_id=postbot_id,
+        )
+        if start_error:
+            await answer_to.answer(f"❌ Не удалось запустить рассылку: {start_error}")
+            return
 
         await answer_to.answer(
-            "✅ Рассылка запущена в фоне. Вы получите уведомления о прогрессе и результате.",
+            f"✅ Рассылка запущена в фоне: задача #{report_id}.\n"
+            "Прогресс, остановка, отчёт и скачивание остатка доступны в статусном сообщении.",
             reply_markup=main_menu_keyboard(user_id))
 
     @dp.callback_query(F.data == "spam_postbot_mode", MassActionStates.WAITING_TARGETS)
@@ -3366,11 +3357,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
             return
         await _answer_callback(callback)
+        if report.get('operation_type') == 'spam':
+            report = dict(report)
+            report['remaining_count'] = db.count_operation_report_items(report_id, 'remaining')
         await edit_message(
             callback,
             account_manager._operation_status_text(report),
             account_manager._operation_status_markup(
-                report_id, report.get('status') == 'running'
+                report_id,
+                report.get('status') == 'running',
+                bool(report.get('remaining_count')),
             )
         )
 
@@ -3402,6 +3398,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
         if report.get('finished_at'):
             text += f"🏁 Завершена: {format_date(report.get('finished_at', 0))}\n"
+        remaining_count = 0
+        if report.get('operation_type') == 'spam':
+            remaining_count = db.count_operation_report_items(report_id, 'remaining')
+            if remaining_count:
+                text += f"📥 Осталось для скачивания: {remaining_count}\n"
         if items:
             text += "\n<b>Последние результаты:</b>\n"
             for item in items[-8:]:
@@ -3414,6 +3415,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         buttons = [
             [InlineKeyboardButton(text="📥 Скачать CSV", callback_data=f"operation_download_{report_id}")],
         ]
+        if remaining_count:
+            buttons.append([
+                InlineKeyboardButton(text="📥 Скачать остаток", callback_data=f"operation_remaining_{report_id}")
+            ])
         if report.get('status') == 'running':
             buttons.append([InlineKeyboardButton(text="🛑 Остановить задачу", callback_data=f"operation_stop_{report_id}")])
             buttons.append([InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"operation_report_{report_id}")])
@@ -3449,6 +3454,38 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
         await _answer_callback(callback, "📥 Отчёт готов")
         await callback.message.answer_document(file, caption=f"📊 Отчёт задачи #{report_id}")
+
+    @dp.callback_query(F.data.startswith('operation_remaining_'))
+    async def operation_remaining_callback(callback: CallbackQuery):
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        report = db.get_operation_report(report_id, callback.from_user.id)
+        if not report:
+            await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
+            return
+        items = [
+            item for item in db.get_operation_report_items(report_id, limit=50000)
+            if item.get('result') == 'remaining'
+        ]
+        if not items:
+            await _answer_callback(callback, "✅ Остаток отсутствует", show_alert=True)
+            return
+        targets = []
+        seen = set()
+        for item in items:
+            target = str(item.get('target') or '').strip()
+            if target and target not in seen:
+                seen.add(target)
+                targets.append(target)
+        payload = ('\n'.join(targets) + '\n').encode('utf-8')
+        file = BufferedInputFile(
+            payload,
+            filename=f"remaining_{report_id}.txt"
+        )
+        await _answer_callback(callback, "📥 Остаток готов")
+        await callback.message.answer_document(
+            file,
+            caption=f"📥 Остаток рассылки #{report_id}: {len(targets)} целей"
+        )
 
     @dp.callback_query(F.data.startswith('operation_stop_'))
     async def operation_stop_callback(callback: CallbackQuery):

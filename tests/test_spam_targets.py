@@ -49,8 +49,10 @@ results.append("кнопка и обработчик «По контактам �
 # 6. Запуск рассылки общий для обоих путей (нет дублирования логики)
 assert H.count('async def _start_spam_distribution') == 1, "нет общего запуска рассылки"
 assert H.count('_start_spam_distribution(') == 3, "общий запуск используется не везде"
-assert H.count('account_manager.spam_to_users(') == 1, "логика запуска продублирована"
-results.append("общий запуск рассылки для списка и контактов: OK")
+assert H.count('account_manager.start_spam_job(') == 1, "логика запуска продублирована"
+assert 'active_spam_jobs' in U and 'operation_remaining_' in H, \
+    "нет общей status bar/выгрузки остатка для многoаккаунтной рассылки"
+results.append("общий запуск рассылки с status bar и остатком: OK")
 
 # 7. Отправка идёт через tg_call (FloodWait/спам-блок/пропуск цели)
 seg4 = U[U.index('async def spam_to_users'):]
