@@ -2609,7 +2609,28 @@ class DBConnection(metaclass=_PoolBoundMeta):
                 return True, ''
             return False, f'Аккаунт на паузе после FloodWait, осталось {left} сек.'
         if state == self.HEALTH_RESTRICTED:
-            return False, f"Аккаунт ограничен Telegram: {h.get('health_reason') or 'спам-блок'}"
+            # Старый классификатор SpamBot принимал слово ``spam`` из
+            # префикса ``SpamBot`` за признак ограничения. Безопасно очищаем
+            # только известные ответы «ограничений нет», чтобы уже ошибочно
+            # сохранённые здоровые аккаунты снова попали в очередь.
+            reason = str(h.get('health_reason') or '')
+            normalized_reason = reason.casefold().replace('ё', 'е')
+            clear_markers = (
+                'свободен от каких-либо ограничений',
+                'свободен от ограничений',
+                'нет ограничений',
+                'не имеет ограничений',
+                'не имеет каких-либо ограничений',
+                'no limits',
+                'not limited',
+                'good news',
+            )
+            if reason.startswith('SpamBot:') and any(
+                marker in normalized_reason for marker in clear_markers
+            ):
+                self.clear_account_health(account_id)
+                return True, ''
+            return False, f"Аккаунт ограничен Telegram: {reason or 'спам-блок'}"
         if state == self.HEALTH_BANNED:
             return False, f"Аккаунт заблокирован: {h.get('health_reason') or 'требуется переподключение'}"
         if state == self.HEALTH_PROXY_ERROR:

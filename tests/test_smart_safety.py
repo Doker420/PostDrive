@@ -1,4 +1,5 @@
 """Regression checks for persistent autopost limits and warmup safety paths."""
+import ast
 import pathlib
 import sys
 import tempfile
@@ -85,6 +86,21 @@ def test_user_safety_guards_are_present():
     assert "while not slot_ok and slot_reason == 'minimum_delay'" in source
     assert "mode in ('prompt', 'post_prompt', 'auto')" in source
 
+    # Regression: the Russian healthy reply contains the word SpamBot, so it
+    # must not be classified as a restriction merely because of "spam".
+    tree = ast.parse(source)
+    classifier_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_classify_spambot_response"
+    )
+    classifier_ns = {}
+    exec(compile(ast.Module(body=[classifier_node], type_ignores=[]), "user.py", "exec"), classifier_ns)
+    classify = classifier_ns["_classify_spambot_response"]
+    assert classify("SpamBot: Ваш аккаунт свободен от каких-либо ограничений.") is True
+    assert classify("SpamBot: Your account is limited until tomorrow.") is False
+    assert classify("SpamBot: непонятный новый ответ") is None
+
     handlers = pathlib.Path("handlers.py").read_text(encoding="utf-8")
     assert "📮 Через @PostBot" in handlers
     assert "set_postbot_" in handlers
@@ -113,6 +129,10 @@ def test_user_safety_guards_are_present():
     assert "'proxy': parse_proxy_string(proxy_str)" in source
     assert "check_proxy_endpoint" in source
     assert "async def check_spam_block" in source
+    assert "def _classify_spambot_response" in source
+    assert "свободен от каких-либо ограничений" in source
+    assert "status = _classify_spambot_response(response)" in source
+    assert "'spam', 'can\\'t send'" not in source
     assert "allow_restricted=True" in source
     assert "acc_spambot_check_" in handlers
     assert "🛡 Проверить спамблок" in handlers

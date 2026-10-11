@@ -141,6 +141,51 @@ SESSION_CHECK_NETWORK_PREFIX = 'NETWORK_UNAVAILABLE: '
 SESSION_CHECK_INVALID_PREFIX = 'SESSION_INVALID: '
 
 
+def _classify_spambot_response(response: str):
+    """Return True/False for a clear SpamBot answer, otherwise None.
+
+    SpamBot prefixes its reply with its own name. Therefore a bare ``spam``
+    substring is not evidence of a restriction: it matches ``SpamBot`` even
+    when the account is healthy. Unknown wording is deliberately left
+    undecided instead of being persisted as an account-wide restriction.
+    """
+    normalized = (response or '').casefold().replace('ё', 'е')
+    clear_markers = (
+        'no limits',
+        'no limitation',
+        'not limited',
+        'good news',
+        'ограничений нет',
+        'ограничения отсутствуют',
+        'лимитов нет',
+        'свободен от каких-либо ограничений',
+        'свободен от ограничений',
+        'нет ограничений',
+        'не имеет ограничений',
+        'не имеет каких-либо ограничений',
+    )
+    if any(marker in normalized for marker in clear_markers):
+        return True
+
+    restricted_markers = (
+        'your account is limited',
+        'account is limited',
+        'temporarily limited',
+        'limited due to spam',
+        "can't send messages",
+        'cannot send messages',
+        'ваш аккаунт ограничен',
+        'аккаунт ограничен',
+        'временное ограничение',
+        'ограничение на отправку',
+        'не можете отправлять',
+        'невозможно отправлять сообщения',
+    )
+    if any(marker in normalized for marker in restricted_markers):
+        return False
+    return None
+
+
 def _is_proxy_failure(error: BaseException, proxy_str: str = '') -> bool:
     """Определяет ошибки транспорта, не выдавая их за битую сессию.
 
@@ -1822,16 +1867,8 @@ class AccountSessionManager:
             if not response:
                 return False, 'SpamBot не прислал ответ за отведённое время'
 
-            normalized = response.casefold()
-            clear_markers = (
-                'no limits', 'no limitation', 'not limited', 'good news',
-                'ограничений нет', 'ограничения отсутствуют', 'лимитов нет',
-            )
-            restricted_markers = (
-                'limited', 'limitation', 'spam', 'can\'t send', 'cannot send',
-                'ограничен', 'ограничение', 'спам', 'не можете отправлять',
-            )
-            if any(marker in normalized for marker in clear_markers):
+            status = _classify_spambot_response(response)
+            if status is True:
                 health = db.get_account_health(account_id)
                 if (
                     health.get('health') == db.HEALTH_RESTRICTED
@@ -1840,7 +1877,7 @@ class AccountSessionManager:
                     db.clear_account_health(account_id)
                 return True, response[:1000]
 
-            if any(marker in normalized for marker in restricted_markers):
+            if status is False:
                 reason = f'SpamBot: {response[:260]}'
                 db.set_account_health(account_id, db.HEALTH_RESTRICTED, reason)
                 return False, response[:1000]
