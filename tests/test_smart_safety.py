@@ -122,6 +122,8 @@ def test_user_safety_guards_are_present():
     assert "_split_text" in transport
     assert "_utf16_units" in transport
     assert "_CAPTION_SAFE_LIMIT" in transport
+    mirrors = pathlib.Path("mirrors.py").read_text(encoding="utf-8")
+    assert "ResilientAiohttpSession" in mirrors
 
 
 if __name__ == "__main__":

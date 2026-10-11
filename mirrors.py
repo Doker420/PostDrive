@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from sqliter import DBConnection, get_db_sync
 from user import AccountSessionManager
 from handlers import register_all_handlers
+from telegram_transport import ResilientAiohttpSession
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,7 +83,13 @@ async def on_startup(app):
     for mirror in active_mirrors:
         token = mirror['bot_token']
         try:
-            bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            bot = Bot(
+                token=token,
+                session=ResilientAiohttpSession(
+                    timeout=75, max_network_retries=1, retry_delay=0.75
+                ),
+                default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            )
             dp = Dispatcher(storage=MemoryStorage())
 
             register_all_handlers(dp, bot, bot_config)
