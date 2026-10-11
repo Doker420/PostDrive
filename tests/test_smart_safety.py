@@ -96,6 +96,17 @@ def test_user_safety_guards_are_present():
     assert "WAITING_SESSION_FILE" in handlers
     assert "WAITING_SESSION_JSON" in handlers
     assert "import_pyrogram_session_files" in source
+    assert "auth_mass_upload" in handlers
+    assert "WAITING_MASS_ARCHIVE" in handlers
+    assert "WAITING_MASS_PROXY_LIST" in handlers
+    assert "_safe_extract_mass_zip" in handlers
+    assert "_mass_archive_unrecognized" in handlers
+    assert "максимум к 5 аккаунтам" in handlers
+    assert "find_duplicate_account" in handlers
+    assert "get_tdata_account_count" in source
+    assert "import_tdata_session" in source
+    assert "proxy=proxy_config" in source
+    assert "check_proxy_endpoint" in source
 
 
 if __name__ == "__main__":

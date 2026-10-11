@@ -979,6 +979,108 @@ class AccountSessionManager:
             self._client_locks[account_id] = asyncio.Lock()
         return self._client_locks[account_id]
 
+    async def get_tdata_account_count(self, tdata_path: str) -> Tuple[int, Optional[str]]:
+        """Read how many authorized accounts a tdata folder contains."""
+        if not tdata_path or not os.path.isdir(tdata_path):
+            return 0, 'Папка tdata не найдена'
+        try:
+            from opentele.td import TDesktop
+            from opentele.api import API
+            tdesk = TDesktop(tdata_path, api=API.TelegramDesktop)
+            if hasattr(tdesk, 'isLoaded') and not tdesk.isLoaded():
+                return 0, 'Папка tdata повреждена или не содержит авторизованный аккаунт'
+            accounts = list(getattr(tdesk, 'accounts', []) or [])
+            count = int(getattr(tdesk, 'accountsCount', len(accounts)) or len(accounts))
+            return max(count, len(accounts)), None
+        except ImportError:
+            return 0, 'Для импорта tdata установите зависимость opentele-ng'
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.error('tdata account count failed: %s', type(error).__name__)
+            return 0, 'Не удалось прочитать список аккаунтов tdata'
+
+    async def import_tdata_session(
+        self, tdata_path: str, proxy_str: str = '', timeout: int = None,
+        account_index: int = 0,
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+        """Convert a Telegram Desktop ``tdata`` folder to a Pyrogram session.
+
+        ``opentele-ng`` is imported lazily so installations that only use
+        native Pyrogram files keep working without importing the converter.
+        The converted session is validated through the same bounded proxy path
+        as regular session imports before it is returned to the caller.
+        """
+        if not tdata_path or not os.path.isdir(tdata_path):
+            return False, None, None, 'Папка tdata не найдена'
+        client = None
+        try:
+            from opentele.api import API
+            from opentele.td import TDesktop
+        except ImportError:
+            return False, None, None, 'Для импорта tdata установите зависимость opentele-ng'
+
+        try:
+            tdesk = TDesktop(tdata_path, api=API.TelegramDesktop)
+            if hasattr(tdesk, 'isLoaded') and not tdesk.isLoaded():
+                return False, None, None, 'Папка tdata повреждена или не содержит авторизованный аккаунт'
+            accounts = list(getattr(tdesk, 'accounts', []) or [])
+            if account_index < 0 or account_index >= len(accounts):
+                return False, None, None, f'В tdata нет аккаунта с индексом {account_index + 1}'
+            # TDesktop.ToPyrogram() always selects mainAccount. Calling the
+            # account bridge directly is required for secondary desktop
+            # accounts in the same tdata directory.
+            account = accounts[account_index]
+            # Pass the selected proxy into the bridge itself: starting the
+            # converted client without it would silently make a direct
+            # Telegram connection before the later session-string check.
+            proxy_config = parse_proxy_string(proxy_str) if proxy_str else None
+            client = await account.ToPyrogram(
+                name=f'postdrive_tdata_{account_index}',
+                api=API.TelegramDesktop,
+                in_memory=True,
+                proxy=proxy_config,
+            )
+            await asyncio.wait_for(client.start(), timeout=max(5, int(timeout or SESSION_CHECK_TIMEOUT)))
+            me = await asyncio.wait_for(
+                client.get_me(), timeout=max(5, int(timeout or SESSION_CHECK_TIMEOUT))
+            )
+            exporter = getattr(client, 'export_session_string', None)
+            if not exporter:
+                return False, None, None, 'Конвертер tdata не умеет экспортировать Pyrogram session string'
+            session_string = await asyncio.wait_for(
+                exporter(), timeout=max(5, int(timeout or SESSION_CHECK_TIMEOUT))
+            )
+            info = {
+                'id': me.id,
+                'first_name': me.first_name or '',
+                'last_name': me.last_name or '',
+                'username': me.username or '',
+                'phone': me.phone_number or '',
+            }
+            if proxy_str:
+                ok, checked_info, error = await self.test_session_string(
+                    session_string, proxy_str, timeout=timeout
+                )
+                if not ok:
+                    return False, None, None, error or 'Прокси не прошёл проверку сессией'
+                info = checked_info or info
+            return True, session_string, info, None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.error('tdata import failed: %s', type(error).__name__)
+            return False, None, None, 'Не удалось прочитать tdata. Проверьте архив и локальный пароль Telegram Desktop.'
+        finally:
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.stop(), timeout=5)
+                except Exception:
+                    try:
+                        await asyncio.wait_for(client.disconnect(), timeout=3)
+                    except Exception:
+                        pass
+
     async def import_pyrogram_session_files(
         self, session_path: str, json_path: str = '', proxy_str: str = '',
         timeout: int = None,
@@ -1566,6 +1668,53 @@ class AccountSessionManager:
         except Exception as e:
             logger.error(f"Error changing bio for acc {account_id}: {e}")
             return False, str(e)
+
+    async def check_proxy_endpoint(self, proxy_str: str, timeout: int = 8) -> Tuple[bool, str]:
+        """Bounded transport probe for a proxy supplied during bulk import.
+
+        The actual account/session check still runs through the selected proxy
+        below. This probe only rejects dead endpoints early and never persists
+        proxy credentials in logs or reports.
+        """
+        try:
+            parsed = parse_proxy_string(proxy_str)
+        except (TypeError, ValueError, IndexError):
+            parsed = None
+        if not parsed or not parsed.get('hostname') or not parsed.get('port'):
+            return False, 'Неверный формат прокси'
+
+        def probe():
+            import socks
+            scheme = str(parsed.get('scheme') or 'socks5').lower()
+            proxy_type = {
+                'socks5': socks.SOCKS5,
+                'socks4': socks.SOCKS4,
+                'http': socks.HTTP,
+                'https': socks.HTTP,
+            }.get(scheme, socks.SOCKS5)
+            sock = socks.socksocket()
+            sock.settimeout(max(1, int(timeout)))
+            sock.set_proxy(
+                proxy_type,
+                addr=parsed['hostname'],
+                port=int(parsed['port']),
+                username=parsed.get('username'),
+                password=parsed.get('password'),
+            )
+            try:
+                # Telegram's production address is enough to verify that the
+                # proxy can establish an outbound TCP tunnel.
+                sock.connect(('149.154.167.91', 443))
+                return True, 'ok'
+            finally:
+                sock.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(probe), timeout=max(2, int(timeout) + 2))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return False, f'{type(error).__name__}: прокси не отвечает'
 
     async def check_account_proxy(self, account_id: int, user_id: int = None):
         """Проверяет прокси аккаунта одним bounded-запуском.

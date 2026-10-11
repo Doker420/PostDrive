@@ -9,3 +9,4 @@ Pillow>=9.0
 openai
 httpx
 curl_cffi
+opentele-ng>=1.4.0  # Telegram Desktop tdata -> Pyrogram conversion

@@ -1061,6 +1061,32 @@ class DBConnection(metaclass=_PoolBoundMeta):
             ), limits
         return True, '', limits
 
+    def find_duplicate_account(
+        self, user_id: int, session_string: str = '', phone: str = ''
+    ) -> Optional[Dict[str, Any]]:
+        """Return an existing account matching imported credentials.
+
+        Session strings are the strongest identity key. A non-empty phone is
+        also checked because the same Telegram account can be exported to a
+        different session string (for example after tdata conversion).
+        """
+        clauses = []
+        values = [user_id]
+        if session_string:
+            clauses.append('session_string = ?')
+            values.append(session_string)
+        if phone:
+            clauses.append("phone <> '' AND phone = ?")
+            values.append(phone)
+        if not clauses:
+            return None
+        self.c.execute(
+            'SELECT * FROM accounts WHERE user_id = ? AND (' + ' OR '.join(clauses) + ') '
+            'ORDER BY id ASC LIMIT 1',
+            tuple(values),
+        )
+        return self._dict_fetchone()
+
     # ── AI daily usage ────────────────────────────────────────────
     @staticmethod
     def _today_key() -> str:

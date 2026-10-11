@@ -8,6 +8,7 @@ import random
 import string
 import tempfile
 import shutil
+import zipfile
 from datetime import datetime
 from html import escape as html_escape
 from typing import List, Dict, Optional, Any, Tuple
@@ -224,6 +225,8 @@ class AddAccountStates(StatesGroup):
     WAITING_SESSION_STRING = State()
     WAITING_SESSION_FILE = State()
     WAITING_SESSION_JSON = State()
+    WAITING_MASS_ARCHIVE = State()
+    WAITING_MASS_PROXY_LIST = State()
     WAITING_QR_SCAN = State()
 
 class AccountPostStates(StatesGroup):
@@ -1434,9 +1437,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if account_manager:
             account_manager.cancel_phone_auth(callback.from_user.id)
         data = await state.get_data()
-        import_dir = data.get('pyro_import_dir')
-        if import_dir:
-            shutil.rmtree(import_dir, ignore_errors=True)
+        import_dirs = {data.get('pyro_import_dir'), data.get('mass_import_dir')}
+        for import_dir in import_dirs:
+            if import_dir:
+                shutil.rmtree(import_dir, ignore_errors=True)
         await state.clear()
         await edit_message(callback, "❌ Действие отменено.")
 
@@ -2382,6 +2386,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="📱 Вход по номеру телефона", callback_data="auth_phone")],
             [InlineKeyboardButton(text="📄 Вход по String Session", callback_data="auth_string_session")],
             [InlineKeyboardButton(text="📦 Загрузить Pyrogram-сессию", callback_data="auth_pyrogram_file")],
+            [InlineKeyboardButton(text="📚 Массовая загрузка аккаунтов", callback_data="auth_mass_upload")],
             [InlineKeyboardButton(text="🔳 Вход по QR-коду", callback_data="auth_qr")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ])
@@ -2729,6 +2734,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             [InlineKeyboardButton(text="📱 Вход по номеру телефона", callback_data="auth_phone")],
             [InlineKeyboardButton(text="📄 Вход по String Session", callback_data="auth_string_session")],
             [InlineKeyboardButton(text="📦 Загрузить Pyrogram-сессию", callback_data="auth_pyrogram_file")],
+            [InlineKeyboardButton(text="📚 Массовая загрузка аккаунтов", callback_data="auth_mass_upload")],
             [InlineKeyboardButton(text="🔳 Вход по QR-коду", callback_data="auth_qr")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ])
@@ -2981,6 +2987,426 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await _finish_pyrogram_file_import(message, state)
         except Exception as error:
             await message.answer(f"❌ Не удалось принять JSON: {error}")
+
+    # ==================== BULK ACCOUNT IMPORT ====================
+    def _mass_archive_candidates(root_dir: str) -> list:
+        """Find native sessions and Telegram Desktop tdata folders safely."""
+        tdata_dirs = []
+        all_files = []
+        for root, dirs, files in os.walk(root_dir):
+            base = os.path.basename(root).lower()
+            if base == 'tdata' or ('key_datas' in {f.lower() for f in files} and not any(
+                f.lower().endswith(('.session', '.sqlite', '.db')) for f in files
+            )):
+                tdata_dirs.append(root)
+            for filename in files:
+                all_files.append(os.path.join(root, filename))
+
+        # Do not treat nested files as unrelated sessions, and do not report a
+        # nested tdata directory twice if an archive contains one accidentally.
+        filtered_tdata_dirs = []
+        for tdata_path in sorted(set(tdata_dirs), key=lambda item: (len(item), item)):
+            if any(os.path.commonpath((os.path.abspath(tdata_path), os.path.abspath(parent))) == os.path.abspath(parent)
+                   for parent in filtered_tdata_dirs):
+                continue
+            filtered_tdata_dirs.append(tdata_path)
+        tdata_dirs = filtered_tdata_dirs
+        candidates = []
+        for tdata_path in tdata_dirs:
+            candidates.append({
+                'kind': 'tdata',
+                'path': tdata_path,
+                'json_path': '',
+                'label': os.path.basename(os.path.dirname(tdata_path)) or 'tdata',
+            })
+
+        def inside_tdata(path: str) -> bool:
+            absolute = os.path.abspath(path)
+            return any(
+                os.path.commonpath((absolute, os.path.abspath(tdata))) == os.path.abspath(tdata)
+                for tdata in tdata_dirs
+            )
+
+        session_files = [
+            path for path in all_files
+            if path.lower().endswith(('.session', '.sqlite', '.db')) and not inside_tdata(path)
+        ]
+        for session_path in sorted(session_files):
+            stem = os.path.splitext(os.path.basename(session_path))[0].lower()
+            same_dir = os.path.dirname(session_path)
+            json_candidates = [
+                os.path.join(same_dir, filename)
+                for filename in os.listdir(same_dir)
+                if filename.lower().endswith('.json')
+                and os.path.splitext(filename)[0].lower() == stem
+            ]
+            candidates.append({
+                'kind': 'session',
+                'path': session_path,
+                'json_path': json_candidates[0] if json_candidates else '',
+                'label': os.path.basename(session_path),
+            })
+        return candidates
+
+    def _mass_archive_unrecognized(root_dir: str, candidates: list) -> list:
+        """Return safe relative names of files no importer can consume."""
+        recognized = set()
+        for candidate in candidates:
+            path = candidate.get('path', '')
+            if candidate.get('kind') == 'session':
+                recognized.add(os.path.abspath(path))
+                json_path = candidate.get('json_path')
+                if json_path:
+                    recognized.add(os.path.abspath(json_path))
+            else:
+                for root, _dirs, files in os.walk(path):
+                    recognized.update(os.path.abspath(os.path.join(root, name)) for name in files)
+        unknown = []
+        for root, _dirs, files in os.walk(root_dir):
+            for name in files:
+                path = os.path.abspath(os.path.join(root, name))
+                if path not in recognized:
+                    unknown.append(os.path.relpath(path, root_dir))
+        return sorted(unknown)
+
+    def _safe_extract_mass_zip(archive_path: str, destination: str):
+        max_members = 200
+        max_unpacked = 500 * 1024 * 1024
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            if len(members) > max_members:
+                raise ValueError(f'в архиве слишком много элементов (максимум {max_members})')
+            total_size = 0
+            destination_abs = os.path.abspath(destination)
+            for info in members:
+                raw_name = (info.filename or '').replace('\\', '/')
+                normalized = os.path.normpath(raw_name)
+                if (
+                    not normalized or normalized in ('.', '..')
+                    or normalized.startswith('../')
+                    or os.path.isabs(normalized)
+                    or normalized.startswith('/')
+                ):
+                    raise ValueError('архив содержит небезопасный путь')
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError('архив содержит символическую ссылку')
+                total_size += int(info.file_size or 0)
+                if total_size > max_unpacked:
+                    raise ValueError('распакованный архив слишком большой (максимум 500 МБ)')
+                target = os.path.abspath(os.path.join(destination, normalized))
+                if os.path.commonpath((destination_abs, target)) != destination_abs:
+                    raise ValueError('архив выходит за пределы временной директории')
+                if info.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(info) as source, open(target, 'wb') as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+
+    def _parse_mass_proxy_lines(raw_text: str) -> list:
+        result = []
+        for line in (raw_text or '').splitlines():
+            value = line.strip()
+            if not value or value.startswith('#'):
+                continue
+            if value.lower() in ('без прокси', 'no proxy', 'none', '-'):
+                continue
+            if value not in result:
+                result.append(value)
+        return result
+
+    @dp.callback_query(F.data == "auth_mass_upload", AddAccountStates.WAITING_METHOD)
+    async def auth_mass_upload_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(AddAccountStates.WAITING_MASS_ARCHIVE)
+        await edit_message(
+            callback,
+            "📚 <b>Массовая загрузка аккаунтов</b>\n\n"
+            "Отправьте ZIP-архив документом. Внутри можно разместить:\n"
+            "• файлы <code>.session</code> и необязательные одноимённые <code>.json</code>;\n"
+            "• папки Telegram Desktop <code>tdata</code>;\n"
+            "• несколько папок/сессий одновременно.\n\n"
+            "Пути внутри архива определяются автоматически. Максимум — 200 элементов и 500 МБ после распаковки.",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(AddAccountStates.WAITING_MASS_ARCHIVE)
+    async def process_mass_accounts_archive(message: Message, state: FSMContext):
+        if not message.document:
+            await message.answer('❌ Отправьте ZIP-архив именно как документ.')
+            return
+        filename = (message.document.file_name or '').lower()
+        if not filename.endswith('.zip'):
+            await message.answer('❌ Для массового импорта нужен ZIP-архив.')
+            return
+        import_dir = tempfile.mkdtemp(prefix='postdrive_mass_accounts_')
+        archive_path = os.path.join(import_dir, 'accounts.zip')
+        try:
+            if message.document.file_size and message.document.file_size > 500 * 1024 * 1024:
+                raise ValueError('архив слишком большой (максимум 500 МБ)')
+            file = await bot.get_file(message.document.file_id)
+            content = await bot.download_file(file.file_path)
+            raw = content.read()
+            if len(raw) > 500 * 1024 * 1024:
+                raise ValueError('архив слишком большой (максимум 500 МБ)')
+            with open(archive_path, 'wb') as output:
+                output.write(raw)
+            extracted = os.path.join(import_dir, 'files')
+            os.makedirs(extracted, exist_ok=True)
+            _safe_extract_mass_zip(archive_path, extracted)
+            candidates = _mass_archive_candidates(extracted)
+            unrecognized = _mass_archive_unrecognized(extracted, candidates)
+            if not candidates:
+                detail = ''
+                if unrecognized:
+                    detail = '\nНераспознанные элементы: ' + ', '.join(unrecognized[:10])
+                raise ValueError('в архиве не найдены .session-файлы или папки tdata' + detail)
+            await state.update_data(
+                mass_import_dir=import_dir,
+                mass_candidates=candidates,
+                mass_unrecognized=unrecognized,
+            )
+            await state.set_state(AddAccountStates.WAITING_MASS_PROXY_LIST)
+            await message.answer(
+                f"✅ Архив распознан. Найдено заготовок аккаунтов: <b>{len(candidates)}</b>.\n\n"
+                "Теперь отправьте список прокси — по одному на строку — или TXT-файл. "
+                "Каждый рабочий прокси будет привязан максимум к 5 аккаунтам.\n\n"
+                "Если прокси не нужны, нажмите кнопку ниже.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➡️ Импортировать без прокси", callback_data="mass_skip_proxy")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
+                ])
+            )
+        except Exception as error:
+            shutil.rmtree(import_dir, ignore_errors=True)
+            await message.answer(f"❌ Не удалось разобрать архив: {error}")
+
+    async def _finish_mass_account_import(target, state: FSMContext, proxy_lines: list):
+        data = await state.get_data()
+        import_dir = data.get('mass_import_dir')
+        candidates = data.get('mass_candidates') or []
+        unrecognized = data.get('mass_unrecognized') or []
+        response = target.message if isinstance(target, CallbackQuery) else target
+        user_id = target.from_user.id
+        if not import_dir or not candidates:
+            await state.clear()
+            await response.answer('⌛ Временная загрузка истекла. Запустите массовый импорт заново.')
+            return
+
+        status = await response.answer(f"⏳ Импортирую аккаунты: 0/{len(candidates)}")
+        valid_proxies = []
+        proxy_errors = []
+        seen_proxy_keys = set()
+        try:
+            for raw_proxy in proxy_lines:
+                try:
+                    parsed = parse_proxy_string(raw_proxy)
+                except (TypeError, ValueError, IndexError):
+                    parsed = None
+                if not parsed or not parsed.get('hostname') or not parsed.get('port'):
+                    proxy_errors.append(
+                        f"прокси #{len(valid_proxies) + len(proxy_errors) + 1} — неверный формат"
+                    )
+                    continue
+                proxy_key = (
+                    str(parsed.get('scheme') or 'socks5').lower(),
+                    str(parsed.get('hostname') or '').lower(),
+                    int(parsed.get('port')),
+                    str(parsed.get('username') or ''),
+                    str(parsed.get('password') or ''),
+                )
+                if proxy_key in seen_proxy_keys:
+                    continue
+                seen_proxy_keys.add(proxy_key)
+                ok, detail = await account_manager.check_proxy_endpoint(raw_proxy)
+                if ok:
+                    valid_proxies.append(raw_proxy)
+                else:
+                    proxy_errors.append(f"прокси #{len(valid_proxies) + len(proxy_errors) + 1}: {detail}")
+
+            if proxy_lines and not valid_proxies:
+                await status.edit_text(
+                    "❌ Рабочих прокси не найдено.\n\n"
+                    "Отправьте новый список прокси или выберите «Импортировать без прокси».",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="➡️ Импортировать без прокси", callback_data="mass_skip_proxy")],
+                        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
+                    ]),
+                )
+                return
+
+            # One Telegram Desktop folder can contain several authorized
+            # accounts. Expand it before assigning proxies so the five-account
+            # quota applies to real accounts, not merely archive folders.
+            expanded_candidates = []
+            failed = []
+            for candidate in candidates:
+                if candidate.get('kind') != 'tdata':
+                    expanded_candidates.append(candidate)
+                    continue
+                count, detail = await account_manager.get_tdata_account_count(candidate['path'])
+                if not count:
+                    failed.append(f"{candidate.get('label', 'tdata')}: {detail or 'не удалось определить аккаунты'}")
+                    continue
+                for account_index in range(count):
+                    expanded_candidates.append({
+                        **candidate,
+                        'account_index': account_index,
+                        'label': f"{candidate.get('label', 'tdata')} (аккаунт {account_index + 1})",
+                    })
+            candidates = expanded_candidates
+            await status.edit_text(
+                f"⏳ Импортирую аккаунты: 0/{len(candidates)}\n"
+                f"✅ Добавлено: 0 · ❌ Ошибок: {len(failed)}"
+            )
+
+            proxy_usage = {proxy: 0 for proxy in valid_proxies}
+            imported = []
+            for index, candidate in enumerate(candidates, 1):
+                allowed, reason, _limits = db.can_add_account(user_id, ADMIN)
+                if not allowed:
+                    failed.extend([
+                        f"{item.get('label', 'аккаунт')}: {reason}"
+                        for item in candidates[index - 1:]
+                    ])
+                    break
+                choices = [proxy for proxy in valid_proxies if proxy_usage[proxy] < 5]
+                if not proxy_lines:
+                    choices = ['']
+                if not choices:
+                    failed.extend([
+                        f"{item.get('label', 'аккаунт')}: закончились места на прокси"
+                        for item in candidates[index - 1:]
+                    ])
+                    break
+
+                result = None
+                last_error = 'не удалось проверить сессию'
+                for proxy in choices:
+                    if candidate.get('kind') == 'tdata':
+                        result = await account_manager.import_tdata_session(
+                            candidate['path'], proxy,
+                            account_index=int(candidate.get('account_index', 0)),
+                        )
+                    else:
+                        result = await account_manager.import_pyrogram_session_files(
+                            candidate['path'], candidate.get('json_path', ''), proxy
+                        )
+                    ok, session_string, info, error = result
+                    if ok:
+                        break
+                    last_error = error or last_error
+                else:
+                    ok, session_string, info, error = False, None, None, last_error
+
+                if ok and session_string and info:
+                    duplicate = db.find_duplicate_account(
+                        user_id,
+                        session_string=session_string,
+                        phone=info.get('phone', ''),
+                    )
+                    if duplicate:
+                        duplicate_name = duplicate.get('account_name') or duplicate.get('phone') or f"#{duplicate.get('id')}"
+                        failed.append(
+                            f"{candidate.get('label', 'аккаунт')}: уже добавлен ({duplicate_name})"
+                        )
+                        await status.edit_text(
+                            f"⏳ Импортирую аккаунты: {index}/{len(candidates)}\n"
+                            f"✅ Добавлено: {len(imported)} · ❌ Ошибок: {len(failed)}"
+                        )
+                        continue
+                    name = (
+                        f"{info.get('first_name', '')} {info.get('last_name', '')}"
+                    ).strip() or info.get('username') or candidate.get('label') or f"Аккаунт #{index}"
+                    account_id = db.add_account(
+                        user_id, session_string,
+                        phone=info.get('phone', ''),
+                        account_name=name,
+                        proxy=proxy if proxy_lines else '',
+                    )
+                    if proxy_lines:
+                        proxy_usage[proxy] = proxy_usage.get(proxy, 0) + 1
+                    imported.append(name)
+                else:
+                    failed.append(f"{candidate.get('label', 'аккаунт')}: {last_error[:180]}")
+                await status.edit_text(
+                    f"⏳ Импортирую аккаунты: {index}/{len(candidates)}\n"
+                    f"✅ Добавлено: {len(imported)} · ❌ Ошибок: {len(failed)}"
+                )
+
+            summary = [
+                "✅ <b>Массовый импорт завершён</b>",
+                f"Добавлено аккаунтов: <b>{len(imported)}</b>",
+                f"Ошибок: <b>{len(failed)}</b>",
+            ]
+            if valid_proxies:
+                summary.append(
+                    "Прокси: " + ', '.join(
+                        f"#{i + 1} — {count}/5"
+                        for i, count in enumerate(proxy_usage.values())
+                    )
+                )
+            if proxy_errors:
+                summary.append(
+                    f"\n⚠️ Прокси пропущены: {len(proxy_errors)}\n" + '\n'.join(
+                        f"• {html_escape(item)}" for item in proxy_errors[:10]
+                    )
+                )
+                if len(proxy_errors) > 10:
+                    summary.append(f"… и ещё {len(proxy_errors) - 10}")
+            if unrecognized:
+                summary.append(
+                    "\n📄 Нераспознанные элементы архива:\n" + '\n'.join(
+                        f"• {html_escape(item)}" for item in unrecognized[:20]
+                    )
+                )
+                if len(unrecognized) > 20:
+                    summary.append(f"… и ещё {len(unrecognized) - 20}")
+            if failed:
+                summary.append("\n<b>Не импортированы:</b>\n" + '\n'.join(
+                    f"• {html_escape(item)}" for item in failed[:20]
+                ))
+                if len(failed) > 20:
+                    summary.append(f"… и ещё {len(failed) - 20}")
+            await status.edit_text('\n'.join(summary))
+        except Exception as error:
+            logger.error('Bulk account import failed: %s', type(error).__name__, exc_info=True)
+            await status.edit_text('❌ Массовый импорт прерван. Проверьте архив и список прокси.')
+        finally:
+            await state.clear()
+            shutil.rmtree(import_dir, ignore_errors=True)
+
+    @dp.callback_query(F.data == "mass_skip_proxy", AddAccountStates.WAITING_MASS_PROXY_LIST)
+    async def mass_skip_proxy_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await _finish_mass_account_import(callback, state, [])
+
+    @dp.message(AddAccountStates.WAITING_MASS_PROXY_LIST)
+    async def process_mass_proxy_list(message: Message, state: FSMContext):
+        raw_text = message.text or message.caption or ''
+        if message.document:
+            try:
+                file = await bot.get_file(message.document.file_id)
+                content = await bot.download_file(file.file_path)
+                raw = content.read()
+                if len(raw) > 5 * 1024 * 1024:
+                    raise ValueError('TXT-файл прокси слишком большой')
+                raw_text = raw.decode('utf-8', errors='replace')
+            except Exception as error:
+                await message.answer(f"❌ Не удалось прочитать TXT-файл: {error}")
+                return
+        if raw_text.strip().lower() in ('без прокси', 'no proxy', 'none', '-'):
+            await _finish_mass_account_import(message, state, [])
+            return
+        proxy_lines = _parse_mass_proxy_lines(raw_text)
+        if not proxy_lines:
+            await message.answer(
+                "❌ Не найдено ни одного прокси. Отправьте список по одному на строку "
+                "или нажмите «Импортировать без прокси»."
+            )
+            return
+        await _finish_mass_account_import(message, state, proxy_lines)
 
     # ==================== PER-ACCOUNT CONTROL PANEL ====================
     async def render_account_dashboard(message_or_callback, account_id: int, user_id: int):
