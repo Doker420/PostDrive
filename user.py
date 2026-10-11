@@ -2450,7 +2450,7 @@ class AccountSessionManager:
             progress = f"[⏳] обработано: {processed}"
         remaining_line = (
             f"📥 Осталось для скачивания: {remaining}\n"
-            if report.get('operation_type') == 'spam' and remaining else ''
+            if report.get('operation_type') in ('spam', 'invite', 'neurocomment') and remaining else ''
         )
         return (
             f"📊 <b>{operation_labels.get(report.get('operation_type'), report.get('title') or 'Задача')}</b>\n\n"
@@ -2478,7 +2478,7 @@ class AccountSessionManager:
         if not force and now - self._operation_status_last_update.get(report_id, 0) < 2:
             return
         self._operation_status_last_update[report_id] = now
-        if report.get('operation_type') == 'spam':
+        if report.get('operation_type') in ('spam', 'invite', 'neurocomment'):
             report = dict(report)
             report['remaining_count'] = db.count_operation_report_items(report_id, 'remaining')
         message = entry.get('status_message')
@@ -2892,6 +2892,7 @@ class AccountSessionManager:
             return report_id
         shared_state = {
             'report_id': report_id,
+            'work_queue': work_queue,
             'stats': {'invited': 0, 'skipped': 0, 'privacy': 0,
                       'already_member': 0, 'target_skipped': 0,
                       'errors': 0, 'duplicates': 0, 'account_errors': 0},
@@ -2926,7 +2927,26 @@ class AccountSessionManager:
             job = self.active_invite_jobs.get(report_id, {})
             report = db.get_operation_report(report_id)
             if report and report.get('status') == 'running':
-                status = 'stopped' if job.get('stop_requested') else 'finished'
+                if job.get('stop_requested'):
+                    status = 'stopped'
+                else:
+                    # Targets left in the shared queue were never attempted.
+                    # Keep them downloadable instead of silently losing them
+                    # when every remaining account receives FloodWait.
+                    queue = shared_state.get('work_queue')
+                    while queue is not None:
+                        try:
+                            target = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        try:
+                            await self._record_operation_result(
+                                report_id, 0, str(target), '', 'remaining',
+                                'Не обработано: аккаунты получили FloodWait или недоступны'
+                            )
+                        finally:
+                            queue.task_done()
+                    status = 'finished'
                 await self._finish_operation_report(report_id, status)
             self.active_invite_jobs.pop(report_id, None)
 
@@ -3086,6 +3106,9 @@ class AccountSessionManager:
         if bot and not notifications_hidden:
             await bot.send_message(user_id, f"🧠 [{acc_name}] Нейрокомментинг запущен! Проверяю каналы...")
 
+        processed_channels = set()
+        target_channels = [c.strip() for c in nc.get('target_channels', '').split(',') if c.strip()]
+
         async def nc_result(target, result, detail=''):
             if report_id:
                 await self._record_operation_result(
@@ -3093,7 +3116,6 @@ class AccountSessionManager:
                 )
         
         try:
-            target_channels = [c.strip() for c in nc.get('target_channels', '').split(',') if c.strip()]
             logging.info(f"📋 [{acc_name}] Target channels from settings: {target_channels}")
             
             valid_channels = []
@@ -3121,6 +3143,8 @@ class AccountSessionManager:
                     logging.info(f"✅ [{acc_name}] Channel {channel} ok (id={chat.id}, discussion={discussion_id})")
                     if bot and not notifications_hidden:
                         await bot.send_message(user_id, f"✅ [{acc_name}] Канал {channel} доступен (комментарии: {discussion_id})")
+                except AccountBlockedError:
+                    raise
                 except Exception as e:
                     logging.warning(f"⚠️ [{acc_name}] Channel {channel} not accessible: {type(e).__name__}: {e}", exc_info=True)
                     if bot and not notifications_hidden and not _is_internal_noise_error(e):
@@ -3212,6 +3236,7 @@ class AccountSessionManager:
                 channel_posts_found = 0
                 
                 for channel in valid_channels:
+                    processed_channels.add(str(channel))
                     try:
                         chat_id = int(channel) if channel.lstrip('-').isdigit() else channel
                         chat_obj = channel_cache.get(channel)  # ⭐ БЕРЁМ ИЗ КЕША
@@ -3402,6 +3427,8 @@ class AccountSessionManager:
                                         await bot.send_message(user_id, f"✅ [{acc_name}] Прокомментирован пост в {channel}")
                                     await nc_result(channel, 'success')
 
+                            except AccountBlockedError:
+                                raise
                             except Exception as send_err:
                                 await nc_result(channel, 'error', str(send_err))
                                 logging.error(f"❌ [{acc_name}] Failed to send comment to {channel}: {type(send_err).__name__}: {send_err}")
@@ -3414,6 +3441,9 @@ class AccountSessionManager:
                             # выстреливает очередь сообщений и ловит спам-блок
                             break
                     
+                    except AccountBlockedError as channel_error:
+                        await nc_result(channel, 'error', str(channel_error))
+                        raise
                     except Exception as e:
                         await nc_result(channel, 'error', str(e))
                         logging.error(f"❌ [{acc_name}] Error processing channel {channel}: {type(e).__name__}: {e}")
@@ -3436,6 +3466,13 @@ class AccountSessionManager:
             logging.info(f"🛑 [{acc_name}] Neurocomment task cancelled")
         except AccountBlockedError as e:
             operation_status = 'failed'
+            if report_id:
+                for channel in target_channels:
+                    if str(channel) not in processed_channels:
+                        await nc_result(
+                            channel, 'remaining',
+                            'Не обработан: аккаунт получил FloodWait или ограничение Telegram'
+                        )
             # Раньше владелец не получал ничего: задача молча умирала, тумблер
             # гас, и выглядело это как «нейрокомментинг не работает».
             disable_on_exit = True

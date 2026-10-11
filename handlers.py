@@ -3357,7 +3357,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await _answer_callback(callback, "❌ Отчёт не найден!", show_alert=True)
             return
         await _answer_callback(callback)
-        if report.get('operation_type') == 'spam':
+        if report.get('operation_type') in ('spam', 'invite', 'neurocomment'):
             report = dict(report)
             report['remaining_count'] = db.count_operation_report_items(report_id, 'remaining')
         await edit_message(
@@ -3399,7 +3399,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if report.get('finished_at'):
             text += f"🏁 Завершена: {format_date(report.get('finished_at', 0))}\n"
         remaining_count = 0
-        if report.get('operation_type') == 'spam':
+        if report.get('operation_type') in ('spam', 'invite', 'neurocomment'):
             remaining_count = db.count_operation_report_items(report_id, 'remaining')
             if remaining_count:
                 text += f"📥 Осталось для скачивания: {remaining_count}\n"
