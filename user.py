@@ -1916,6 +1916,53 @@ class AccountSessionManager:
             logger.error(f"Error changing bio for acc {account_id}: {e}")
             return False, str(e)
 
+    async def set_account_2fa(
+        self, account_id: int, user_id: int, current_password: str = '',
+        new_password: str = '', hint: str = '',
+    ) -> Tuple[bool, str]:
+        """Set or change Telegram Cloud Password without storing credentials."""
+        account = db.get_account(account_id)
+        if not account:
+            return False, 'Аккаунт не найден'
+        if int(account.get('user_id') or 0) != int(user_id):
+            return False, 'Доступ запрещён'
+        if not str(new_password or '').strip():
+            return False, 'Новый пароль 2FA не задан'
+
+        client, err = await self.get_or_start_client(account_id, user_id)
+        if not client:
+            return False, err or 'Не удалось подключить аккаунт'
+        try:
+            if str(current_password or '').strip():
+                change_password = getattr(client, 'change_cloud_password', None)
+                if not change_password:
+                    return False, 'Текущая версия Pyrogram не поддерживает смену 2FA'
+                await asyncio.wait_for(
+                    change_password(
+                        str(current_password), str(new_password), str(hint or '')
+                    ),
+                    timeout=30,
+                )
+                return True, 'Пароль 2FA изменён'
+
+            enable_password = getattr(client, 'enable_cloud_password', None)
+            if not enable_password:
+                return False, 'Текущая версия Pyrogram не поддерживает установку 2FA'
+            await asyncio.wait_for(
+                enable_password(str(new_password), hint=str(hint or '')),
+                timeout=30,
+            )
+            return True, 'Пароль 2FA установлен'
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                '2FA operation failed for account %s (%s): %s',
+                account_id, 'change' if current_password else 'enable',
+                type(error).__name__,
+            )
+            return False, str(error)[:260]
+
     async def check_proxy_endpoint(self, proxy_str: str, timeout: int = 8) -> Tuple[bool, str]:
         """Bounded transport probe for a proxy supplied during bulk import.
 

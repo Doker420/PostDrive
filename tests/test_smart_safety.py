@@ -176,6 +176,8 @@ def test_user_safety_guards_are_present():
     assert "join_pack_goto_page_" in handlers
     assert "account_manager.bind_account_api(account_id)" in handlers
     assert "check_all_proxies" in handlers
+    assert "📣 Кампании" in handlers
+    assert "campaign_spam" in handlers
     assert "mass_change_bio" in handlers
     assert "MassActionStates.WAITING_BIO" in handlers
     assert "mass_join_link" in handlers
@@ -185,8 +187,16 @@ def test_user_safety_guards_are_present():
     assert "_run_mass_spambot_check" in handlers
     assert "nc_select_all" in handlers
     assert "nc_start_selected" in handlers
+    assert "TwoFactorStates.WAITING_CURRENT" in handlers
+    assert "acc_2fa_" in handlers
+    assert "mass_2fa_start" in handlers
+    assert "set_account_2fa" in source
     assert "PAGE_DIGITS" in handlers
     assert "1️⃣" in handlers
+
+    main_source = pathlib.Path("main.py").read_text(encoding="utf-8")
+    assert "async def _polling_supervisor" in main_source
+    assert "polling_task = asyncio.create_task(_polling_supervisor())" in main_source
     assert "spam_mode_forward" in handlers
     assert "client.forward_messages" in source
     assert "toggle_invite_auto_join" in handlers
@@ -197,6 +207,7 @@ def test_user_safety_guards_are_present():
     assert "_split_text" in transport
     assert "_utf16_units" in transport
     assert "_CAPTION_SAFE_LIMIT" in transport
+    assert "stale_session" in transport
     mirrors = pathlib.Path("mirrors.py").read_text(encoding="utf-8")
     assert "ResilientAiohttpSession" in mirrors
 

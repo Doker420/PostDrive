@@ -248,6 +248,11 @@ class AccountSettingsStates(StatesGroup):
     WAITING_FOR_AUTORESPONDER = State()
     WAITING_FOR_PM_REPLY = State()
 
+class TwoFactorStates(StatesGroup):
+    WAITING_CURRENT = State()
+    WAITING_NEW = State()
+    WAITING_HINT = State()
+
 class AdminStates(StatesGroup):
     WAITING_CATEGORY_NAME = State()
     WAITING_PACK_NAME = State()
@@ -328,7 +333,8 @@ def main_menu_keyboard(user_id: int, is_admin: bool = False, admin_id: int = Non
         [KeyboardButton(text='➕ Добавить аккаунт', style='primary')],
         [KeyboardButton(text='🚀 Автопостинг', style='success' if is_sub else 'danger'), KeyboardButton(text='🧠 Нейрокомментинг', style='success' if is_sub else 'danger')],
         [KeyboardButton(text='📨 Рассылка', style='success' if is_sub else 'danger'), KeyboardButton(text='📥 Инвайтинг', style='success' if is_sub else 'danger')],
-        [KeyboardButton(text='📁 Каталог папок с чатами', style='success' if is_sub else 'danger'), KeyboardButton(text='💳 Подписка', style='success')],
+        [KeyboardButton(text='📣 Кампании', style='success' if is_sub else 'danger'), KeyboardButton(text='📁 Каталог папок с чатами', style='success' if is_sub else 'danger')],
+        [KeyboardButton(text='💳 Подписка', style='success')],
         [KeyboardButton(text='🎁 Промо', style='primary'), KeyboardButton(text='🤝 Партнеры', style='primary')],
         [KeyboardButton(text='ℹ️ Информация')]]
     if is_admin:
@@ -343,6 +349,7 @@ def cancel_inline_keyboard():
 
 def account_connected_keyboard(account_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Установить / сменить 2FA", callback_data=f"acc_2fa_{account_id}")],
         [InlineKeyboardButton(text="🔥 Запустить автопрогрев", callback_data=f"warmup_start_{account_id}")],
         [InlineKeyboardButton(text="📱 Открыть аккаунт", callback_data=f"manage_acc_{account_id}")],
     ])
@@ -383,6 +390,7 @@ async def check_mandatory_subscription(user_id: int, bot: Bot, ADMIN: int) -> bo
     if cached and cached[2] == channel and now - cached[1] < (5 if not cached[0] else 30):
         return cached[0]
 
+    transient_error = False
     try:
         member = await asyncio.wait_for(
             bot.get_chat_member(channel, user_id), timeout=8
@@ -391,12 +399,22 @@ async def check_mandatory_subscription(user_id: int, bot: Bot, ADMIN: int) -> bo
         _mandatory_sub_cache[user_id] = (result, now, channel)
         return result
     except asyncio.TimeoutError:
+        transient_error = True
         logging.warning(
             "Mandatory subscription check timed out for user %s in %s",
             user_id, channel
         )
     except Exception as e:
+        transient_error = _is_bot_api_transport_error(e)
         logging.error(f"Error checking mandatory subscription for user {user_id} in channel {channel}: {e}")
+    # Не заставляем пользователя повторять /start после краткого обрыва
+    # соединения. Если ранее подписка уже подтверждалась, используем этот
+    # положительный результат и обновляем его TTL; следующая проверка всё
+    # равно выполнится позже. При первом обращении без кэша сохраняем
+    # безопасное поведение и не пропускаем неподтверждённого пользователя.
+    if transient_error and cached and cached[0] and cached[2] == channel:
+        _mandatory_sub_cache[user_id] = (True, now, channel)
+        return True
     # Короткий negative cache предотвращает шквал повторных /start, но не
     # блокирует повторную проверку надолго при временном сбое Telegram.
     _mandatory_sub_cache[user_id] = (False, now, channel)
@@ -646,6 +664,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     CHATS_PER_PAGE = 8
     user_selected_leave_chats: Dict[int, set] = {}
+    # Пароли 2FA держим только в памяти процесса, а не в FSM/Redis и не в БД.
+    twofa_pending: Dict[int, Dict[str, str]] = {}
 
     # Проверка сессий администратором — отдельная фоновая задача. Раньше весь
     # цикл выполнялся прямо внутри callback-хендлера, а каждый мёртвый прокси
@@ -1194,6 +1214,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             'bio': '👤 Массовая смена BIO',
             'join_link': '➕ Массовое вступление по ссылке',
             'spambot': '🛡 Массовая проверка спамблока',
+            'twofa': '🔐 Массовая настройка 2FA',
         }.get(action, '⚙️ Массовая операция')
         text = (
             f"{action_name}\n\nВыберите аккаунты:\n"
@@ -1485,6 +1506,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         await show_account_selection(callback, action, state, page=0)
 
+    @dp.callback_query(F.data == 'mass_2fa_start')
+    async def mass_2fa_start_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        twofa_pending.pop(callback.from_user.id, None)
+        await state.clear()
+        await show_account_selection(callback, 'twofa', state, page=0)
+
     @dp.callback_query(F.data.startswith('mass_action_next_'))
     async def mass_action_next_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
@@ -1557,6 +1585,18 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")],
                 ])
+            )
+        elif action == 'twofa':
+            twofa_pending.pop(callback.from_user.id, None)
+            await state.update_data(twofa_account_ids=selected)
+            await state.set_state(TwoFactorStates.WAITING_CURRENT)
+            await edit_message(
+                callback,
+                "🔐 <b>Массовая настройка 2FA</b>\n\n"
+                f"Выбрано аккаунтов: {len(selected)}\n"
+                "Введите текущий пароль 2FA.\n"
+                "Если 2FA ещё нет, отправьте слово <code>нет</code>.",
+                reply_markup=cancel_inline_keyboard(),
             )
 
     @dp.callback_query(F.data == "refresh_mass_spam")
@@ -1851,6 +1891,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         _stop_qr_poller(callback.from_user.id)
         if account_manager:
             account_manager.cancel_phone_auth(callback.from_user.id)
+        twofa_pending.pop(callback.from_user.id, None)
         data = await state.get_data()
         import_dirs = {data.get('pyro_import_dir'), data.get('mass_import_dir')}
         for import_dir in import_dirs:
@@ -3114,6 +3155,50 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         await render_accounts_screen(message, user_id, page=0)
 
+    @dp.message(F.text == '📣 Кампании')
+    async def campaigns_menu_handler(message: Message, state: FSMContext):
+        await state.clear()
+        user_id = message.from_user.id
+        if not db.is_user_subscribed(user_id, ADMIN):
+            await message.answer("🔒 Для использования кампаний требуется активная подписка.")
+            return
+        await message.answer(
+            "📣 <b>Кампании</b>\n\nВыберите действие и аккаунты для него:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📨 Рассылка", callback_data="campaign_spam"),
+                 InlineKeyboardButton(text="📥 Инвайтинг", callback_data="campaign_invite")],
+                [InlineKeyboardButton(text="➕ Вступление по ссылке", callback_data="campaign_join"),
+                 InlineKeyboardButton(text="🛡 Спамблок", callback_data="campaign_spambot")],
+                [InlineKeyboardButton(text="🧠 Нейрокомментинг", callback_data="campaign_neuro")],
+                [InlineKeyboardButton(text="📱 Аккаунты и автопостинг", callback_data="campaign_accounts")],
+                [InlineKeyboardButton(text="◀️ Главная", callback_data="back_to_main")],
+            ])
+        )
+
+    @dp.callback_query(F.data.in_({
+        'campaign_spam', 'campaign_invite', 'campaign_join',
+        'campaign_spambot', 'campaign_accounts', 'campaign_neuro',
+    }))
+    async def campaign_action_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        action = {
+            'campaign_spam': 'spam',
+            'campaign_invite': 'invite',
+            'campaign_join': 'join_link',
+            'campaign_spambot': 'spambot',
+        }.get(callback.data)
+        user_id = callback.from_user.id
+        if not db.is_user_subscribed(user_id, ADMIN):
+            await _answer_callback(callback, "🔒 Требуется активная подписка!", show_alert=True)
+            return
+        await state.clear()
+        if callback.data == 'campaign_accounts':
+            await render_accounts_screen(callback, user_id, page=0)
+        elif callback.data == 'campaign_neuro':
+            await neurocomment_menu_handler(callback.message, state, user_id=user_id, page=0)
+        else:
+            await show_account_selection(callback, action, state, page=0)
+
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
         user_id = callback.from_user.id
@@ -3796,7 +3881,19 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 ))
                 if len(failed) > 20:
                     summary.append(f"… и ещё {len(failed) - 20}")
-            await status.edit_text('\n'.join(summary))
+            summary_markup = None
+            if imported:
+                summary_markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="🔐 Настроить / сменить 2FA",
+                        callback_data="mass_2fa_start"
+                    )],
+                    [InlineKeyboardButton(
+                        text="📱 К аккаунтам",
+                        callback_data="back_to_accounts"
+                    )],
+                ])
+            await status.edit_text('\n'.join(summary), reply_markup=summary_markup)
         except Exception as error:
             logger.error('Bulk account import failed: %s', type(error).__name__, exc_info=True)
             await status.edit_text('❌ Массовый импорт прерван. Проверьте архив и список прокси.')
@@ -3890,6 +3987,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
              InlineKeyboardButton(text="📦 Вступить из пака", callback_data=f"acc_join_pack_{account_id}")],
             [InlineKeyboardButton(text="🌐 Прокси", callback_data=f"acc_proxy_{account_id}"),
              InlineKeyboardButton(text="🔎 Проверить прокси", callback_data=f"acc_proxy_check_{account_id}")],
+            [InlineKeyboardButton(text="🔐 Установить / сменить 2FA", callback_data=f"acc_2fa_{account_id}")],
             [InlineKeyboardButton(text="🛡 Проверить спамблок", callback_data=f"acc_spambot_check_{account_id}")],
             [InlineKeyboardButton(text="🤖 Автоответчик", callback_data=f"acc_autoresponder_{account_id}"),
              InlineKeyboardButton(text="👤 Изменить BIO", callback_data=f"acc_bio_{account_id}")],
@@ -7531,6 +7629,125 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await message.answer(
             "✅ Новый прокси подключён. Нажмите «🔎 Проверить прокси», "
             "чтобы проверить его до запуска задач."
+        )
+
+    # ==================== TWO-FACTOR PASSWORD ====================
+    @dp.callback_query(F.data.startswith('acc_2fa_'))
+    async def acc_2fa_callback(callback: CallbackQuery, state: FSMContext):
+        account_id = int(callback.data.rsplit('_', 1)[1])
+        account = db.get_account(account_id)
+        if not account or int(account.get('user_id') or 0) != int(callback.from_user.id):
+            await _answer_callback(callback, "❌ Аккаунт не найден!", show_alert=True)
+            return
+        await _answer_callback(callback)
+        twofa_pending.pop(callback.from_user.id, None)
+        await state.clear()
+        await state.update_data(twofa_account_ids=[account_id])
+        await state.set_state(TwoFactorStates.WAITING_CURRENT)
+        await edit_message(
+            callback,
+            "🔐 <b>Установить или сменить 2FA</b>\n\n"
+            "Введите текущий пароль 2FA.\n"
+            "Если 2FA ещё не установлена, отправьте слово <code>нет</code>.",
+            reply_markup=cancel_inline_keyboard(),
+        )
+
+    @dp.message(TwoFactorStates.WAITING_CURRENT)
+    async def process_2fa_current_password(message: Message, state: FSMContext):
+        current = (message.text or '').strip()
+        if not current:
+            await message.answer("❌ Введите текущий пароль или отправьте слово «нет».")
+            return
+        if current.casefold() in {'нет', 'нету', 'no', 'none', 'отсутствует', '-'}:
+            current = ''
+        twofa_pending[message.from_user.id] = {'current': current}
+        await state.set_state(TwoFactorStates.WAITING_NEW)
+        await message.answer(
+            "🔐 Введите новый пароль 2FA.\n"
+            "Пароль не сохраняется в базе данных.",
+            reply_markup=cancel_inline_keyboard(),
+        )
+
+    @dp.message(TwoFactorStates.WAITING_NEW)
+    async def process_2fa_new_password(message: Message, state: FSMContext):
+        new_password = (message.text or '').strip()
+        if len(new_password) < 1 or len(new_password) > 256:
+            await message.answer("❌ Новый пароль должен содержать от 1 до 256 символов.")
+            return
+        pending = twofa_pending.get(message.from_user.id)
+        if pending is None:
+            await state.clear()
+            await message.answer("⌛ Сессия настройки 2FA истекла. Нажмите кнопку заново.")
+            return
+        if pending.get('current') and new_password == pending.get('current'):
+            await message.answer("❌ Новый пароль должен отличаться от текущего.")
+            return
+        pending['new'] = new_password
+        await state.set_state(TwoFactorStates.WAITING_HINT)
+        await message.answer(
+            "💡 Введите подсказку для 2FA или отправьте «-», чтобы пропустить.",
+            reply_markup=cancel_inline_keyboard(),
+        )
+
+    @dp.message(TwoFactorStates.WAITING_HINT)
+    async def process_2fa_hint(message: Message, state: FSMContext):
+        data = await state.get_data()
+        pending = twofa_pending.pop(message.from_user.id, None) or {}
+        hint = (message.text or '').strip()
+        if hint.casefold() in {'-', 'нет', 'нету', 'no', 'none'}:
+            hint = ''
+        requested_ids = data.get('twofa_account_ids') or []
+        owned_ids = {int(account['id']) for account in db.get_user_accounts(message.from_user.id)}
+        account_ids = list(dict.fromkeys(
+            int(account_id) for account_id in requested_ids
+            if str(account_id).lstrip('-').isdigit() and int(account_id) in owned_ids
+        ))
+        if 'new' not in pending:
+            await state.clear()
+            await message.answer("⌛ Сессия настройки 2FA истекла. Нажмите кнопку заново.")
+            return
+        current = pending.get('current', '')
+        new_password = pending.get('new', '')
+        await state.clear()
+        if not account_ids:
+            await message.answer("❌ Не найдено доступных аккаунтов.")
+            return
+
+        await message.answer(f"⏳ Настраиваю 2FA на {len(account_ids)} аккаунтах...")
+        semaphore = asyncio.Semaphore(3)
+
+        async def update_one(account_id):
+            async with semaphore:
+                account = db.get_account(account_id) or {}
+                name = account.get('account_name') or f"Аккаунт #{account_id}"
+                try:
+                    ok, result = await account_manager.set_account_2fa(
+                        account_id, message.from_user.id, current, new_password, hint
+                    )
+                    return name, bool(ok), str(result or '')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error('2FA operation failed for account %s: %s', account_id, error, exc_info=True)
+                    return name, False, f'{type(error).__name__}: {error}'
+
+        results = await asyncio.gather(*(update_one(account_id) for account_id in account_ids))
+        success = sum(1 for _name, ok, _result in results if ok)
+        lines = [
+            "🔐 <b>Настройка 2FA завершена</b>",
+            f"✅ Успешно: {success}/{len(results)}",
+        ]
+        for name, ok, result in results:
+            detail = ' '.join(result.split())
+            lines.append(
+                f"{'✅' if ok else '❌'} <b>{html_escape(name)}</b>"
+                + (f": {html_escape(detail[:180])}" if detail else '')
+            )
+        await message.answer(
+            '\n'.join(lines)[:3900],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")]
+            ])
         )
 
     # ==================== BIO & AUTORESPONDER ====================

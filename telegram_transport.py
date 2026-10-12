@@ -90,6 +90,16 @@ class ResilientAiohttpSession(AiohttpSession):
             except (TelegramNetworkError, asyncio.TimeoutError) as error:
                 if attempt >= self.max_network_retries:
                     raise
+                # After a long idle period the pooled TCP connection can be
+                # half-closed by a NAT/proxy. Recreate the aiohttp session
+                # before retrying instead of sending the next request through
+                # the same stale socket.
+                stale_session = getattr(self, '_session', None)
+                if stale_session is not None and not stale_session.closed:
+                    try:
+                        await stale_session.close()
+                    except Exception:
+                        logger.debug('Could not close stale Bot API session', exc_info=True)
                 delay = self.retry_delay * (attempt + 1)
                 logger.warning(
                     "Telegram Bot API network timeout for %s; bounded retry %s/%s in %.2fs",

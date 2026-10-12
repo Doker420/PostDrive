@@ -258,6 +258,28 @@ async def _start_yoomoney_webhook():
         _yoomoney_runner = None
 
 
+async def _polling_supervisor():
+    """Keep Telegram polling alive after idle/stale-connection failures."""
+    backoff = 1
+    while not _shutdown_event.is_set():
+        try:
+            await dp.start_polling(bot, skip_updates=True)
+            if _shutdown_event.is_set():
+                break
+            logger.warning("Telegram polling ended unexpectedly; reconnecting")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.exception("Telegram polling failed; will reconnect: %s", error)
+        if _shutdown_event.is_set():
+            break
+        try:
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, 30)
+
+
 async def main():
     global _yoomoney_start_task
     print("=" * 60)
@@ -275,7 +297,7 @@ async def main():
     # Start polling first. The optional YooMoney listener is launched as a
     # bounded background task so a bind/DNS/proxy issue cannot block /start or
     # any other Telegram command.
-    polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
+    polling_task = asyncio.create_task(_polling_supervisor())
     if YOOMONEY_ENABLED:
         _yoomoney_start_task = asyncio.create_task(_start_yoomoney_webhook())
     else:
