@@ -176,6 +176,14 @@ def test_user_safety_guards_are_present():
     assert "join_pack_goto_page_" in handlers
     assert "account_manager.bind_account_api(account_id)" in handlers
     assert "check_all_proxies" in handlers
+    assert "mass_change_bio" in handlers
+    assert "MassActionStates.WAITING_BIO" in handlers
+    assert "mass_join_link" in handlers
+    assert "MassActionStates.WAITING_JOIN_LINKS" in handlers
+    assert "mass_spambot_check" in handlers
+    assert "_run_mass_spambot_check" in handlers
+    assert "PAGE_DIGITS" in handlers
+    assert "1️⃣" in handlers
     assert "spam_mode_forward" in handlers
     assert "client.forward_messages" in source
     assert "toggle_invite_auto_join" in handlers

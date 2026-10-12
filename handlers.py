@@ -301,6 +301,8 @@ class MassActionStates(StatesGroup):
     WAITING_POSTBOT_ID = State()
     WAITING_FORWARD_SOURCE = State()
     WAITING_CUSTOM_TEXT = State()
+    WAITING_BIO = State()
+    WAITING_JOIN_LINKS = State()
 
 class InviteStates(StatesGroup):
     SELECTING_CHAT = State()
@@ -707,6 +709,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         start = page * per_page
         return items[start:start + per_page], page, total_pages
 
+    PAGE_DIGITS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
+
+    def _page_number_row(total_pages: int, page: int, callback_factory, window: int = 4):
+        """Render compact direct page buttons (1️⃣ 2️⃣ 3️⃣ 4️⃣).
+
+        A four-button window keeps Telegram keyboards usable for very large
+        account lists while still making the common first pages one tap away.
+        """
+        if total_pages <= 1:
+            return []
+        window = max(1, min(int(window), len(PAGE_DIGITS), total_pages))
+        start = min(max(0, int(page) - 1), max(0, total_pages - window))
+        return [InlineKeyboardButton(
+            text=PAGE_DIGITS[index] if index < len(PAGE_DIGITS) else str(index + 1),
+            callback_data=callback_factory(index),
+        ) for index in range(start, min(total_pages, start + window))]
+
     async def render_accounts_screen(target, user_id: int, page: int = 0):
         """Render the account dashboard in pages instead of one huge keyboard."""
         accounts = db.get_user_accounts(user_id)
@@ -746,9 +765,18 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"accounts_page_{page + 1}"))
         buttons.append(nav)
+        page_numbers = _page_number_row(
+            total_pages, page, lambda number: f"accounts_page_{number}"
+        )
+        if page_numbers:
+            buttons.append(page_numbers)
         buttons.append([
-            InlineKeyboardButton(text="🔢 К странице", callback_data=f"accounts_goto_page_{page}"),
             InlineKeyboardButton(text="🔎 Проверить все прокси", callback_data="check_all_proxies"),
+            InlineKeyboardButton(text="🛡 Проверить спамблок", callback_data="mass_spambot_check"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="👤 Массово сменить BIO", callback_data="mass_change_bio"),
+            InlineKeyboardButton(text="➕ Массовое вступление", callback_data="mass_join_link"),
         ])
         buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1143,15 +1171,23 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mass_account_page_{action}_{page + 1}"))
         buttons.append(nav)
-        buttons.append([InlineKeyboardButton(
-            text="🔢 К странице",
-            callback_data=f"mass_account_goto_{action}_{page}"
-        )])
+        page_numbers = _page_number_row(
+            total_pages, page,
+            lambda number: f"mass_account_page_{action}_{number}"
+        )
+        if page_numbers:
+            buttons.append(page_numbers)
         buttons.append([InlineKeyboardButton(text="✅ Далее", callback_data=f"mass_action_next_{action}")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-        action_name = "📨 Рассылка" if action == "spam" else "📥 Инвайтинг"
+        action_name = {
+            'spam': '📨 Рассылка',
+            'invite': '📥 Инвайтинг',
+            'bio': '👤 Массовая смена BIO',
+            'join_link': '➕ Массовое вступление по ссылке',
+            'spambot': '🛡 Массовая проверка спамблока',
+        }.get(action, '⚙️ Массовая операция')
         text = (
             f"{action_name}\n\nВыберите аккаунты:\n"
             f"Выбрано: {len(selected)}\nСтраница: {page + 1}/{total_pages}"
@@ -1292,6 +1328,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             nav_buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"invite_chat_page_{page+1}"))
         if nav_buttons:
             buttons.append(nav_buttons)
+        page_numbers = _page_number_row(
+            total_pages, page, lambda number: f"invite_chat_page_{number}"
+        )
+        if page_numbers:
+            buttons.append(page_numbers)
 
         buttons.append([InlineKeyboardButton(text="🔗 Ввести ID/ссылку чата", callback_data="invite_custom_chat")])
         buttons.append([InlineKeyboardButton(
@@ -1326,17 +1367,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.startswith('mass_account_page_'))
     async def mass_account_page_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
-        parts = callback.data.split('_')
-        action = parts[3]
-        page = int(parts[4])
-        await show_account_selection(callback, action, state, page=page)
+        payload = callback.data[len('mass_account_page_'):]
+        action, page_text = payload.rsplit('_', 1)
+        await show_account_selection(callback, action, state, page=int(page_text))
 
     @dp.callback_query(F.data.startswith('mass_account_goto_'))
     async def mass_account_goto_page_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
-        parts = callback.data.split('_')
-        action = parts[3]
-        page = int(parts[4])
+        payload = callback.data[len('mass_account_goto_'):]
+        action, page_text = payload.rsplit('_', 1)
+        page = int(page_text)
         await state.set_state(AccountPageStates.WAITING_PAGE)
         await state.update_data(
             account_page_context='mass',
@@ -1352,34 +1392,80 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             ])
         )
 
-    @dp.callback_query(F.data.startswith('toggle_mass_spam_'))
-    async def toggle_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
+    @dp.callback_query(F.data.startswith('toggle_mass_'))
+    async def toggle_mass_account_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
-        account_id = int(callback.data.split('_')[3])
+        payload = callback.data[len('toggle_mass_'):]
+        action, account_text = payload.rsplit('_', 1)
+        account_id = int(account_text)
         data = await state.get_data()
-        selected = data.get('selected_accounts', [])
+        selected = list(data.get('selected_accounts') or [])
         if account_id in selected:
             selected.remove(account_id)
         else:
             selected.append(account_id)
         await state.update_data(selected_accounts=selected)
-        await show_account_selection(callback, 'spam', state)
+        await show_account_selection(callback, action, state)
 
-    @dp.callback_query(F.data.startswith('toggle_mass_invite_'))
-    async def toggle_mass_invite_callback(callback: CallbackQuery, state: FSMContext):
+    async def _run_mass_spambot_check(account_ids: list, user_id: int) -> list:
+        """Check selected accounts through SpamBot with bounded concurrency."""
+        semaphore = asyncio.Semaphore(3)
+
+        async def check_one(account_id):
+            async with semaphore:
+                account = db.get_account(int(account_id))
+                if not account or int(account.get('user_id') or 0) != int(user_id):
+                    return {'account_id': account_id, 'name': f'#{account_id}',
+                            'ok': False, 'result': 'Аккаунт не найден'}
+                name = account.get('account_name') or f"Аккаунт #{account_id}"
+                try:
+                    ok, result = await account_manager.check_spam_block(
+                        int(account_id), user_id
+                    )
+                    return {'account_id': account_id, 'name': name,
+                            'ok': bool(ok), 'result': str(result or '')}
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error('Массовая проверка SpamBot #%s: %s', account_id, error, exc_info=True)
+                    return {'account_id': account_id, 'name': name,
+                            'ok': False, 'result': f'{type(error).__name__}: {error}'}
+
+        return await asyncio.gather(*(check_one(account_id) for account_id in account_ids))
+
+    def _format_mass_spambot_result(results: list) -> str:
+        healthy = sum(1 for item in results if item.get('ok'))
+        restricted = len(results) - healthy
+        lines = [
+            "🛡 <b>Массовая проверка спамблока завершена</b>",
+            "",
+            f"Проверено: {len(results)}",
+            f"✅ Ограничений не обнаружено: {healthy}",
+            f"⚠️ Нужна проверка/есть проблема: {restricted}",
+            "",
+        ]
+        for item in results:
+            icon = '✅' if item.get('ok') else '⚠️'
+            detail = ' '.join(str(item.get('result') or '').split())
+            lines.append(f"{icon} <b>{html_escape(str(item.get('name') or ''))}</b>: "
+                         f"{html_escape(detail[:220])}")
+        text = '\n'.join(lines)
+        return text if len(text) <= 3900 else text[:3850] + "\n…"
+
+    @dp.callback_query(F.data.in_({'mass_change_bio', 'mass_join_link', 'mass_spambot_check'}))
+    async def mass_account_utility_start_callback(callback: CallbackQuery, state: FSMContext):
+        action = {
+            'mass_change_bio': 'bio',
+            'mass_join_link': 'join_link',
+            'mass_spambot_check': 'spambot',
+        }[callback.data]
         await _answer_callback(callback)
-        account_id = int(callback.data.split('_')[3])
-        data = await state.get_data()
-        selected = data.get('selected_accounts', [])
-        if account_id in selected:
-            selected.remove(account_id)
-        else:
-            selected.append(account_id)
-        await state.update_data(selected_accounts=selected)
-        await show_account_selection(callback, 'invite', state)
+        await state.clear()
+        await show_account_selection(callback, action, state, page=0)
 
     @dp.callback_query(F.data.startswith('mass_action_next_'))
     async def mass_action_next_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         data = await state.get_data()
         action = data.get('action_type')
         selected = data.get('selected_accounts', [])
@@ -1414,6 +1500,42 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 invite_auto_join=True,
             )
             await show_invite_chat_selection(callback, state)
+        elif action == 'bio':
+            await state.update_data(mass_bio_account_ids=selected)
+            await state.set_state(MassActionStates.WAITING_BIO)
+            await edit_message(
+                callback,
+                "👤 <b>Массовая смена BIO</b>\n\n"
+                f"Выбрано аккаунтов: {len(selected)}\n"
+                "Отправьте новый BIO одним сообщением (до 70 символов):",
+                reply_markup=cancel_inline_keyboard(),
+            )
+        elif action == 'join_link':
+            await state.update_data(mass_join_account_ids=selected)
+            await state.set_state(MassActionStates.WAITING_JOIN_LINKS)
+            await edit_message(
+                callback,
+                "➕ <b>Массовое вступление</b>\n\n"
+                f"Выбрано аккаунтов: {len(selected)}\n"
+                "Отправьте ссылку на чат или несколько ссылок по одной на строку.\n"
+                "Можно также отправить TXT-файл.",
+                reply_markup=cancel_inline_keyboard(),
+            )
+        elif action == 'spambot':
+            await state.clear()
+            await edit_message(
+                callback,
+                "⏳ <b>Массовая проверка спамблока</b>\n\n"
+                f"Проверяю аккаунты: {len(selected)}. Это может занять несколько минут..."
+            )
+            results = await _run_mass_spambot_check(selected, callback.from_user.id)
+            await edit_message(
+                callback,
+                _format_mass_spambot_result(results),
+                InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")],
+                ])
+            )
 
     @dp.callback_query(F.data == "refresh_mass_spam")
     async def refresh_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
@@ -1472,6 +1594,108 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             } for e in caption_entities])
         await state.update_data(custom_spam_text=text, custom_spam_entities=entities_json)
         await ask_for_spam_targets(message, state)
+
+    @dp.message(MassActionStates.WAITING_BIO)
+    async def process_mass_bio(message: Message, state: FSMContext):
+        new_bio = (message.text or '').strip()
+        if not new_bio:
+            await message.answer("❌ Отправьте текст BIO одним сообщением.")
+            return
+        if len(new_bio) > 70:
+            await message.answer(
+                f"❌ BIO слишком длинное: {len(new_bio)} символов. Telegram разрешает максимум 70."
+            )
+            return
+
+        data = await state.get_data()
+        requested_ids = data.get('mass_bio_account_ids') or []
+        owned_ids = {
+            int(account['id']) for account in db.get_user_accounts(message.from_user.id)
+        }
+        account_ids = [int(account_id) for account_id in requested_ids
+                       if str(account_id).lstrip('-').isdigit() and int(account_id) in owned_ids]
+        if not account_ids:
+            await state.clear()
+            await message.answer("❌ Не найдено доступных выбранных аккаунтов.")
+            return
+
+        await state.clear()
+        await message.answer(f"⏳ Меняю BIO на {len(account_ids)} аккаунтах...")
+        semaphore = asyncio.Semaphore(4)
+
+        async def change_one(account_id):
+            async with semaphore:
+                account = db.get_account(account_id) or {}
+                name = account.get('account_name') or f"Аккаунт #{account_id}"
+                try:
+                    ok, result = await account_manager.change_account_bio(account_id, new_bio)
+                    return name, bool(ok), str(result or '')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error('Массовая смена BIO #%s: %s', account_id, error, exc_info=True)
+                    return name, False, f'{type(error).__name__}: {error}'
+
+        results = await asyncio.gather(*(change_one(account_id) for account_id in account_ids))
+        changed = sum(1 for _name, ok, _result in results if ok)
+        lines = [f"👤 <b>Массовая смена BIO завершена</b>",
+                 f"✅ Изменено: {changed}/{len(results)}"]
+        for name, ok, result in results:
+            detail = ' '.join(result.split())
+            lines.append(f"{'✅' if ok else '❌'} <b>{html_escape(name)}</b>"
+                         + (f": {html_escape(detail[:180])}" if not ok and detail else ''))
+        await message.answer(
+            '\n'.join(lines)[:3900],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")]
+            ])
+        )
+
+    @dp.message(MassActionStates.WAITING_JOIN_LINKS)
+    async def process_mass_join_links(message: Message, state: FSMContext):
+        data = await state.get_data()
+        requested_ids = data.get('mass_join_account_ids') or []
+        links = []
+        if message.document:
+            try:
+                file = await bot.get_file(message.document.file_id)
+                content = await bot.download_file(file.file_path)
+                links = [line.strip() for line in content.read().decode('utf-8', errors='replace').splitlines()
+                         if line.strip()]
+            except Exception as error:
+                await message.answer(f"❌ Не удалось прочитать TXT-файл: {error}")
+                return
+        elif message.text:
+            links = [line.strip() for line in message.text.splitlines() if line.strip()]
+
+        if not links:
+            await message.answer("❌ Отправьте ссылку на чат или TXT-файл со ссылками.")
+            return
+
+        owned_ids = {
+            int(account['id']) for account in db.get_user_accounts(message.from_user.id)
+        }
+        account_ids = [int(account_id) for account_id in requested_ids
+                       if str(account_id).lstrip('-').isdigit() and int(account_id) in owned_ids]
+        account_ids = list(dict.fromkeys(account_ids))
+        if not account_ids:
+            await state.clear()
+            await message.answer("❌ Не найдено доступных выбранных аккаунтов.")
+            return
+
+        await state.clear()
+        user_id = message.from_user.id
+        for account_id in account_ids:
+            asyncio.create_task(account_manager.run_limited(
+                account_manager.join_chats_batch(account_id, links, bot, user_id)
+            ))
+        await message.answer(
+            f"🚀 Вступление запущено на {len(account_ids)} аккаунтах.\n"
+            f"Ссылок в очереди: {len(links)}.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")]
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('invite_chat_page_'))
     async def invite_chat_page_callback(callback: CallbackQuery, state: FSMContext):
@@ -4597,10 +4821,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nc_page_{page + 1}"))
         buttons.append(nav)
-        buttons.append([InlineKeyboardButton(
-            text="🔢 К странице",
-            callback_data=f"nc_goto_page_{page}"
-        )])
+        page_numbers = _page_number_row(
+            total_pages, page, lambda number: f"nc_page_{number}"
+        )
+        if page_numbers:
+            buttons.append(page_numbers)
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await send_photo(
@@ -6425,10 +6650,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"join_pack_page_{pack_id}_{page + 1}"))
         buttons.append(nav)
-        buttons.append([InlineKeyboardButton(
-            text="🔢 К странице",
-            callback_data=f"join_pack_goto_page_{pack_id}_{page}"
-        )])
+        page_numbers = _page_number_row(
+            total_pages, page,
+            lambda number: f"join_pack_page_{pack_id}_{number}"
+        )
+        if page_numbers:
+            buttons.append(page_numbers)
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"user_pack_{pack_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         text = f"📱 <b>Выберите аккаунт для вступления:</b>\nСтраница: {page + 1}/{total_pages}"
