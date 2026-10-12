@@ -1057,11 +1057,16 @@ class AccountSessionManager:
                 logger.error("watchdog: ошибка возобновления warmup %s: %s", account_id, error, exc_info=True)
 
     async def start_cleanup_loop(self):
-        """Background task that periodically cleans up idle clients and AR_HISTORY."""
+        """Background task for cleanup and expiry of temporary account restrictions."""
         await self._restore_stalled_warmups()
         while True:
             try:
-                await asyncio.sleep(300)  # every 5 minutes
+                # Keep the persisted health state in sync even when nobody opens
+                # the account screen or starts a task after the restriction expires.
+                expired = db.reset_expired_account_health()
+                if expired:
+                    logger.info("Automatically cleared %s expired account restriction(s)", expired)
+                await asyncio.sleep(60)
                 cleanup_ar_history()
                 await self._evict_idle_clients()
                 await self._enforce_client_limit()

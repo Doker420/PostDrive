@@ -105,6 +105,18 @@ async def main():
     assert ok, "после истечения кулдауна аккаунт снова доступен"
     results.append("cooldown expiry: OK")
 
+    # 6b. Ограничение с конечным сроком очищается, а постоянные состояния — нет.
+    db.set_account_health(1, db.HEALTH_RESTRICTED, "temporary restriction", restricted_until=int(time.time()) - 5)
+    assert db.get_account_health(1)['health'] == db.HEALTH_OK
+    db.set_account_health(1, db.HEALTH_RESTRICTED, "manual review")
+    assert db.get_account_health(1)['health'] == db.HEALTH_RESTRICTED
+    db.set_account_health(1, db.HEALTH_BANNED, "banned", restricted_until=int(time.time()) - 5)
+    assert db.get_account_health(1)['health'] == db.HEALTH_BANNED
+    db.set_account_health(1, db.HEALTH_PROXY_ERROR, "proxy", restricted_until=int(time.time()) - 5)
+    assert db.get_account_health(1)['health'] == db.HEALTH_PROXY_ERROR
+    db.clear_account_health(1)
+    results.append("temporary restriction expiry without clearing permanent/proxy states: OK")
+
     # 7. Повторные FloodWait подряд -> исчерпание попыток
     slept.clear()
     async def always_flood():

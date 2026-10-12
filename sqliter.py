@@ -1448,10 +1448,15 @@ class DBConnection(metaclass=_PoolBoundMeta):
         return self.c.lastrowid
 
     def get_user_accounts(self, user_id: int) -> List[Dict[str, Any]]:
+        # Account lists are also a normal entry point after a cooldown expires.
+        self.reset_expired_account_health()
         self.c.execute('SELECT * FROM accounts WHERE user_id = ? ORDER BY id ASC', (user_id,))
         return self._dict_fetchall()
 
     def get_account(self, account_id: int) -> Optional[Dict[str, Any]]:
+        # Keep single-account settings screens in sync even if the watchdog has
+        # not run since the restriction expired.
+        self.reset_expired_account_health()
         self.c.execute('SELECT * FROM accounts WHERE id = ?', (account_id,))
         return self._dict_fetchone()
 
@@ -2566,6 +2571,22 @@ class DBConnection(metaclass=_PoolBoundMeta):
         )
         self.conn_ctx.commit()
 
+    def reset_expired_account_health(self, now: int = None) -> int:
+        """Automatically clear finite restrictions whose window has expired."""
+        now = int(time.time() if now is None else now)
+        self.c.execute(
+            """UPDATE accounts
+               SET health = 'ok', health_reason = '', restricted_until = 0
+               WHERE health IN ('cooldown', 'restricted')
+                 AND restricted_until > 0
+                 AND restricted_until <= ?""",
+            (now,)
+        )
+        changed = int(getattr(self.c, 'rowcount', 0) or 0)
+        if changed:
+            self.conn_ctx.commit()
+        return changed
+
     def clear_false_channel_bans(self) -> int:
         """Repair old false account-wide bans caused by UserBannedInChannel."""
         self.c.execute(
@@ -2618,8 +2639,13 @@ class DBConnection(metaclass=_PoolBoundMeta):
             return {'health': self.HEALTH_OK, 'health_reason': '', 'restricted_until': 0,
                     'flood_count': 0, 'flood_total_seconds': 0, 'last_flood_at': 0}
         now = int(time.time())
-        # Кулдаун истёк — считаем аккаунт снова здоровым
-        if row.get('health') == self.HEALTH_COOLDOWN and int(row.get('restricted_until') or 0) <= now:
+        # Временный cooldown/ограничение истёк — считаем аккаунт снова здоровым.
+        # Ограничения без срока, бан и proxy_error намеренно не очищаем.
+        if (
+            row.get('health') in (self.HEALTH_COOLDOWN, self.HEALTH_RESTRICTED)
+            and int(row.get('restricted_until') or 0) > 0
+            and int(row.get('restricted_until') or 0) <= now
+        ):
             self.clear_account_health(account_id)
             row['health'] = self.HEALTH_OK
             row['health_reason'] = ''
