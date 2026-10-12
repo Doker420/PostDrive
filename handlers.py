@@ -232,6 +232,13 @@ class AddAccountStates(StatesGroup):
 class AccountPageStates(StatesGroup):
     WAITING_PAGE = State()
 
+class BlacklistStates(StatesGroup):
+    WAITING_TARGET = State()
+    WAITING_IMPORT = State()
+
+class CampaignDraftStates(StatesGroup):
+    WAITING_NAME = State()
+
 class AccountPostStates(StatesGroup):
     WAITING_TEXT = State()
     WAITING_PHOTO = State()
@@ -791,8 +798,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page_numbers:
             buttons.append(page_numbers)
         buttons.append([
+            InlineKeyboardButton(text="🩺 Центр здоровья", callback_data="account_health_center"),
+            InlineKeyboardButton(text="📜 Журнал", callback_data="operation_history"),
+        ])
+        buttons.append([
             InlineKeyboardButton(text="🔎 Проверить все прокси", callback_data="check_all_proxies"),
             InlineKeyboardButton(text="🛡 Проверить спамблок", callback_data="mass_spambot_check"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text="🚫 Blacklist / отписки", callback_data="blacklist_menu"),
+            InlineKeyboardButton(text="💾 Резервная копия", callback_data="backup_menu"),
         ])
         buttons.append([
             InlineKeyboardButton(text="👤 Массово сменить BIO", callback_data="mass_change_bio"),
@@ -1320,6 +1335,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             )],
             [InlineKeyboardButton(text="📮 Через @PostBot", callback_data="spam_postbot_mode")],
             [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
+            [InlineKeyboardButton(text="👁 Предпросмотр кампании", callback_data="spam_preview")],
+            [InlineKeyboardButton(text="💾 Сохранить черновик", callback_data="save_spam_draft")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ]
@@ -1854,6 +1871,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 seen_targets.add(key)
                 unique_users.append(raw.strip())
 
+        unique_users, blocked_users = db.filter_blacklisted_targets(user_id, unique_users)
+        if blocked_users:
+            await message.answer(f"🚫 Из инвайтинга исключено целей из blacklist: {len(blocked_users)}")
+
         valid_account_ids = []
         for raw_account_id in account_ids:
             if not raw_account_id:
@@ -1972,13 +1993,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 f"ℹ️ Убрано дубликатов: {len(parsed_targets) - len(unique_targets)}. "
                 f"Итого уникальных: {len(unique_targets)}")
 
+        parsed_targets, blocked_targets = db.filter_blacklisted_targets(user_id, unique_targets)
+        if blocked_targets:
+            await answer_to.answer(
+                f"🚫 Из кампании исключено целей из blacklist: {len(blocked_targets)}"
+            )
+        if not parsed_targets:
+            await answer_to.answer("❌ Все цели находятся в blacklist.")
+            return
+
         account_ids = [a for a in account_ids if a]
         if not account_ids:
             await answer_to.answer("❌ Не выбрано ни одного аккаунта.")
             return
 
         report_id, start_error = await account_manager.start_spam_job(
-            account_ids, unique_targets, bot, user_id,
+            account_ids, parsed_targets, bot, user_id,
             mode=mode, custom_text=custom_text,
             custom_entities=custom_entities,
             delay_min=delay_min, delay_max=delay_max,
@@ -3193,6 +3223,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                  InlineKeyboardButton(text="🛡 Спамблок", callback_data="campaign_spambot")],
                 [InlineKeyboardButton(text="🧠 Нейрокомментинг", callback_data="campaign_neuro")],
                 [InlineKeyboardButton(text="📱 Аккаунты и автопостинг", callback_data="campaign_accounts")],
+                [InlineKeyboardButton(text="📐 Черновики кампаний", callback_data="campaign_drafts")],
+                [InlineKeyboardButton(text="📜 История операций", callback_data="operation_history")],
+                [InlineKeyboardButton(text="🚫 Blacklist / отписки", callback_data="blacklist_menu")],
                 [InlineKeyboardButton(text="◀️ Главная", callback_data="back_to_main")],
             ])
         )
@@ -3200,6 +3233,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     @dp.callback_query(F.data.in_({
         'campaign_spam', 'campaign_invite', 'campaign_join',
         'campaign_spambot', 'campaign_accounts', 'campaign_neuro',
+        'campaign_drafts',
     }))
     async def campaign_action_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
@@ -3217,7 +3251,9 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if callback.data == 'campaign_accounts':
             await render_accounts_screen(callback, user_id, page=0)
         elif callback.data == 'campaign_neuro':
-            await neurocomment_menu_handler(callback.message, state, user_id=user_id, page=0)
+            await neurocomment_menu_handler(callback.message, state, user_id=user_id)
+        elif callback.data == 'campaign_drafts':
+            await render_campaign_drafts(callback, user_id)
         else:
             await show_account_selection(callback, action, state, page=0)
 
@@ -3695,18 +3731,43 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 if unrecognized:
                     detail = '\nНераспознанные элементы: ' + ', '.join(unrecognized[:10])
                 raise ValueError('в архиве не найдены .session-файлы или папки tdata' + detail)
+            import_run_id = db.create_import_run(
+                message.from_user.id, message.document.file_name or 'accounts.zip',
+                total=len(candidates), valid_count=len(candidates)
+            )
+            for candidate in candidates:
+                db.add_import_run_item(import_run_id, candidate.get('label', ''),
+                                        candidate.get('kind', ''), 'preview')
+            for item in unrecognized:
+                db.add_import_run_item(import_run_id, item, 'unknown', 'unsupported',
+                                       'Файл не относится к поддерживаемому формату')
+            db.write_audit(message.from_user.id, 'import_preview', 'import_run', import_run_id,
+                           {'candidates': len(candidates), 'unrecognized': len(unrecognized)})
             await state.update_data(
                 mass_import_dir=import_dir,
                 mass_candidates=candidates,
                 mass_unrecognized=unrecognized,
+                mass_import_run_id=import_run_id,
             )
             await state.set_state(AddAccountStates.WAITING_MASS_PROXY_LIST)
+            preview = [
+                f"🔎 <b>Предпросмотр ZIP (dry-run)</b>",
+                f"Поддерживаемых заготовок: <b>{len(candidates)}</b>",
+                f"Нераспознанных элементов: <b>{len(unrecognized)}</b>",
+                '',
+                "Пока ничего не добавлено в базу. После продолжения можно назначить прокси и запустить проверку.",
+                "Прокси будут проверены до использования, каждый рабочий прокси будет привязан максимум к 5 аккаунтам.",
+            ]
+            if candidates:
+                preview.append('')
+                preview.extend(f"• {html_escape(item.get('label', ''))} ({item.get('kind', '')})"
+                               for item in candidates[:10])
+                if len(candidates) > 10:
+                    preview.append(f"… и ещё {len(candidates) - 10}")
             await message.answer(
-                f"✅ Архив распознан. Найдено заготовок аккаунтов: <b>{len(candidates)}</b>.\n\n"
-                "Теперь отправьте список прокси — по одному на строку — или TXT-файл. "
-                "Каждый рабочий прокси будет привязан максимум к 5 аккаунтам.\n\n"
-                "Если прокси не нужны, нажмите кнопку ниже.",
+                '\n'.join(preview),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➡️ Продолжить к прокси", callback_data="mass_import_continue")],
                     [InlineKeyboardButton(text="➡️ Импортировать без прокси", callback_data="mass_skip_proxy")],
                     [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
                 ])
@@ -3720,6 +3781,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         import_dir = data.get('mass_import_dir')
         candidates = data.get('mass_candidates') or []
         unrecognized = data.get('mass_unrecognized') or []
+        import_run_id = int(data.get('mass_import_run_id') or 0)
         response = target.message if isinstance(target, CallbackQuery) else target
         user_id = target.from_user.id
         if not import_dir or not candidates:
@@ -3904,6 +3966,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 if len(failed) > 20:
                     summary.append(f"… и ещё {len(failed) - 20}")
             summary_markup = None
+            if import_run_id:
+                db.update_import_run(
+                    import_run_id, status='finished', imported_count=len(imported),
+                    error_count=len(failed),
+                )
+                db.write_audit(user_id, 'import_finished', 'import_run', import_run_id,
+                               {'imported': len(imported), 'errors': len(failed)})
             if imported:
                 summary_markup = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(
@@ -3918,10 +3987,28 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await status.edit_text('\n'.join(summary), reply_markup=summary_markup)
         except Exception as error:
             logger.error('Bulk account import failed: %s', type(error).__name__, exc_info=True)
+            if import_run_id:
+                db.update_import_run(import_run_id, status='failed', error_count=1)
+                db.write_audit(user_id, 'import_failed', 'import_run', import_run_id,
+                               {'error': type(error).__name__})
             await status.edit_text('❌ Массовый импорт прерван. Проверьте архив и список прокси.')
         finally:
             await state.clear()
             shutil.rmtree(import_dir, ignore_errors=True)
+
+    @dp.callback_query(F.data == "mass_import_continue", AddAccountStates.WAITING_MASS_PROXY_LIST)
+    async def mass_import_continue_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await edit_message(
+            callback,
+            "📡 <b>Шаг 2: Прокси для импорта</b>\n\n"
+            "Отправьте список по одному на строку или TXT-файл.\n"
+            "Каждый адрес будет проверен до использования, максимум 5 аккаунтов на рабочий прокси.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➡️ Импортировать без прокси", callback_data="mass_skip_proxy")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")],
+            ])
+        )
 
     @dp.callback_query(F.data == "mass_skip_proxy", AddAccountStates.WAITING_MASS_PROXY_LIST)
     async def mass_skip_proxy_callback(callback: CallbackQuery, state: FSMContext):
@@ -3953,6 +4040,493 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             )
             return
         await _finish_mass_account_import(message, state, proxy_lines)
+
+    # ==================== HEALTH / BLACKLIST / REPORTS ====================
+    def _health_label(account: dict) -> tuple:
+        health = account.get('health') or 'ok'
+        labels = {
+            'ok': ('🟢', 'Готов'),
+            'cooldown': ('⏳', 'Cooldown'),
+            'restricted': ('⚠️', 'Ограничен'),
+            'banned': ('🚫', 'Сессия недействительна'),
+            'proxy_error': ('🌐', 'Ошибка прокси'),
+        }
+        return labels.get(health, ('❔', health))
+
+    async def render_health_center(target, user_id: int, page: int = 0, notice: str = ''):
+        accounts = db.get_user_health_center(user_id)
+        visible, page, total_pages = _account_page(accounts, page)
+        lines = [
+            "🩺 <b>Центр здоровья аккаунтов</b>",
+            f"Всего аккаунтов: <b>{len(accounts)}</b> · страница {page + 1}/{total_pages}",
+        ]
+        if notice:
+            lines.extend(['', html_escape(notice)])
+        buttons = []
+        for account in visible:
+            icon, label = _health_label(account)
+            name = html_escape(account.get('account_name') or f"Аккаунт #{account['id']}")
+            check = account.get('last_health_check') or {}
+            checked = format_date(check.get('checked_at')) if check else 'не проверялся'
+            buttons.append([InlineKeyboardButton(
+                text=f"{icon} {name} · {label} · {checked}",
+                callback_data=f"manage_acc_{account['id']}"
+            )])
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'health_page_{page - 1}'))
+        nav.append(InlineKeyboardButton(text=f'{page + 1}/{total_pages}', callback_data='noop'))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text='➡️', callback_data=f'health_page_{page + 1}'))
+        buttons.append(nav)
+        numbers = _page_number_row(total_pages, page, lambda number: f'health_page_{number}')
+        if numbers:
+            buttons.append(numbers)
+        buttons.extend([
+            [InlineKeyboardButton(text='🔎 Проверить все аккаунты', callback_data='health_check_all')],
+            [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text = '\n'.join(lines)
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=markup)
+        else:
+            await edit_message(target, text, markup)
+
+    @dp.callback_query(F.data == 'account_health_center')
+    async def account_health_center_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_health_center(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data.startswith('health_page_'))
+    async def health_page_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_health_center(callback, callback.from_user.id,
+                                   int(callback.data.rsplit('_', 1)[1]))
+
+    @dp.callback_query(F.data == 'health_check_all')
+    async def health_check_all_callback(callback: CallbackQuery):
+        user_id = callback.from_user.id
+        accounts = db.get_user_accounts(user_id)
+        if not accounts:
+            await _answer_callback(callback, 'Нет аккаунтов для проверки', show_alert=True)
+            return
+        await _answer_callback(callback, 'Проверка запущена')
+        status = await callback.message.answer(f'🩺 Проверяю аккаунты: 0/{len(accounts)}')
+        semaphore = asyncio.Semaphore(4)
+
+        async def check_one(account):
+            async with semaphore:
+                try:
+                    return await account_manager.check_account_health(int(account['id']), user_id)
+                except Exception as error:
+                    logger.exception('Health check failed for #%s', account.get('id'))
+                    return False, f'{type(error).__name__}: {error}'
+
+        tasks = [asyncio.create_task(check_one(account)) for account in accounts]
+        results = []
+        for index, task in enumerate(tasks, 1):
+            results.append(await task)
+            if index == len(tasks) or index % 4 == 0:
+                try:
+                    await status.edit_text(f'🩺 Проверяю аккаунты: {index}/{len(accounts)}')
+                except Exception:
+                    pass
+        good = sum(1 for ok, _detail in results if ok)
+        await status.edit_text(
+            f'✅ <b>Проверка завершена</b>\n\n'
+            f'🟢 Работают: {good}\n'
+            f'⚠️ Требуют внимания: {len(results) - good}',
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='🩺 Центр здоровья', callback_data='account_health_center')],
+                [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+            ])
+        )
+        try:
+            db.write_audit(user_id, 'health_check_all', 'account', '',
+                           {'total': len(accounts), 'ok': good, 'failed': len(accounts) - good})
+        except Exception:
+            pass
+
+    async def render_blacklist(target, user_id: int, page: int = 0):
+        entries, total_pages = db.get_blacklist_page(user_id, page=page, per_page=10)
+        lines = ['🚫 <b>Blacklist и отписки</b>',
+                 'Цели из списка автоматически исключаются из новых рассылок и инвайтинга.', '']
+        buttons = []
+        if entries:
+            for entry in entries:
+                reason = f" · {entry.get('reason')}" if entry.get('reason') else ''
+                lines.append(f"• <code>{html_escape(entry['target'])}</code>{html_escape(reason)}")
+                buttons.append([InlineKeyboardButton(
+                    text=f"🗑 Удалить {entry['target']}",
+                    callback_data=f"blacklist_remove_{entry['id']}"
+                )])
+        else:
+            lines.append('Список пуст.')
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'blacklist_page_{page - 1}'))
+        nav.append(InlineKeyboardButton(text=f'{page + 1}/{total_pages}', callback_data='noop'))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text='➡️', callback_data=f'blacklist_page_{page + 1}'))
+        buttons.append(nav)
+        buttons.extend([
+            [InlineKeyboardButton(text='➕ Добавить цель', callback_data='blacklist_add')],
+            [InlineKeyboardButton(text='📄 Импортировать TXT', callback_data='blacklist_import')],
+            [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text = '\n'.join(lines)
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=markup)
+        else:
+            await edit_message(target, text, markup)
+
+    @dp.callback_query(F.data == 'blacklist_menu')
+    async def blacklist_menu_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        await render_blacklist(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data.startswith('blacklist_page_'))
+    async def blacklist_page_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_blacklist(callback, callback.from_user.id,
+                               int(callback.data.rsplit('_', 1)[1]))
+
+    @dp.callback_query(F.data == 'blacklist_add')
+    async def blacklist_add_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(BlacklistStates.WAITING_TARGET)
+        await edit_message(callback,
+            '🚫 Отправьте username, Telegram ID или ссылку t.me.\n'
+            'Причину можно добавить через символ <code>|</code>:\n'
+            '<code>@example | отписка</code>',
+            cancel_inline_keyboard())
+
+    @dp.callback_query(F.data == 'blacklist_import')
+    async def blacklist_import_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(BlacklistStates.WAITING_IMPORT)
+        await edit_message(callback,
+            '📄 Отправьте TXT-файл: одна цель на строку.\n'
+            'Формат: <code>цель | причина</code>.', cancel_inline_keyboard())
+
+    async def _save_blacklist_lines(user_id: int, lines: list) -> int:
+        saved = 0
+        for raw in lines:
+            value = str(raw or '').strip()
+            if not value or value.startswith('#'):
+                continue
+            parts = value.split('|', 1)
+            if db.add_blacklist_entry(user_id, parts[0].strip(),
+                                      parts[1].strip() if len(parts) > 1 else '',
+                                      source='manual'):
+                saved += 1
+        if saved:
+            try:
+                db.write_audit(user_id, 'blacklist_updated', 'blacklist', '', {'added': saved})
+            except Exception:
+                pass
+        return saved
+
+    @dp.message(BlacklistStates.WAITING_TARGET)
+    async def blacklist_target_message(message: Message, state: FSMContext):
+        saved = await _save_blacklist_lines(message.from_user.id, (message.text or '').splitlines())
+        await state.clear()
+        await message.answer(f'✅ Сохранено целей: {saved}')
+        await render_blacklist(message, message.from_user.id)
+
+    @dp.message(BlacklistStates.WAITING_IMPORT)
+    async def blacklist_import_message(message: Message, state: FSMContext):
+        if not message.document:
+            await message.answer('❌ Отправьте TXT-файл документом.')
+            return
+        try:
+            file = await bot.get_file(message.document.file_id)
+            content = await bot.download_file(file.file_path)
+            raw = content.read()
+            if len(raw) > 5 * 1024 * 1024:
+                raise ValueError('файл слишком большой (максимум 5 МБ)')
+            saved = await _save_blacklist_lines(
+                message.from_user.id, raw.decode('utf-8', errors='replace').splitlines()
+            )
+            await state.clear()
+            await message.answer(f'✅ Импортировано целей: {saved}')
+            await render_blacklist(message, message.from_user.id)
+        except Exception as error:
+            await message.answer(f'❌ Не удалось импортировать TXT: {error}')
+
+    @dp.callback_query(F.data.startswith('blacklist_remove_'))
+    async def blacklist_remove_callback(callback: CallbackQuery):
+        entry_id = int(callback.data.rsplit('_', 1)[1])
+        if not db.remove_blacklist_entry(entry_id, callback.from_user.id):
+            await _answer_callback(callback, 'Запись не найдена', show_alert=True)
+            return
+        try:
+            db.write_audit(callback.from_user.id, 'blacklist_removed', 'blacklist', entry_id, {})
+        except Exception:
+            pass
+        await _answer_callback(callback, 'Удалено')
+        await render_blacklist(callback, callback.from_user.id)
+
+    # ==================== REPORTS / CAMPAIGN DRAFTS / BACKUP ====================
+    def _format_time(timestamp):
+        return datetime.fromtimestamp(int(timestamp)).strftime('%d.%m %H:%M') if timestamp else '—'
+
+    async def render_operation_history(target, user_id: int, page: int = 0):
+        reports = db.get_user_operation_reports(user_id, limit=50)
+        per_page = 8
+        total_pages = max(1, (len(reports) + per_page - 1) // per_page)
+        page = max(0, min(int(page or 0), total_pages - 1))
+        visible = reports[page * per_page:(page + 1) * per_page]
+        lines = ['📜 <b>История операций</b>', '']
+        buttons = []
+        labels = {'running': '⏳', 'finished': '✅', 'stopped': '⏹', 'failed': '❌', 'interrupted': '⚠️'}
+        for report in visible:
+            icon = labels.get(report.get('status'), '❔')
+            title = html_escape(report.get('title') or report.get('operation_type') or '')
+            lines.append(
+                f"{icon} #{report['id']} {title} · {report.get('success_count', 0)}/{report.get('total', 0)} · "
+                f"{_format_time(report.get('started_at'))}"
+            )
+            buttons.append([InlineKeyboardButton(
+                text=f"#{report['id']} · {(report.get('title') or report.get('operation_type') or '')[:24]}",
+                callback_data=f"operation_view_{report['id']}"
+            )])
+        if not visible:
+            lines.append('Операций пока нет.')
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'operation_page_{page - 1}'))
+        nav.append(InlineKeyboardButton(text=f'{page + 1}/{total_pages}', callback_data='noop'))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text='➡️', callback_data=f'operation_page_{page + 1}'))
+        buttons.extend([
+            nav,
+            [InlineKeyboardButton(text='🧾 Журнал аудита', callback_data='audit_log')],
+            [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text = '\n'.join(lines)
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=markup)
+        else:
+            await edit_message(target, text, markup)
+
+    @dp.callback_query(F.data == 'operation_history')
+    async def operation_history_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_operation_history(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data.startswith('operation_page_'))
+    async def operation_page_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_operation_history(callback, callback.from_user.id,
+                                       int(callback.data.rsplit('_', 1)[1]))
+
+    @dp.callback_query(F.data.startswith('operation_view_'))
+    async def operation_view_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        report_id = int(callback.data.rsplit('_', 1)[1])
+        report = db.get_operation_report(report_id, user_id=callback.from_user.id)
+        if not report:
+            await _answer_callback(callback, 'Отчёт не найден', show_alert=True)
+            return
+        items = db.get_operation_report_items(report_id, limit=12)
+        text = [
+            f"📊 <b>Операция #{report_id}</b>",
+            f"Тип: {html_escape(report.get('operation_type') or '')}",
+            f"Статус: {html_escape(report.get('status') or '')}",
+            f"Обработано: {report.get('processed', 0)}/{report.get('total', 0)}",
+            f"Успешно: {report.get('success_count', 0)} · пропущено: {report.get('skipped_count', 0)} · ошибок: {report.get('error_count', 0)}",
+            '', 'Последние результаты:'
+        ]
+        for item in items:
+            text.append(f"• {html_escape(item.get('target') or '')}: {html_escape(item.get('result') or '')}")
+        await edit_message(callback, '\n'.join(text), InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📜 Назад к истории', callback_data='operation_history')],
+            [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+        ]))
+
+    @dp.callback_query(F.data == 'audit_log')
+    async def audit_log_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        entries, _pages = db.get_audit_log(callback.from_user.id, page=0, per_page=12)
+        lines = ['🧾 <b>Журнал аудита</b>', '']
+        for entry in entries:
+            lines.append(
+                f"• {_format_time(entry.get('created_at'))} "
+                f"<code>{html_escape(entry.get('action') or '')}</code> "
+                f"{html_escape(entry.get('entity_type') or '')} {html_escape(entry.get('entity_id') or '')}"
+            )
+        if not entries:
+            lines.append('Записей пока нет.')
+        await edit_message(callback, '\n'.join(lines), InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📜 Назад к истории', callback_data='operation_history')],
+        ]))
+
+    async def render_campaign_drafts(target, user_id: int):
+        drafts = db.get_campaign_drafts(user_id)
+        lines = ['📐 <b>Черновики кампаний</b>',
+                 'Черновики не содержат session string или API-ключей.', '']
+        buttons = []
+        for draft in drafts[:20]:
+            name = html_escape(draft.get('name') or 'Без названия')
+            lines.append(f"• #{draft['id']} {name} · {draft.get('operation_type', 'spam')}")
+            buttons.append([
+                InlineKeyboardButton(text=f"▶️ {(draft.get('name') or '')[:24]}", callback_data=f"draft_apply_{draft['id']}"),
+                InlineKeyboardButton(text='🗑', callback_data=f"draft_delete_{draft['id']}"),
+            ])
+        if not drafts:
+            lines.append('Черновиков пока нет.')
+        buttons.extend([
+            [InlineKeyboardButton(text='➕ Новый черновик', callback_data='draft_new')],
+            [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text = '\n'.join(lines)
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=markup)
+        else:
+            await edit_message(target, text, markup)
+
+    @dp.callback_query(F.data == 'campaigns_from_drafts')
+    async def campaigns_from_drafts_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        await campaigns_menu_handler(callback.message, state)
+
+    @dp.callback_query(F.data == 'campaigns_from_history')
+    async def campaigns_from_history_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        await campaigns_menu_handler(callback.message, state)
+
+    @dp.callback_query(F.data == 'spam_preview', MassActionStates.WAITING_TARGETS)
+    async def spam_preview_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        data = await state.get_data()
+        mode = data.get('spam_mode', 'post')
+        speed = data.get('spam_speed', 'normal')
+        speed_label = SPAM_SPEED_LABELS.get(speed, SPAM_SPEED_LABELS['normal'])[0]
+        text = data.get('custom_spam_text') if mode == 'custom' else data.get('spam_postbot_id')
+        preview = str(text or data.get('spam_forward_chat') or 'Текст аккаунта не задан')
+        if len(preview) > 700:
+            preview = preview[:700] + '…'
+        await edit_message(callback,
+            '👁 <b>Предпросмотр кампании</b>\n\n'
+            f"Режим: <code>{html_escape(mode)}</code>\n"
+            f"Скорость: {html_escape(speed_label)}\n"
+            f"Удалять у себя: {'да' if data.get('delete_after_send') else 'нет'}\n"
+            f"Аккаунтов: {len(data.get('spam_account_ids') or [])}\n\n"
+            f"<b>Данные отправки:</b>\n{html_escape(preview)}",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='◀️ К настройкам кампании', callback_data='spam_preview_back')],
+                [InlineKeyboardButton(text='❌ Отмена', callback_data='cancel_action')],
+            ]))
+
+    @dp.callback_query(F.data == 'spam_preview_back', MassActionStates.WAITING_TARGETS)
+    async def spam_preview_back_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await ask_for_spam_targets(callback, state)
+
+    @dp.callback_query(F.data == 'save_spam_draft', MassActionStates.WAITING_TARGETS)
+    async def save_spam_draft_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.update_data(draft_return='spam')
+        await state.set_state(CampaignDraftStates.WAITING_NAME)
+        await edit_message(callback, '💾 Введите название черновика рассылки:', cancel_inline_keyboard())
+
+    @dp.callback_query(F.data == 'draft_new')
+    async def draft_new_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(CampaignDraftStates.WAITING_NAME)
+        await state.update_data(draft_return='list')
+        await edit_message(callback, '📐 Введите название черновика:', cancel_inline_keyboard())
+
+    @dp.message(CampaignDraftStates.WAITING_NAME)
+    async def draft_name_message(message: Message, state: FSMContext):
+        name = (message.text or '').strip()
+        if not name:
+            await message.answer('❌ Название не должно быть пустым.')
+            return
+        data = await state.get_data()
+        settings = {key: value for key, value in data.items()
+                    if key in ('spam_mode', 'spam_speed', 'custom_spam_text', 'custom_spam_entities',
+                               'spam_postbot_id', 'spam_forward_chat', 'spam_forward_message_id',
+                               'delete_after_send')}
+        draft_id = db.create_campaign_draft(message.from_user.id, name, 'spam', settings)
+        db.write_audit(message.from_user.id, 'campaign_draft_created', 'campaign_draft', draft_id,
+                       {'name': name})
+        return_to_spam = data.get('draft_return') == 'spam'
+        await state.clear()
+        if return_to_spam:
+            await message.answer(f'✅ Черновик #{draft_id} сохранён.')
+            await ask_for_spam_targets(message, state)
+        else:
+            await message.answer(f'✅ Черновик #{draft_id} сохранён.')
+            await render_campaign_drafts(message, message.from_user.id)
+
+    @dp.callback_query(F.data.startswith('draft_delete_'))
+    async def draft_delete_callback(callback: CallbackQuery):
+        draft_id = int(callback.data.rsplit('_', 1)[1])
+        if not db.delete_campaign_draft(draft_id, callback.from_user.id):
+            await _answer_callback(callback, 'Черновик не найден', show_alert=True)
+            return
+        await _answer_callback(callback, 'Удалено')
+        await render_campaign_drafts(callback, callback.from_user.id)
+
+    @dp.callback_query(F.data.startswith('draft_apply_'))
+    async def draft_apply_callback(callback: CallbackQuery, state: FSMContext):
+        draft_id = int(callback.data.rsplit('_', 1)[1])
+        draft = db.get_campaign_draft(draft_id, callback.from_user.id)
+        if not draft:
+            await _answer_callback(callback, 'Черновик не найден', show_alert=True)
+            return
+        await _answer_callback(callback)
+        await state.clear()
+        await state.update_data(**(draft.get('settings') or {}), spam_account_ids=[])
+        await edit_message(callback,
+            f"📐 Черновик «{html_escape(draft.get('name') or '')}» загружен.\n\n"
+            'Теперь выберите аккаунты для запуска.',
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='📱 Выбрать аккаунты', callback_data='refresh_mass_spam')],
+                [InlineKeyboardButton(text='❌ Отмена', callback_data='cancel_action')],
+            ]))
+
+    @dp.callback_query(F.data == 'backup_menu')
+    async def backup_menu_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await edit_message(callback,
+            '💾 <b>Резервная копия</b>\n\n'
+            'Будет создан архив метаданных без session string, API hash и proxy credentials.\n'
+            'Такой backup безопаснее хранить и использовать для восстановления настроек.',
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='📦 Создать безопасную копию', callback_data='backup_create')],
+                [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
+            ]))
+
+    @dp.callback_query(F.data == 'backup_create')
+    async def backup_create_callback(callback: CallbackQuery):
+        await _answer_callback(callback, 'Создаю архив')
+        try:
+            from backup_utils import create_safe_backup
+            path, digest, size = create_safe_backup(db, callback.from_user.id)
+            db.write_audit(callback.from_user.id, 'backup_created', 'backup', '',
+                           {'sha256': digest, 'size_bytes': size, 'includes_sessions': False})
+            await callback.message.answer_document(
+                FSInputFile(path),
+                caption=f'✅ Безопасная копия создана. SHA-256: <code>{digest[:16]}…</code>\n'
+                        'Session string и секретные ключи исключены.'
+            )
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        except Exception as error:
+            logger.exception('Safe backup failed')
+            await callback.message.answer(f'❌ Не удалось создать копию: {html_escape(str(error)[:300])}')
 
     # ==================== PER-ACCOUNT CONTROL PANEL ====================
     async def render_account_dashboard(message_or_callback, account_id: int, user_id: int):
@@ -4175,7 +4749,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if context == 'mass':
             await show_account_selection(callback, data.get('account_page_action', 'spam'), state, page=page)
         elif context == 'neuro':
-            await neurocomment_menu_handler(callback.message, state, callback.from_user.id, page=page)
+            await state.update_data(neuro_page=page)
+            await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
         elif context == 'join_pack':
             await state.clear()
             await render_join_pack_account_selection(callback, int(data.get('account_page_pack_id')), page=page)
@@ -4199,7 +4774,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if context == 'mass':
             await show_account_selection(message, data.get('account_page_action', 'spam'), state, page=page)
         elif context == 'neuro':
-            await neurocomment_menu_handler(message, state, message.from_user.id, page=page)
+            await state.update_data(neuro_page=page)
+            await neurocomment_menu_handler(message, state, message.from_user.id)
         elif context == 'join_pack':
             await state.clear()
             await render_join_pack_account_selection(message, int(data.get('account_page_pack_id')), page=page)
@@ -4931,11 +5507,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
     # ==================== NEUROCOMMENTING ====================
     @dp.message(F.text == '🧠 Нейрокомментинг')
-    async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None, page: int = 0):
+    async def neurocomment_menu_handler(message: Message, state: FSMContext, user_id: int = None):
         # ВАЖНО: при вызове из callback сюда передаётся callback.message — его
         # from_user это САМ БОТ, а не пользователь. Без явного user_id проверка
         # подписки выполнялась для id бота и всегда падала с «нет подписки»,
         # из-за чего меню не перерисовывалось и статус визуально не менялся.
+        state_data = await state.get_data()
+        page = int(state_data.get('neuro_page') or 0)
         await state.clear()
         if user_id is None:
             user_id = message.from_user.id
@@ -5066,7 +5644,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await callback.message.delete()
         except Exception:
             pass
-        await neurocomment_menu_handler(callback.message, state, callback.from_user.id, page=page)
+        await state.update_data(neuro_page=page)
+        await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
 
     @dp.callback_query(F.data.startswith('nc_goto_page_'))
     async def nc_goto_page_callback(callback: CallbackQuery, state: FSMContext):

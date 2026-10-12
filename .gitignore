@@ -6,6 +6,8 @@ hashs.txt
 *.db
 *.db-shm
 *.db-wal
+backups/
+*.backup
 *.session
 *.session-journal
 

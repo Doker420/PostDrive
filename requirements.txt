@@ -10,3 +10,4 @@ openai
 httpx
 curl_cffi
 opentele-ng>=1.4.0  # Telegram Desktop tdata -> Pyrogram conversion
+cryptography>=41.0.0  # Fernet encryption for session strings at rest

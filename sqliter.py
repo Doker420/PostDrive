@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import threading
+import json
 import contextlib
 import contextvars
 import functools
@@ -13,6 +14,52 @@ import dbconfig
 from typing import List, Dict, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
+
+_SESSION_PREFIX = 'enc:v1:'
+_SESSION_FERNET = None
+_SESSION_FERNET_KEY = None
+
+
+def _session_fernet():
+    """Return the optional Fernet instance without ever logging the key."""
+    global _SESSION_FERNET, _SESSION_FERNET_KEY
+    key = os.environ.get('SESSION_ENCRYPTION_KEY', '').strip()
+    if not key:
+        return None
+    if _SESSION_FERNET is not None and _SESSION_FERNET_KEY == key:
+        return _SESSION_FERNET
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as error:
+        raise RuntimeError(
+            'SESSION_ENCRYPTION_KEY задан, но пакет cryptography не установлен'
+        ) from error
+    _SESSION_FERNET = Fernet(key.encode())
+    _SESSION_FERNET_KEY = key
+    return _SESSION_FERNET
+
+
+def _protect_session(value: str) -> str:
+    raw = str(value or '')
+    if not raw or raw.startswith(_SESSION_PREFIX):
+        return raw
+    fernet = _session_fernet()
+    if not fernet:
+        return raw
+    return _SESSION_PREFIX + fernet.encrypt(raw.encode()).decode()
+
+
+def _reveal_session(value: str) -> str:
+    raw = str(value or '')
+    if not raw.startswith(_SESSION_PREFIX):
+        return raw
+    fernet = _session_fernet()
+    if not fernet:
+        raise RuntimeError('Для чтения зашифрованной сессии нужен SESSION_ENCRYPTION_KEY')
+    try:
+        return fernet.decrypt(raw[len(_SESSION_PREFIX):].encode()).decode()
+    except Exception as error:
+        raise RuntimeError('Не удалось расшифровать session string') from error
 
 # ── Shared singleton accessor ─────────────────────────────────────
 _db_instance: Optional['DBConnection'] = None
@@ -233,6 +280,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._apply_pragmas(self.conn)
         self.create_tables()
         self.update_db()
+        self.migrate_secret_columns()
         self.seed_default_tariffs()
         self.cleanup_old_data()
 
@@ -440,6 +488,31 @@ class DBConnection(metaclass=_PoolBoundMeta):
             c = self.c
         rows = c.fetchall()
         return [dict(row) for row in rows]
+
+    def migrate_secret_columns(self):
+        """Encrypt legacy plaintext session/API values when a key is configured."""
+        if not os.environ.get('SESSION_ENCRYPTION_KEY', '').strip():
+            return
+        # Validate the key/dependency before touching rows.
+        _session_fernet()
+        c = self._cursor()
+        c.execute('SELECT id, session_string, api_hash FROM accounts')
+        rows = c.fetchall()
+        changed = 0
+        for row in rows:
+            session_value = row[1] or ''
+            api_hash = row[2] or ''
+            protected_session = _protect_session(session_value)
+            protected_hash = _protect_session(api_hash)
+            if protected_session != session_value or protected_hash != api_hash:
+                c.execute(
+                    'UPDATE accounts SET session_string = ?, api_hash = ? WHERE id = ?',
+                    (protected_session, protected_hash, row[0])
+                )
+                changed += 1
+        if changed:
+            self.conn_ctx.commit()
+        c.close()
 
     def create_tables(self):
         c = self._cursor()
@@ -847,6 +920,102 @@ class DBConnection(metaclass=_PoolBoundMeta):
             finished_at INTEGER DEFAULT 0
         )''')
 
+        # Account health checks keep a short, auditable history separate from
+        # the current aggregate state stored on accounts.
+        c.execute('''CREATE TABLE IF NOT EXISTS account_health_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            check_type TEXT NOT NULL,
+            status TEXT DEFAULT 'unknown',
+            detail TEXT DEFAULT '',
+            latency_ms INTEGER DEFAULT 0,
+            checked_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+
+        # User-level opt-out/blacklist. Targets are normalized before storage
+        # so usernames with and without @ cannot bypass the same entry.
+        c.execute('''CREATE TABLE IF NOT EXISTS blacklist_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            target TEXT NOT NULL,
+            target_type TEXT DEFAULT 'target',
+            reason TEXT DEFAULT '',
+            source TEXT DEFAULT 'manual',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            expires_at INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            UNIQUE(user_id, target)
+        )''')
+
+        # Reusable campaign drafts contain only campaign parameters, never
+        # session strings, API hashes or other credentials.
+        c.execute('''CREATE TABLE IF NOT EXISTS campaign_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            operation_type TEXT DEFAULT 'spam',
+            settings_json TEXT DEFAULT '{}',
+            status TEXT DEFAULT 'draft',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+
+        # Immutable-ish per-user audit trail for high-level actions. Details
+        # are JSON and are intentionally bounded by the writer method.
+        c.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            entity_type TEXT DEFAULT '',
+            entity_id TEXT DEFAULT '',
+            details_json TEXT DEFAULT '{}',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+
+        # ZIP import dry-runs and item-level outcomes survive the FSM lifetime.
+        c.execute('''CREATE TABLE IF NOT EXISTS import_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            source_name TEXT DEFAULT '',
+            status TEXT DEFAULT 'preview',
+            total INTEGER DEFAULT 0,
+            valid_count INTEGER DEFAULT 0,
+            imported_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            finished_at INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS import_run_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            label TEXT DEFAULT '',
+            kind TEXT DEFAULT '',
+            status TEXT DEFAULT 'preview',
+            detail TEXT DEFAULT '',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(run_id) REFERENCES import_runs(id) ON DELETE CASCADE
+        )''')
+
+        # Backup metadata only; backup files live outside the database and are
+        # never included automatically in Git.
+        c.execute('''CREATE TABLE IF NOT EXISTS backup_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            includes_sessions INTEGER DEFAULT 0,
+            encrypted INTEGER DEFAULT 0,
+            sha256 TEXT DEFAULT '',
+            size_bytes INTEGER DEFAULT 0,
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+
         # ── Performance indexes ────────────────────────────────────
         c.execute('CREATE INDEX IF NOT EXISTS idx_accounts_user_id ON accounts(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_account_chats_account_id ON account_chats(account_id)')
@@ -857,6 +1026,11 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._migrate_parsed_users_unique(c)
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_user ON running_tasks(user_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_running_tasks_status ON running_tasks(status)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_health_checks_account ON account_health_checks(account_id, checked_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_blacklist_user_target ON blacklist_entries(user_id, target)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_audit_user_time ON audit_log(user_id, created_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_import_runs_user ON import_runs(user_id, created_at)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_campaign_drafts_user ON campaign_drafts(user_id, updated_at)')
 
         self.conn_ctx.commit()
         c.close()
@@ -924,6 +1098,12 @@ class DBConnection(metaclass=_PoolBoundMeta):
             "ALTER TABLE accounts ADD COLUMN flood_count INTEGER DEFAULT 0",
             "ALTER TABLE accounts ADD COLUMN flood_total_seconds INTEGER DEFAULT 0",
             "ALTER TABLE accounts ADD COLUMN last_flood_at INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN last_health_check_at INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN last_success_at INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN last_error_at INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN last_error TEXT DEFAULT ''",
+            "ALTER TABLE accounts ADD COLUMN operation_success_count INTEGER DEFAULT 0",
+            "ALTER TABLE accounts ADD COLUMN operation_error_count INTEGER DEFAULT 0",
             "ALTER TABLE tariffs ADD COLUMN code TEXT DEFAULT ''",
             "ALTER TABLE tariffs ADD COLUMN max_accounts INTEGER DEFAULT 1",
             "ALTER TABLE tariffs ADD COLUMN ai_comments_per_day INTEGER DEFAULT 20",
@@ -1076,20 +1256,29 @@ class DBConnection(metaclass=_PoolBoundMeta):
         """
         clauses = []
         values = [user_id]
-        if session_string:
-            clauses.append('session_string = ?')
-            values.append(session_string)
         if phone:
             clauses.append("phone <> '' AND phone = ?")
             values.append(phone)
-        if not clauses:
-            return None
-        self.c.execute(
-            'SELECT * FROM accounts WHERE user_id = ? AND (' + ' OR '.join(clauses) + ') '
-            'ORDER BY id ASC LIMIT 1',
-            tuple(values),
-        )
-        return self._dict_fetchone()
+        if clauses:
+            self.c.execute(
+                'SELECT * FROM accounts WHERE user_id = ? AND (' + ' OR '.join(clauses) + ') '
+                'ORDER BY id ASC LIMIT 1',
+                tuple(values),
+            )
+            found = self._decode_account(self._dict_fetchone())
+            if found:
+                return found
+        if session_string:
+            # With Fernet enabled the database contains ciphertext, so compare
+            # after decoding instead of interpolating plaintext into SQL.
+            self.c.execute(
+                'SELECT * FROM accounts WHERE user_id = ? ORDER BY id ASC',
+                (int(user_id),)
+            )
+            for row in self._decode_accounts(self._dict_fetchall()):
+                if row.get('session_string') == session_string:
+                    return row
+        return None
 
     # ── AI daily usage ────────────────────────────────────────────
     @staticmethod
@@ -1441,29 +1630,49 @@ class DBConnection(metaclass=_PoolBoundMeta):
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', '', '', 'HTML', 5, 0, ?)
         ''', (
-            user_id, phone, session_string, account_name, proxy,
-            int(api_id or 0), str(api_hash or ''), int(time.time()),
+            user_id, phone, _protect_session(session_string), account_name, proxy,
+            int(api_id or 0), _protect_session(str(api_hash or '')), int(time.time()),
         ))
         self.conn_ctx.commit()
-        return self.c.lastrowid
+        account_id = int(self.c.lastrowid)
+        try:
+            self.write_audit(user_id, 'account_added', 'account', account_id,
+                             {'has_proxy': bool(proxy), 'has_phone': bool(phone)})
+        except Exception:
+            logger.debug('Не удалось записать audit добавления аккаунта', exc_info=True)
+        return account_id
+
+    @staticmethod
+    def _decode_account(account: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if account is None:
+            return None
+        if 'session_string' in account:
+            account['session_string'] = _reveal_session(account.get('session_string', ''))
+        if 'api_hash' in account:
+            account['api_hash'] = _reveal_session(account.get('api_hash', ''))
+        return account
+
+    @classmethod
+    def _decode_accounts(cls, accounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [cls._decode_account(account) for account in accounts]
 
     def get_user_accounts(self, user_id: int) -> List[Dict[str, Any]]:
         # Account lists are also a normal entry point after a cooldown expires.
         self.reset_expired_account_health()
         self.c.execute('SELECT * FROM accounts WHERE user_id = ? ORDER BY id ASC', (user_id,))
-        return self._dict_fetchall()
+        return self._decode_accounts(self._dict_fetchall())
 
     def get_account(self, account_id: int) -> Optional[Dict[str, Any]]:
         # Keep single-account settings screens in sync even if the watchdog has
         # not run since the restriction expired.
         self.reset_expired_account_health()
         self.c.execute('SELECT * FROM accounts WHERE id = ?', (account_id,))
-        return self._dict_fetchone()
+        return self._decode_account(self._dict_fetchone())
 
     def update_account_api(self, account_id: int, api_id: int, api_hash: str):
         self.c.execute(
             'UPDATE accounts SET api_id = ?, api_hash = ? WHERE id = ?',
-            (int(api_id), str(api_hash or ''), int(account_id)),
+            (int(api_id), _protect_session(str(api_hash or '')), int(account_id)),
         )
         self.conn_ctx.commit()
 
@@ -1472,7 +1681,10 @@ class DBConnection(metaclass=_PoolBoundMeta):
             "SELECT api_id, api_hash FROM accounts "
             "WHERE COALESCE(api_id, 0) > 0 AND COALESCE(api_hash, '') <> ''"
         )
-        return self._dict_fetchall()
+        rows = self._dict_fetchall()
+        for row in rows:
+            row['api_hash'] = _reveal_session(row.get('api_hash', ''))
+        return rows
 
     def update_account_status(self, account_id: int, status: str):
         self.c.execute('UPDATE accounts SET status = ? WHERE id = ?', (status, account_id))
@@ -1689,8 +1901,14 @@ class DBConnection(metaclass=_PoolBoundMeta):
     def delete_account(self, account_id: int, user_id: int) -> bool:
         self.c.execute('DELETE FROM account_chats WHERE account_id = ?', (account_id,))
         self.c.execute('DELETE FROM accounts WHERE id = ? AND user_id = ?', (account_id, user_id))
+        deleted = bool(self.c.rowcount)
         self.conn_ctx.commit()
-        return self.c.rowcount > 0
+        if deleted:
+            try:
+                self.write_audit(user_id, 'account_deleted', 'account', account_id, {})
+            except Exception:
+                logger.debug('Не удалось записать audit удаления аккаунта', exc_info=True)
+        return deleted
 
     # ==================== ACCOUNT CHATS (Selective Spam & Settings) ====================
     UPSERT_CHAT_SQL = (
@@ -2088,7 +2306,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
     # ==================== ADMIN SESSION EXPORT & CHECK ====================
     def get_all_accounts(self) -> List[Dict[str, Any]]:
         self.c.execute('SELECT * FROM accounts ORDER BY id ASC')
-        return self._dict_fetchall()
+        return self._decode_accounts(self._dict_fetchall())
 
     def get_all_accounts_with_user(self) -> List[Dict[str, Any]]:
         self.c.execute('''
@@ -2097,7 +2315,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
             LEFT JOIN users u ON a.user_id = u.user_id
             ORDER BY a.id ASC
         ''')
-        return self._dict_fetchall()
+        return self._decode_accounts(self._dict_fetchall())
 
     def update_account_status_by_id(self, account_id: int, status: str):
         self.c.execute('UPDATE accounts SET status = ? WHERE id = ?', (status, account_id))
@@ -2559,14 +2777,16 @@ class DBConnection(metaclass=_PoolBoundMeta):
     def set_account_health(self, account_id: int, health: str, reason: str = '',
                            restricted_until: int = 0):
         self.c.execute(
-            'UPDATE accounts SET health = ?, health_reason = ?, restricted_until = ? WHERE id = ?',
-            (health, (reason or '')[:300], int(restricted_until or 0), account_id)
+            'UPDATE accounts SET health = ?, health_reason = ?, restricted_until = ?, '
+            'last_error_at = ?, last_error = ? WHERE id = ?',
+            (health, (reason or '')[:300], int(restricted_until or 0),
+             int(time.time()), (reason or '')[:300], account_id)
         )
         self.conn_ctx.commit()
 
     def clear_account_health(self, account_id: int):
         self.c.execute(
-            "UPDATE accounts SET health = 'ok', health_reason = '', restricted_until = 0 WHERE id = ?",
+            "UPDATE accounts SET health = 'ok', health_reason = '', restricted_until = 0, last_error = '' WHERE id = ?",
             (account_id,)
         )
         self.conn_ctx.commit()
@@ -2693,6 +2913,309 @@ class DBConnection(metaclass=_PoolBoundMeta):
                 f"Прокси недоступен: {h.get('health_reason') or 'проверьте адрес и доступность прокси'}"
             )
         return True, ''
+
+    # ==================== ACCOUNT HEALTH CENTER ====================
+    @staticmethod
+    def normalize_target(value: Any) -> str:
+        """Canonicalize a username, Telegram ID or t.me link."""
+        raw = str(value or '').strip()
+        if raw.startswith(('https://t.me/', 'http://t.me/')):
+            raw = raw.split('://', 1)[1].split('/', 1)[1] if '/' in raw.split('://', 1)[1] else raw
+        raw = raw.split('?', 1)[0].strip().strip('/')
+        if raw.startswith('@'):
+            return '@' + raw[1:].strip().casefold()
+        if raw.lstrip('-').isdigit():
+            return raw
+        return '@' + raw.casefold() if raw else ''
+
+    def mark_account_activity(self, account_id: int, success: bool = True, error: str = ''):
+        """Update lightweight activity counters used by the health center."""
+        now = int(time.time())
+        if success:
+            self.c.execute(
+                'UPDATE accounts SET last_success_at = ?, operation_success_count = '
+                'COALESCE(operation_success_count, 0) + 1 WHERE id = ?',
+                (now, int(account_id))
+            )
+        else:
+            self.c.execute(
+                'UPDATE accounts SET last_error_at = ?, last_error = ?, '
+                'operation_error_count = COALESCE(operation_error_count, 0) + 1 WHERE id = ?',
+                (now, str(error or '')[:300], int(account_id))
+            )
+        self.conn_ctx.commit()
+
+    def record_account_health_check(self, account_id: int, user_id: int,
+                                    check_type: str, status: str,
+                                    detail: str = '', latency_ms: int = 0) -> int:
+        now = int(time.time())
+        normalized = status if status in ('ok', 'failed', 'unknown', 'cooldown', 'restricted') else 'unknown'
+        self.c.execute(
+            'INSERT INTO account_health_checks '
+            '(account_id, user_id, check_type, status, detail, latency_ms, checked_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (int(account_id), int(user_id), str(check_type)[:60], normalized,
+             str(detail or '')[:500], max(0, int(latency_ms or 0)), now)
+        )
+        check_id = self.c.lastrowid
+        self.c.execute(
+            'UPDATE accounts SET last_health_check_at = ? WHERE id = ?',
+            (now, int(account_id))
+        )
+        self.conn_ctx.commit()
+        return int(check_id)
+
+    def get_account_health_checks(self, account_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM account_health_checks WHERE account_id = ? '
+            'ORDER BY checked_at DESC, id DESC LIMIT ?',
+            (int(account_id), max(1, int(limit)))
+        )
+        return self._dict_fetchall()
+
+    def get_user_health_center(self, user_id: int) -> List[Dict[str, Any]]:
+        accounts = self.get_user_accounts(user_id)
+        for account in accounts:
+            checks = self.get_account_health_checks(int(account['id']), limit=1)
+            account['last_health_check'] = checks[0] if checks else None
+        return accounts
+
+    # ==================== BLACKLIST / OPT-OUT ====================
+    def add_blacklist_entry(self, user_id: int, target: Any, reason: str = '',
+                            source: str = 'manual', expires_at: int = 0) -> Optional[int]:
+        normalized = self.normalize_target(target)
+        if not normalized:
+            return None
+        self.c.execute(
+            'INSERT INTO blacklist_entries '
+            '(user_id, target, target_type, reason, source, created_at, expires_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(user_id, target) DO UPDATE SET reason = excluded.reason, '
+            'source = excluded.source, expires_at = excluded.expires_at',
+            (int(user_id), normalized, 'id' if normalized.lstrip('-').isdigit() else 'username',
+             str(reason or '')[:300], str(source or 'manual')[:40], int(time.time()),
+             int(expires_at or 0))
+        )
+        self.conn_ctx.commit()
+        self.c.execute(
+            'SELECT id FROM blacklist_entries WHERE user_id = ? AND target = ?',
+            (int(user_id), normalized)
+        )
+        row = self.c.fetchone()
+        return int(row[0]) if row else None
+
+    def remove_blacklist_entry(self, entry_id: int, user_id: int) -> bool:
+        self.c.execute(
+            'DELETE FROM blacklist_entries WHERE id = ? AND user_id = ?',
+            (int(entry_id), int(user_id))
+        )
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def is_blacklisted(self, user_id: int, target: Any) -> bool:
+        normalized = self.normalize_target(target)
+        if not normalized:
+            return False
+        now = int(time.time())
+        self.c.execute(
+            'SELECT 1 FROM blacklist_entries WHERE user_id = ? AND target = ? '
+            'AND (expires_at = 0 OR expires_at > ?) LIMIT 1',
+            (int(user_id), normalized, now)
+        )
+        return self.c.fetchone() is not None
+
+    def filter_blacklisted_targets(self, user_id: int, targets: list) -> Tuple[List[Any], List[Any]]:
+        allowed, blocked = [], []
+        for target in targets or []:
+            if self.is_blacklisted(user_id, target):
+                blocked.append(target)
+            else:
+                allowed.append(target)
+        return allowed, blocked
+
+    def get_blacklist_page(self, user_id: int, page: int = 0,
+                           per_page: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+        per_page = max(1, min(int(per_page), 100))
+        self.c.execute(
+            'SELECT COUNT(*) FROM blacklist_entries WHERE user_id = ? '
+            'AND (expires_at = 0 OR expires_at > ?)',
+            (int(user_id), int(time.time()))
+        )
+        total = int(self.c.fetchone()[0] or 0)
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(int(page or 0), pages - 1))
+        self.c.execute(
+            'SELECT * FROM blacklist_entries WHERE user_id = ? '
+            'AND (expires_at = 0 OR expires_at > ?) ORDER BY id DESC LIMIT ? OFFSET ?',
+            (int(user_id), int(time.time()), per_page, page * per_page)
+        )
+        return self._dict_fetchall(), pages
+
+    def clear_expired_blacklist(self) -> int:
+        self.c.execute(
+            'DELETE FROM blacklist_entries WHERE expires_at > 0 AND expires_at <= ?',
+            (int(time.time()),)
+        )
+        changed = int(self.c.rowcount or 0)
+        if changed:
+            self.conn_ctx.commit()
+        return changed
+
+    # ==================== CAMPAIGN DRAFTS ====================
+    def create_campaign_draft(self, user_id: int, name: str,
+                              operation_type: str = 'spam', settings: dict = None) -> int:
+        now = int(time.time())
+        payload = json.dumps(settings or {}, ensure_ascii=False, separators=(',', ':'))
+        self.c.execute(
+            'INSERT INTO campaign_drafts '
+            '(user_id, name, operation_type, settings_json, status, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (int(user_id), str(name or 'Без названия')[:120], str(operation_type or 'spam')[:40],
+             payload, 'draft', now, now)
+        )
+        self.conn_ctx.commit()
+        return int(self.c.lastrowid)
+
+    def get_campaign_drafts(self, user_id: int, limit: int = 30) -> List[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM campaign_drafts WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?',
+            (int(user_id), max(1, int(limit)))
+        )
+        rows = self._dict_fetchall()
+        for row in rows:
+            try:
+                row['settings'] = json.loads(row.get('settings_json') or '{}')
+            except (TypeError, ValueError):
+                row['settings'] = {}
+        return rows
+
+    def get_campaign_draft(self, draft_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM campaign_drafts WHERE id = ? AND user_id = ?',
+            (int(draft_id), int(user_id))
+        )
+        row = self._dict_fetchone()
+        if row:
+            try:
+                row['settings'] = json.loads(row.get('settings_json') or '{}')
+            except (TypeError, ValueError):
+                row['settings'] = {}
+        return row
+
+    def update_campaign_draft(self, draft_id: int, user_id: int,
+                              name: str = None, settings: dict = None,
+                              status: str = None) -> bool:
+        fields, values = [], []
+        if name is not None:
+            fields.append('name = ?')
+            values.append(str(name)[:120])
+        if settings is not None:
+            fields.append('settings_json = ?')
+            values.append(json.dumps(settings, ensure_ascii=False, separators=(',', ':')))
+        if status is not None:
+            fields.append('status = ?')
+            values.append(str(status)[:30])
+        if not fields:
+            return False
+        fields.append('updated_at = ?')
+        values.append(int(time.time()))
+        values.extend((int(draft_id), int(user_id)))
+        self.c.execute(
+            'UPDATE campaign_drafts SET ' + ', '.join(fields) + ' WHERE id = ? AND user_id = ?',
+            tuple(values)
+        )
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def delete_campaign_draft(self, draft_id: int, user_id: int) -> bool:
+        self.c.execute(
+            'DELETE FROM campaign_drafts WHERE id = ? AND user_id = ?',
+            (int(draft_id), int(user_id))
+        )
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    # ==================== AUDIT / IMPORT REGISTRY ====================
+    def write_audit(self, user_id: int, action: str, entity_type: str = '',
+                    entity_id: Any = '', details: dict = None) -> int:
+        safe_details = details or {}
+        try:
+            encoded = json.dumps(safe_details, ensure_ascii=False, separators=(',', ':'))
+        except (TypeError, ValueError):
+            encoded = '{}'
+        self.c.execute(
+            'INSERT INTO audit_log '
+            '(user_id, action, entity_type, entity_id, details_json, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (int(user_id), str(action)[:80], str(entity_type)[:40], str(entity_id or '')[:80],
+             encoded[:4000], int(time.time()))
+        )
+        self.conn_ctx.commit()
+        return int(self.c.lastrowid)
+
+    def get_audit_log(self, user_id: int, page: int = 0,
+                      per_page: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+        per_page = max(1, min(int(per_page), 100))
+        self.c.execute('SELECT COUNT(*) FROM audit_log WHERE user_id = ?', (int(user_id),))
+        total = int(self.c.fetchone()[0] or 0)
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(int(page or 0), pages - 1))
+        self.c.execute(
+            'SELECT * FROM audit_log WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?',
+            (int(user_id), per_page, page * per_page)
+        )
+        return self._dict_fetchall(), pages
+
+    def create_import_run(self, user_id: int, source_name: str,
+                          total: int = 0, valid_count: int = 0) -> int:
+        self.c.execute(
+            'INSERT INTO import_runs '
+            '(user_id, source_name, status, total, valid_count, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (int(user_id), str(source_name or '')[:200], 'preview', int(total or 0),
+             int(valid_count or 0), int(time.time()))
+        )
+        self.conn_ctx.commit()
+        return int(self.c.lastrowid)
+
+    def add_import_run_item(self, run_id: int, label: str, kind: str,
+                            status: str = 'preview', detail: str = '') -> int:
+        self.c.execute(
+            'INSERT INTO import_run_items '
+            '(run_id, label, kind, status, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (int(run_id), str(label or '')[:300], str(kind or '')[:40],
+             str(status or 'preview')[:30], str(detail or '')[:500], int(time.time()))
+        )
+        self.conn_ctx.commit()
+        return int(self.c.lastrowid)
+
+    def update_import_run(self, run_id: int, status: str = None,
+                          imported_count: int = None, error_count: int = None) -> bool:
+        fields, values = [], []
+        if status is not None:
+            fields.append('status = ?'); values.append(str(status)[:30])
+        if imported_count is not None:
+            fields.append('imported_count = ?'); values.append(int(imported_count))
+        if error_count is not None:
+            fields.append('error_count = ?'); values.append(int(error_count))
+        if status in ('finished', 'failed', 'cancelled'):
+            fields.append('finished_at = ?'); values.append(int(time.time()))
+        if not fields:
+            return False
+        values.append(int(run_id))
+        self.c.execute('UPDATE import_runs SET ' + ', '.join(fields) + ' WHERE id = ?', tuple(values))
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def get_import_run(self, run_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM import_runs WHERE id = ? AND user_id = ?',
+            (int(run_id), int(user_id))
+        )
+        return self._dict_fetchone()
 
     # ==================== TASK REGISTRY (persistence & recovery) ====================
     def register_task(self, user_id: int, account_id: int, task_type: str, progress: str = '') -> int:

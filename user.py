@@ -636,13 +636,26 @@ async def autoresponder_callback(client: Client, message):
         account_id = int(account_id_str)
         
         account = db.get_account(account_id)
-        if not account or not account.get('autoresponder_enabled'):
+        if not account:
             return
-            
+
         user_id = message.from_user.id if message.from_user else None
         if not user_id:
             return
-            
+
+        # A direct opt-out is recorded even when the autoresponder itself is
+        # disabled, so later campaigns cannot contact the same person.
+        incoming = (getattr(message, 'text', None) or getattr(message, 'caption', None) or '').strip().casefold()
+        if incoming in {'стоп', 'стоп!', 'не писать', 'отписка', 'unsubscribe', 'stop'}:
+            db.add_blacklist_entry(
+                int(account.get('user_id') or 0), user_id,
+                reason='Получена команда отписки', source='optout'
+            )
+            return
+
+        if not account.get('autoresponder_enabled'):
+            return
+
         if account_id not in AR_HISTORY:
             AR_HISTORY[account_id] = {}
             
@@ -2064,11 +2077,19 @@ class AccountSessionManager:
                     and str(health.get('health_reason') or '').startswith('SpamBot:')
                 ):
                     db.clear_account_health(account_id)
+                db.record_account_health_check(
+                    account_id, int(account.get('user_id') or user_id or 0),
+                    'spambot', 'ok', response[:500], 0,
+                )
                 return True, response[:1000]
 
             if status is False:
                 reason = f'SpamBot: {response[:260]}'
                 db.set_account_health(account_id, db.HEALTH_RESTRICTED, reason)
+                db.record_account_health_check(
+                    account_id, int(account.get('user_id') or user_id or 0),
+                    'spambot', 'restricted', response[:500], 0,
+                )
                 return False, response[:1000]
 
             return False, f'Не удалось однозначно определить статус SpamBot:\n{response[:900]}'
@@ -2077,6 +2098,30 @@ class AccountSessionManager:
         except Exception as error:
             logging.error('SpamBot check failed for account %s: %s', account_id, error, exc_info=True)
             return False, f'Ошибка проверки SpamBot: {type(error).__name__}'
+
+    async def check_account_health(self, account_id: int, user_id: int = None):
+        """Run one bounded session/transport check for the health center."""
+        account = db.get_account(account_id)
+        if not account:
+            return False, 'Аккаунт не найден'
+        if user_id is not None and int(account.get('user_id') or 0) != int(user_id):
+            return False, 'Доступ запрещён'
+        started = time.monotonic()
+        ok, _info, error = await self.test_session_string(
+            account.get('session_string', ''), account.get('proxy', ''),
+            account_id=account_id, timeout=12,
+        )
+        latency_ms = int(max(0, (time.monotonic() - started) * 1000))
+        detail = 'Сессия и транспорт отвечают' if ok else (error or 'Проверка не пройдена')
+        try:
+            db.record_account_health_check(
+                account_id, int(account.get('user_id') or user_id or 0),
+                'session', 'ok' if ok else 'failed', detail, latency_ms,
+            )
+            db.mark_account_activity(account_id, success=ok, error='' if ok else detail)
+        except Exception:
+            logging.debug('Не удалось сохранить результат health check', exc_info=True)
+        return ok, detail
 
     async def check_account_proxy(self, account_id: int, user_id: int = None):
         """Проверяет прокси аккаунта одним bounded-запуском.
@@ -2097,8 +2142,22 @@ class AccountSessionManager:
             account.get('session_string', ''), proxy_str, account_id=account_id
         )
         if ok:
+            try:
+                db.record_account_health_check(
+                    account_id, int(account.get('user_id') or user_id or 0),
+                    'proxy', 'ok', 'Прокси работает, сессия отвечает', 0,
+                )
+            except Exception:
+                logging.debug('Не удалось записать proxy health check', exc_info=True)
             return True, 'Прокси работает, сессия отвечает'
         error = error or 'Прокси не отвечает'
+        try:
+            db.record_account_health_check(
+                account_id, int(account.get('user_id') or user_id or 0),
+                'proxy', 'failed', error, 0,
+            )
+        except Exception:
+            logging.debug('Не удалось записать proxy health check', exc_info=True)
         if error.startswith((SESSION_CHECK_PROXY_PREFIX, SESSION_CHECK_NETWORK_PREFIX)):
             # Удаляем только транспорт, а не Telegram-сессию. Это не даст
             # следующим задачам бесконечно стучаться в тот же мёртвый SOCKS5.
@@ -2395,6 +2454,11 @@ class AccountSessionManager:
                 # транспортов; сетевые таймауты ниже получают ограниченный
                 # экспоненциальный retry, а не бесконечный reconnect.
                 result = await asyncio.wait_for(factory(), timeout=TELEGRAM_CALL_TIMEOUT)
+                if account_id:
+                    try:
+                        db.mark_account_activity(account_id, success=True)
+                    except Exception:
+                        logging.debug('Не удалось обновить статистику активности аккаунта', exc_info=True)
                 # Успешный вызов после флуда — снимаем пометку кулдауна
                 if account_id and attempt > 1:
                     try:
@@ -2522,6 +2586,11 @@ class AccountSessionManager:
                         raise TargetSkipError(f"{type(e).__name__}") from e
                     return None
                 last_err = e
+                if account_id:
+                    try:
+                        db.mark_account_activity(account_id, success=False, error=f'{type(e).__name__}: {e}')
+                    except Exception:
+                        logging.debug('Не удалось обновить ошибку активности аккаунта', exc_info=True)
                 # Сетевые сбои имеет смысл повторить, прикладные ошибки — нет
                 error_text = str(e).lower()
                 transient = (
@@ -3037,6 +3106,11 @@ class AccountSessionManager:
             'operation_type': operation_type, 'account_id': account_id,
             'status_message': None,
         }
+        try:
+            db.write_audit(user_id, 'operation_started', 'operation', report_id,
+                           {'operation_type': operation_type, 'total': int(total or 0)})
+        except Exception:
+            logging.debug('Не удалось записать audit для запуска операции', exc_info=True)
         await self._send_operation_status(report_id, bot=bot, user_id=user_id, force=True)
         return report_id
 
@@ -3081,6 +3155,14 @@ class AccountSessionManager:
         if not report_id:
             return
         db.finish_operation_report(report_id, status)
+        try:
+            report = db.get_operation_report(report_id) or {}
+            db.write_audit(int(report.get('user_id') or 0), 'operation_finished', 'operation', report_id,
+                           {'status': status, 'processed': report.get('processed', 0),
+                            'success_count': report.get('success_count', 0),
+                            'error_count': report.get('error_count', 0)})
+        except Exception:
+            logging.debug('Не удалось записать audit для завершения операции', exc_info=True)
         await self._send_operation_status(report_id, force=True)
         self._operation_status_last_update.pop(report_id, None)
         self.active_operation_reports.pop(report_id, None)
@@ -3144,7 +3226,29 @@ class AccountSessionManager:
         is removed from the sender's own history on a best-effort basis.
         """
         account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids if account_id))
+        usable_account_ids = []
+        excluded_accounts = []
+        for account_id in account_ids:
+            usable, reason = db.is_account_usable(account_id)
+            if usable:
+                usable_account_ids.append(account_id)
+            else:
+                excluded_accounts.append({'account_id': account_id, 'reason': reason})
+        account_ids = usable_account_ids
+        if excluded_accounts:
+            try:
+                db.write_audit(user_id, 'health_filter', 'spam', '',
+                               {'excluded': excluded_accounts})
+            except Exception:
+                pass
         targets = list(targets or [])
+        targets, blocked_targets = db.filter_blacklisted_targets(user_id, targets)
+        if blocked_targets:
+            try:
+                db.write_audit(user_id, 'blacklist_filter', 'spam', '',
+                               {'blocked_count': len(blocked_targets)})
+            except Exception:
+                pass
         if not account_ids or not targets:
             return 0, 'Нет аккаунтов или целей для рассылки'
         if self._running_tasks >= self._max_concurrent_tasks:
@@ -3487,6 +3591,18 @@ class AccountSessionManager:
     async def start_invite_job(self, account_ids: list, chat_id: str, users: list,
                                bot, user_id: int, auto_join: bool = True):
         """Запускает инвайтинг с общей очередью и одним отчётом/status bar."""
+        account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids if account_id))
+        account_ids = [account_id for account_id in account_ids
+                       if db.is_account_usable(account_id)[0]]
+        users, blocked_users = db.filter_blacklisted_targets(user_id, list(users or []))
+        if not account_ids or not users:
+            return 0
+        if blocked_users:
+            try:
+                db.write_audit(user_id, 'blacklist_filter', 'invite', '',
+                               {'blocked_count': len(blocked_users)})
+            except Exception:
+                pass
         work_queue = asyncio.Queue()
         for target in users:
             work_queue.put_nowait(target)

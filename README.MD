@@ -60,6 +60,17 @@ API_HASHES_FILE = hashs.txt
 Для распределения аккаунтов по разным API создайте рядом с main.py файл hashs.txt.
 Каждая строка: api_id:api_hash. Пустые строки и строки с # игнорируются.
 
+Для шифрования session string и API hash в базе задайте переменную окружения
+`SESSION_ENCRYPTION_KEY` (Fernet-ключ). Ключ нельзя сохранять в Git или в базе:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+В интерфейсе доступны Центр здоровья аккаунтов, dry-run ZIP-импорт,
+blacklist/отписки, черновики кампаний, история операций и безопасный backup
+метаданных без секретов.
+
 Как узнать свой TELEGRAM_ID:
 Напишите боту @userinfobot
 
