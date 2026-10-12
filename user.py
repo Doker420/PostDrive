@@ -2578,7 +2578,8 @@ class AccountSessionManager:
             lambda: client.send_inline_bot_result(target, query_id, result_id),
             account_id=account_id, bot=bot, user_id=user_id,
             description=f'PostBot send -> {target}',
-            max_retries=2, notify=notify, stop_on_flood=True
+            max_retries=2, notify=notify, stop_on_flood=True,
+            raise_on_skip=True,
         )
 
     async def generate_ai_comment(self, prompt: str, post_text: str = "") -> str:
@@ -3132,12 +3133,15 @@ class AccountSessionManager:
                              mode: str = 'post', custom_text: str = '',
                              custom_entities: str = None, delay_min: int = 30,
                              delay_max: int = 90, postbot_id: str = '',
-                             forward_chat_id: str = '', forward_message_id: int = 0):
+                             forward_chat_id: str = '', forward_message_id: int = 0,
+                             delete_after_send: bool = False):
         """Run a multi-account mailing with one status bar and a shared queue.
 
         An account that receives FloodWait/PeerFlood leaves the queue. Other
         accounts continue taking targets. Unclaimed targets are persisted as
         ``remaining`` report items and can be downloaded after completion.
+        When ``delete_after_send`` is enabled, each successfully sent message
+        is removed from the sender's own history on a best-effort basis.
         """
         account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids if account_id))
         targets = list(targets or [])
@@ -3175,7 +3179,8 @@ class AccountSessionManager:
                 self.run_limited(self._spam_shared_worker(
                     account_id, work_queue, shared_state, bot, user_id,
                     mode, custom_text, custom_entities, delay_min, delay_max,
-                    postbot_id, forward_chat_id, forward_message_id
+                    postbot_id, forward_chat_id, forward_message_id,
+                    delete_after_send
                 )),
                 name=f'spam-{report_id}-{account_id}'
             )
@@ -3186,7 +3191,8 @@ class AccountSessionManager:
                                   bot, user_id: int, mode: str, custom_text: str,
                                   custom_entities: str, delay_min: int, delay_max: int,
                                   postbot_id: str, forward_chat_id: str = '',
-                                  forward_message_id: int = 0):
+                                  forward_message_id: int = 0,
+                                  delete_after_send: bool = False):
         """Process the shared mailing queue for one account only."""
         report_id = int(shared_state.get('report_id') or 0)
         account = db.get_account(account_id) or {}
@@ -3200,6 +3206,45 @@ class AccountSessionManager:
             if report_id:
                 await self._record_operation_result(
                     report_id, account_id, str(target), '', result, detail
+                )
+
+        async def delete_sent_copy(peer, sent_message):
+            """Remove a sent message from the sender's own history.
+
+            Delivery has already succeeded when this is called. Deletion is
+            deliberately best-effort: a timeout or Telegram refusal must not
+            turn a successful delivery into an error in the mailing report.
+            ``revoke=False`` requests removal only from this account where
+            Telegram supports local-only deletion.
+            """
+            if isinstance(sent_message, (list, tuple)):
+                messages = sent_message
+            else:
+                messages = [sent_message]
+            message_ids = [
+                int(getattr(message, 'id', 0) or 0)
+                for message in messages
+                if getattr(message, 'id', None)
+            ]
+            if not message_ids:
+                logging.warning(
+                    '[%s] отправка успешна, но Telegram не вернул ID сообщения; '
+                    'удаление пропущено',
+                    acc_name,
+                )
+                return
+            try:
+                await asyncio.wait_for(
+                    client.delete_messages(peer, message_ids, revoke=False),
+                    timeout=15,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    '[%s] сообщение доставлено, но не удалось удалить его у отправителя '
+                    'для %s: %s: %s',
+                    acc_name, peer, type(exc).__name__, exc,
                 )
 
         try:
@@ -3325,7 +3370,7 @@ class AccountSessionManager:
                         entities_to_send = None
 
                     if mode == 'forward':
-                        await self.tg_call(
+                        sent_message = await self.tg_call(
                             lambda: client.forward_messages(
                                 peer, forward_source, int(forward_message_id)
                             ),
@@ -3335,13 +3380,13 @@ class AccountSessionManager:
                             raise_on_skip=True,
                         )
                     elif selected_postbot_id:
-                        await self.send_via_postbot(
+                        sent_message = await self.send_via_postbot(
                             client, peer, selected_postbot_id, account_id,
                             bot=bot, user_id=user_id,
                             notify=not notifications_hidden,
                         )
                     elif post_photo and os.path.exists(post_photo) and mode == 'post':
-                        await self.tg_call(
+                        sent_message = await self.tg_call(
                             lambda: client.send_photo(
                                 peer, post_photo, caption=text_to_send,
                                 caption_entities=entities_to_send if entities_to_send else None,
@@ -3353,7 +3398,7 @@ class AccountSessionManager:
                             raise_on_skip=True,
                         )
                     else:
-                        await self.tg_call(
+                        sent_message = await self.tg_call(
                             lambda: client.send_message(
                                 peer, text_to_send,
                                 entities=entities_to_send if entities_to_send else None,
@@ -3364,6 +3409,8 @@ class AccountSessionManager:
                             notify=not notifications_hidden,
                             raise_on_skip=True,
                         )
+                    if delete_after_send:
+                        await delete_sent_copy(peer, sent_message)
                     local_success += 1
                     await record(target, 'success')
                 except TargetSkipError as exc:
@@ -6184,7 +6231,7 @@ class AccountSessionManager:
     async def spam_to_users(self, account_id: int, targets: list, bot, user_id: int,
                             mode: str = 'post', custom_text: str = '', custom_entities: str = None,
                             delay_min: int = 30, delay_max: int = 90,
-                            postbot_id: str = ''):
+                            postbot_id: str = '', delete_after_send: bool = False):
         account = db.get_account(account_id)
         if not account:
             return
@@ -6231,7 +6278,36 @@ class AccountSessionManager:
         
         success = 0
         errors = 0
-        
+
+        async def delete_sent_copy(peer, sent_message):
+            """Best-effort local cleanup for the legacy single-account path."""
+            messages = sent_message if isinstance(sent_message, (list, tuple)) else [sent_message]
+            message_ids = [
+                int(getattr(message, 'id', 0) or 0)
+                for message in messages
+                if getattr(message, 'id', None)
+            ]
+            if not message_ids:
+                logging.warning(
+                    '[%s] отправка успешна, но Telegram не вернул ID сообщения; '
+                    'удаление пропущено',
+                    acc_name,
+                )
+                return
+            try:
+                await asyncio.wait_for(
+                    client.delete_messages(peer, message_ids, revoke=False),
+                    timeout=15,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.warning(
+                    '[%s] сообщение доставлено, но не удалось удалить его у отправителя '
+                    'для %s: %s: %s',
+                    acc_name, peer, type(exc).__name__, exc,
+                )
+
         for target in targets:
             try:
                 if isinstance(target, int):
@@ -6288,13 +6364,13 @@ class AccountSessionManager:
                 # цель просто пропускается. Раньше сырые client.send_* ничего
                 # этого не делали — аккаунт молча выгорал.
                 if postbot_id:
-                    await self.send_via_postbot(
+                    sent_message = await self.send_via_postbot(
                         client, peer, postbot_id, account_id,
                         bot=bot, user_id=user_id,
                         notify=not notifications_hidden
                     )
                 elif post_photo and os.path.exists(post_photo) and mode == 'post':
-                    await self.tg_call(
+                    sent_message = await self.tg_call(
                         lambda: client.send_photo(
                             peer, post_photo, caption=text_to_send,
                             caption_entities=entities_to_send if entities_to_send else None,
@@ -6302,13 +6378,15 @@ class AccountSessionManager:
                         account_id=account_id, bot=bot, user_id=user_id,
                         description=f'spam -> {peer}', notify=not notifications_hidden)
                 else:
-                    await self.tg_call(
+                    sent_message = await self.tg_call(
                         lambda: client.send_message(
                             peer, text_to_send,
                             entities=entities_to_send if entities_to_send else None,
                             parse_mode=None),
                         account_id=account_id, bot=bot, user_id=user_id,
                         description=f'spam -> {peer}', notify=not notifications_hidden)
+                if delete_after_send:
+                    await delete_sent_copy(peer, sent_message)
                 success += 1
                 if bot and not notifications_hidden:
                     try:

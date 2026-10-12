@@ -1286,6 +1286,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         account_ids = data.get('spam_account_ids', [])
         mode = data.get('spam_mode', 'post')
         speed = data.get('spam_speed', 'normal')
+        delete_after_send = bool(data.get('delete_after_send', False))
         speed_label, speed_hint = SPAM_SPEED_LABELS.get(speed, SPAM_SPEED_LABELS['normal'])
 
         mode_label = {
@@ -1313,6 +1314,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                                                   callback_data=f"spam_speed_{code}"))
         buttons = [
             speed_row,
+            [InlineKeyboardButton(
+                text=f"🗑 Удалять у себя: {'✅ ВКЛ' if delete_after_send else '❌ ВЫКЛ'}",
+                callback_data="spam_toggle_delete_after_send"
+            )],
             [InlineKeyboardButton(text="📮 Через @PostBot", callback_data="spam_postbot_mode")],
             [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
@@ -1539,7 +1544,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             ]
             markup = InlineKeyboardMarkup(inline_keyboard=buttons)
             await state.set_state(MassActionStates.SELECTING_ACCOUNTS)
-            await state.update_data(spam_account_ids=selected)
+            await state.update_data(
+                spam_account_ids=selected,
+                delete_after_send=False,
+            )
             await edit_message(callback, text, markup)
         elif action == 'invite':
             await state.clear()
@@ -1952,6 +1960,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         postbot_id = data.get('spam_postbot_id', '')
         forward_chat = data.get('spam_forward_chat', '')
         forward_message_id = int(data.get('spam_forward_message_id') or 0)
+        delete_after_send = bool(data.get('delete_after_send', False))
         speed = data.get('spam_speed', 'normal')
         delay_min, delay_max = account_manager.SPAM_SPEEDS.get(
             speed, account_manager.SPAM_SPEEDS['normal'])
@@ -1976,6 +1985,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             postbot_id=postbot_id,
             forward_chat_id=forward_chat,
             forward_message_id=forward_message_id,
+            delete_after_send=delete_after_send,
         )
         if start_error:
             await answer_to.answer(f"❌ Не удалось запустить рассылку: {start_error}")
@@ -2042,6 +2052,18 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         await state.update_data(spam_mode='postbot', spam_postbot_id=postbot_id)
         await ask_for_spam_targets(message, state)
+
+    @dp.callback_query(F.data == "spam_toggle_delete_after_send", MassActionStates.WAITING_TARGETS)
+    async def spam_toggle_delete_after_send_callback(callback: CallbackQuery, state: FSMContext):
+        data = await state.get_data()
+        enabled = not bool(data.get('delete_after_send', False))
+        await state.update_data(delete_after_send=enabled)
+        await _answer_callback(
+            callback,
+            f"🗑 Удаление отправленных сообщений у себя: {'включено' if enabled else 'выключено'}",
+            show_alert=False,
+        )
+        await ask_for_spam_targets(callback, state)
 
     @dp.callback_query(F.data.startswith("spam_speed_"), MassActionStates.WAITING_TARGETS)
     async def spam_speed_callback(callback: CallbackQuery, state: FSMContext):

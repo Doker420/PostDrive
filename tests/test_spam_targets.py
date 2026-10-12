@@ -74,6 +74,17 @@ assert 'F.data.startswith("spam_speed_")' in H, "нет обработчика �
 assert 'delay_min=delay_min, delay_max=delay_max' in H, "скорость не доходит до рассылки"
 results.append("выбор скорости рассылки с лимитами Telegram: OK")
 
+# 9. Удаление отправленного сообщения — отдельная опция, прокинутая через
+# общий worker; ошибка удаления не должна попадать в ветку ошибки доставки.
+assert 'callback_data="spam_toggle_delete_after_send"' in H, "нет переключателя удаления"
+assert 'delete_after_send=delete_after_send' in H, "флаг удаления не передаётся из FSM"
+assert 'delete_after_send: bool = False' in U, "нет безопасного значения по умолчанию"
+assert 'client.delete_messages(peer, message_ids, revoke=False)' in U, \
+    "нет локального удаления сообщения у аккаунта-отправителя"
+assert 'if delete_after_send:' in U and 'await delete_sent_copy(peer, sent_message)' in U, \
+    "удаление не выполняется после успешной отправки"
+results.append("переключатель удаления после успешной отправки: OK")
+
 ast.parse(H)
 ast.parse(U)
 results.append("handlers.py и user.py компилируются: OK")
