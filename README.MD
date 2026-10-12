@@ -1,3 +1,7 @@
+# Autoposter — версия 6.0.1
+
+Список исправлений: [FIX_LIST.md](FIX_LIST.md).
+
 Инструкция по установке и запуску Autoposter
 Требования
 Python 3.8 или выше
@@ -51,6 +55,10 @@ DIR =
 
 API_ID = ВАШ_API_ID
 API_HASH = ВАШ_API_HASH
+API_HASHES_FILE = hashs.txt
+
+Для распределения аккаунтов по разным API создайте рядом с main.py файл hashs.txt.
+Каждая строка: api_id:api_hash. Пустые строки и строки с # игнорируются.
 
 Как узнать свой TELEGRAM_ID:
 Напишите боту @userinfobot

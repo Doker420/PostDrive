@@ -170,6 +170,16 @@ def test_user_safety_guards_are_present():
     assert "nc_page_" in handlers
     assert "join_pack_page_" in handlers
     assert "await render_accounts_screen(message, user_id, page=0)" in handlers
+    assert "accounts_goto_page_" in handlers
+    assert "mass_account_goto_" in handlers
+    assert "nc_goto_page_" in handlers
+    assert "join_pack_goto_page_" in handlers
+    assert "account_manager.bind_account_api(account_id)" in handlers
+    assert "check_all_proxies" in handlers
+    assert "spam_mode_forward" in handlers
+    assert "client.forward_messages" in source
+    assert "toggle_invite_auto_join" in handlers
+    assert "await account_manager.stop_account_warmup(account_id, user_id)" in handlers
 
     transport = pathlib.Path("telegram_transport.py").read_text(encoding="utf-8")
     assert "MESSAGE_TOO_LONG" in transport

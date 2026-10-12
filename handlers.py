@@ -229,6 +229,9 @@ class AddAccountStates(StatesGroup):
     WAITING_MASS_PROXY_LIST = State()
     WAITING_QR_SCAN = State()
 
+class AccountPageStates(StatesGroup):
+    WAITING_PAGE = State()
+
 class AccountPostStates(StatesGroup):
     WAITING_TEXT = State()
     WAITING_PHOTO = State()
@@ -296,6 +299,7 @@ class MassActionStates(StatesGroup):
     SELECTING_ACCOUNTS = State()
     WAITING_TARGETS = State()
     WAITING_POSTBOT_ID = State()
+    WAITING_FORWARD_SOURCE = State()
     WAITING_CUSTOM_TEXT = State()
 
 class InviteStates(StatesGroup):
@@ -742,6 +746,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"accounts_page_{page + 1}"))
         buttons.append(nav)
+        buttons.append([
+            InlineKeyboardButton(text="🔢 К странице", callback_data=f"accounts_goto_page_{page}"),
+            InlineKeyboardButton(text="🔎 Проверить все прокси", callback_data="check_all_proxies"),
+        ])
         buttons.append([InlineKeyboardButton(text="➕ Добавить аккаунт", style="success", callback_data="add_account_start")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         title = f"📱 <b>Ваши аккаунты:</b> ({len(accounts)})\nСтраница: {page + 1}/{total_pages}"
@@ -1135,6 +1143,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mass_account_page_{action}_{page + 1}"))
         buttons.append(nav)
+        buttons.append([InlineKeyboardButton(
+            text="🔢 К странице",
+            callback_data=f"mass_account_goto_{action}_{page}"
+        )])
         buttons.append([InlineKeyboardButton(text="✅ Далее", callback_data=f"mass_action_next_{action}")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1160,6 +1172,42 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             else:
                 await message_or_callback.message.answer(text, reply_markup=markup)
 
+    def _parse_forward_source(value: str):
+        """Parse ``@group 123`` or a public/private Telegram post link."""
+        from urllib.parse import urlparse
+        raw = (value or '').strip()
+        if not raw:
+            return None, None
+        if raw.startswith(('https://', 'http://', 't.me/')):
+            url = raw if '://' in raw else f'https://{raw}'
+            parts = [part for part in urlparse(url).path.split('/') if part]
+            if len(parts) < 2:
+                return None, None
+            message_id = parts[-1]
+            source = parts[-2]
+            if not message_id.isdigit():
+                return None, None
+            if source == 'c' and len(parts) >= 3 and parts[-2].isdigit():
+                # The private link form is /c/<channel_id>/<message_id>.
+                source = f"-100{parts[-2]}"
+            elif parts[0] == 'c' and len(parts) >= 3 and parts[1].isdigit():
+                source = f"-100{parts[1]}"
+            else:
+                source = source if source.startswith(('@', '-100')) else f'@{source}'
+            return source, int(message_id)
+
+        tokens = raw.replace(',', ' ').split()
+        if len(tokens) == 1 and ':' in tokens[0]:
+            tokens = tokens[0].rsplit(':', 1)
+        if len(tokens) != 2 or not tokens[1].isdigit():
+            return None, None
+        source = tokens[0].strip()
+        if source.lstrip('-').isdigit():
+            source = int(source)
+        elif not source.startswith('@'):
+            source = f'@{source}'
+        return source, int(tokens[1])
+
     # Пресеты скорости рассылки. Ориентир Telegram: безопасная норма для
     # сообщений незнакомым людям — примерно 20-30 в час на аккаунт;
     # превышение почти гарантированно даёт PeerFlood («спам-блок»).
@@ -1180,6 +1228,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             'post': '📝 Текст из поста',
             'custom': '✏️ Свой текст',
             'postbot': f"📮 @PostBot ({data.get('spam_postbot_id', 'ID не задан')})",
+            'forward': f"📤 Репост из группы ({data.get('spam_forward_chat', 'источник не задан')} · пост {data.get('spam_forward_message_id', '?')})",
         }.get(mode, '📝 Текст из поста')
         text = (
             f"📨 <b>Рассылка</b>\n\n"
@@ -1216,6 +1265,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         data = await state.get_data()
         account_ids = data.get('invite_account_ids', [])
         page = data.get('invite_chat_page', 0)
+        auto_join = bool(data.get('invite_auto_join', True))
         per_page = 10
 
         all_chats = []
@@ -1244,6 +1294,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             buttons.append(nav_buttons)
 
         buttons.append([InlineKeyboardButton(text="🔗 Ввести ID/ссылку чата", callback_data="invite_custom_chat")])
+        buttons.append([InlineKeyboardButton(
+            text=f"🔗 Массовое вступление: {'✅ ВКЛ' if auto_join else '❌ ВЫКЛ'}",
+            callback_data="toggle_invite_auto_join"
+        )])
         buttons.append([InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_invite")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1276,6 +1330,27 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         action = parts[3]
         page = int(parts[4])
         await show_account_selection(callback, action, state, page=page)
+
+    @dp.callback_query(F.data.startswith('mass_account_goto_'))
+    async def mass_account_goto_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        parts = callback.data.split('_')
+        action = parts[3]
+        page = int(parts[4])
+        await state.set_state(AccountPageStates.WAITING_PAGE)
+        await state.update_data(
+            account_page_context='mass',
+            account_page_action=action,
+            account_page_current=page,
+        )
+        await edit_message(
+            callback,
+            "🔢 <b>Переход к странице аккаунтов</b>\n\n"
+            "Введите номер страницы:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="account_page_cancel")]
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('toggle_mass_spam_'))
     async def toggle_mass_spam_callback(callback: CallbackQuery, state: FSMContext):
@@ -1322,6 +1397,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             buttons = [
                 [InlineKeyboardButton(text="📝 Текст из поста", callback_data="spam_mode_post")],
                 [InlineKeyboardButton(text="✏️ Свой текст", callback_data="spam_mode_custom")],
+                [InlineKeyboardButton(text="📤 Репост из группы", callback_data="spam_mode_forward")],
                 [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
             ]
@@ -1332,7 +1408,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         elif action == 'invite':
             await state.clear()
             await state.set_state(InviteStates.SELECTING_CHAT)
-            await state.update_data(invite_account_ids=selected, invite_chat_page=0)
+            await state.update_data(
+                invite_account_ids=selected,
+                invite_chat_page=0,
+                invite_auto_join=True,
+            )
             await show_invite_chat_selection(callback, state)
 
     @dp.callback_query(F.data == "refresh_mass_spam")
@@ -1398,6 +1478,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await _answer_callback(callback)
         page = int(callback.data.split('_')[3])
         await state.update_data(invite_chat_page=page)
+        await show_invite_chat_selection(callback, state)
+
+    @dp.callback_query(F.data == "toggle_invite_auto_join")
+    async def toggle_invite_auto_join_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        data = await state.get_data()
+        await state.update_data(invite_auto_join=not bool(data.get('invite_auto_join', True)))
         await show_invite_chat_selection(callback, state)
 
     @dp.callback_query(F.data == "invite_custom_chat")
@@ -1501,7 +1588,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         # сообщении доступны остановка и отчёт с выгрузкой CSV.
         report_id = await account_manager.start_invite_job(
             valid_account_ids, chat_id, unique_users, bot, user_id,
-            auto_join=True
+            auto_join=bool(data.get('invite_auto_join', True))
         )
 
         await state.clear()
@@ -1576,6 +1663,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         custom_text = data.get('custom_spam_text', '')
         custom_entities = data.get('custom_spam_entities', None)
         postbot_id = data.get('spam_postbot_id', '')
+        forward_chat = data.get('spam_forward_chat', '')
+        forward_message_id = int(data.get('spam_forward_message_id') or 0)
         speed = data.get('spam_speed', 'normal')
         delay_min, delay_max = account_manager.SPAM_SPEEDS.get(
             speed, account_manager.SPAM_SPEEDS['normal'])
@@ -1598,6 +1687,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             custom_entities=custom_entities,
             delay_min=delay_min, delay_max=delay_max,
             postbot_id=postbot_id,
+            forward_chat_id=forward_chat,
+            forward_message_id=forward_message_id,
         )
         if start_error:
             await answer_to.answer(f"❌ Не удалось запустить рассылку: {start_error}")
@@ -1607,6 +1698,37 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"✅ Рассылка запущена в фоне: задача #{report_id}.\n"
             "Прогресс, остановка, отчёт и скачивание остатка доступны в статусном сообщении.",
             reply_markup=main_menu_keyboard(user_id))
+
+    @dp.callback_query(F.data == "spam_mode_forward", MassActionStates.SELECTING_ACCOUNTS)
+    async def spam_mode_forward_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.set_state(MassActionStates.WAITING_FORWARD_SOURCE)
+        await edit_message(
+            callback,
+            "📤 <b>Репост из группы</b>\n\n"
+            "Отправьте источник и ID поста одной строкой:\n"
+            "• <code>@group 123</code>\n"
+            "• <code>https://t.me/group/123</code>\n"
+            "• <code>https://t.me/c/123456789/123</code>\n\n"
+            "Выбранный пост будет переслан каждому получателю.",
+            reply_markup=cancel_inline_keyboard()
+        )
+
+    @dp.message(MassActionStates.WAITING_FORWARD_SOURCE)
+    async def process_spam_forward_source(message: Message, state: FSMContext):
+        source, message_id = _parse_forward_source(message.text or message.caption or '')
+        if source is None or message_id is None:
+            await message.answer(
+                "❌ Не удалось распознать источник. Пример: <code>@group 123</code> "
+                "или ссылка на пост Telegram."
+            )
+            return
+        await state.update_data(
+            spam_mode='forward',
+            spam_forward_chat=source,
+            spam_forward_message_id=message_id,
+        )
+        await ask_for_spam_targets(message, state)
 
     @dp.callback_query(F.data == "spam_postbot_mode", MassActionStates.WAITING_TARGETS)
     async def spam_postbot_mode_callback(callback: CallbackQuery, state: FSMContext):
@@ -3507,6 +3629,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
 
         buttons = [
+            [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")],
             [spam_btn],
             [warmup_btn],
             [InlineKeyboardButton(
@@ -3658,6 +3781,107 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await state.clear()
         page = int(callback.data.rsplit('_', 1)[1])
         await render_accounts_screen(callback, callback.from_user.id, page=page)
+
+    @dp.callback_query(F.data.startswith('accounts_goto_page_'))
+    async def accounts_goto_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        page = int(callback.data.rsplit('_', 1)[1])
+        await state.set_state(AccountPageStates.WAITING_PAGE)
+        await state.update_data(
+            account_page_context='accounts',
+            account_page_current=page,
+        )
+        await edit_message(
+            callback,
+            "🔢 <b>Переход к странице аккаунтов</b>\n\n"
+            "Введите номер страницы:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="account_page_cancel")]
+            ])
+        )
+
+    @dp.callback_query(F.data == 'account_page_cancel', AccountPageStates.WAITING_PAGE)
+    async def account_page_cancel_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        data = await state.get_data()
+        context = data.get('account_page_context')
+        page = int(data.get('account_page_current') or 0)
+        if context == 'mass':
+            await show_account_selection(callback, data.get('account_page_action', 'spam'), state, page=page)
+        elif context == 'neuro':
+            await neurocomment_menu_handler(callback.message, state, callback.from_user.id, page=page)
+        elif context == 'join_pack':
+            await state.clear()
+            await render_join_pack_account_selection(callback, int(data.get('account_page_pack_id')), page=page)
+        else:
+            await state.clear()
+            await render_accounts_screen(callback, callback.from_user.id, page=page)
+
+    @dp.message(AccountPageStates.WAITING_PAGE)
+    async def account_page_input(message: Message, state: FSMContext):
+        raw_page = (message.text or '').strip()
+        try:
+            requested_page = int(raw_page)
+            if requested_page < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            await message.answer("❌ Введите положительный номер страницы, например: 3")
+            return
+        data = await state.get_data()
+        context = data.get('account_page_context')
+        page = requested_page - 1
+        if context == 'mass':
+            await show_account_selection(message, data.get('account_page_action', 'spam'), state, page=page)
+        elif context == 'neuro':
+            await neurocomment_menu_handler(message, state, message.from_user.id, page=page)
+        elif context == 'join_pack':
+            await state.clear()
+            await render_join_pack_account_selection(message, int(data.get('account_page_pack_id')), page=page)
+        else:
+            await state.clear()
+            await render_accounts_screen(message, message.from_user.id, page=page)
+
+    @dp.callback_query(F.data == 'check_all_proxies')
+    async def check_all_proxies_callback(callback: CallbackQuery):
+        await _answer_callback(callback, "⏳ Проверяю прокси аккаунтов...", show_alert=False)
+        accounts = [
+            account for account in db.get_user_accounts(callback.from_user.id)
+            if (account.get('proxy') or '').strip()
+        ]
+        if not accounts:
+            await _answer_callback(callback, "ℹ️ У аккаунтов нет заданных прокси.", show_alert=True)
+            return
+        semaphore = asyncio.Semaphore(8)
+
+        async def check_one(account):
+            async with semaphore:
+                try:
+                    ok, result = await account_manager.check_account_proxy(
+                        int(account['id']), callback.from_user.id
+                    )
+                    return account, ok, result or ''
+                except Exception as error:
+                    logger.error('Массовая проверка прокси #%s: %s', account.get('id'), error, exc_info=True)
+                    return account, False, f'{type(error).__name__}: {error}'
+
+        results = await asyncio.gather(*(check_one(account) for account in accounts))
+        working = sum(1 for _account, ok, _result in results if ok)
+        failed = len(results) - working
+        removed = sum(
+            1 for _account, ok, result in results
+            if not ok and ('удалён' in result.lower() or 'удален' in result.lower())
+        )
+        await edit_message(
+            callback,
+            "🔎 <b>Массовая проверка прокси завершена</b>\n\n"
+            f"Проверено: {len(results)}\n"
+            f"✅ Работают: {working}\n"
+            f"❌ Не работают: {failed}\n"
+            f"🗑 Автоматически удалены из аккаунтов: {removed}",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")],
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('start_spam_'))
     async def start_spam_callback(callback: CallbackQuery, state: FSMContext):
@@ -4320,14 +4544,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await edit_message(callback, "❓ Удалить аккаунт?", reply_markup=markup)
 
     @dp.callback_query(F.data.startswith('confirm_del_acc_'))
-    async def confirm_del_acc_callback(callback: CallbackQuery):
+    async def confirm_del_acc_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
         account_id = int(callback.data.split('_')[3])
         user_id = callback.from_user.id
-        await account_manager.stop_account_spam(account_id, user_id)
-        await account_manager.stop_client(account_id)
-        db.delete_account(account_id, user_id)
+        try:
+            await account_manager.stop_account_spam(account_id, user_id)
+            await account_manager.stop_client(account_id)
+            await account_manager.stop_account_warmup(account_id, user_id)
+            deleted = db.delete_account(account_id, user_id)
+            if not deleted:
+                await _answer_callback(callback, "❌ Аккаунт уже удалён или не найден.", show_alert=True)
+                return
+        except Exception as error:
+            logger.error("Не удалось удалить аккаунт %s: %s", account_id, error, exc_info=True)
+            await _answer_callback(callback, "❌ Не удалось удалить аккаунт. Попробуйте ещё раз.", show_alert=True)
+            return
         await _answer_callback(callback, "✅ Аккаунт удалён", show_alert=True)
-        await back_to_accounts_callback(callback, None)
+        await back_to_accounts_callback(callback, state)
 
     # ==================== NEUROCOMMENTING ====================
     @dp.message(F.text == '🧠 Нейрокомментинг')
@@ -4363,6 +4597,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"nc_page_{page + 1}"))
         buttons.append(nav)
+        buttons.append([InlineKeyboardButton(
+            text="🔢 К странице",
+            callback_data=f"nc_goto_page_{page}"
+        )])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await send_photo(
@@ -4380,6 +4618,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         except Exception:
             pass
         await neurocomment_menu_handler(callback.message, state, callback.from_user.id, page=page)
+
+    @dp.callback_query(F.data.startswith('nc_goto_page_'))
+    async def nc_goto_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        page = int(callback.data.rsplit('_', 1)[1])
+        await state.set_state(AccountPageStates.WAITING_PAGE)
+        await state.update_data(
+            account_page_context='neuro',
+            account_page_current=page,
+        )
+        await edit_message(
+            callback,
+            "🔢 <b>Переход к странице аккаунтов</b>\n\n"
+            "Введите номер страницы:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="account_page_cancel")]
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('nc_acc_'))
     async def nc_account_callback(callback: CallbackQuery, state: FSMContext):
@@ -6145,10 +6401,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         ])
         await edit_message(callback, text, reply_markup=markup)
 
-    async def render_join_pack_account_selection(callback: CallbackQuery, pack_id: int, page: int = 0):
-        accounts = db.get_user_accounts(callback.from_user.id)
+    async def render_join_pack_account_selection(target, pack_id: int, page: int = 0):
+        user_id = target.from_user.id
+        accounts = db.get_user_accounts(user_id)
         if not accounts:
-            await _answer_callback(callback, "📱 У вас нет аккаунтов!", show_alert=True)
+            if isinstance(target, CallbackQuery):
+                await _answer_callback(target, "📱 У вас нет аккаунтов!", show_alert=True)
+            else:
+                await target.answer("📱 У вас нет аккаунтов!")
             return
         visible, page, total_pages = _account_page(accounts, page)
         buttons = []
@@ -6165,13 +6425,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if page < total_pages - 1:
             nav.append(InlineKeyboardButton(text="➡️", callback_data=f"join_pack_page_{pack_id}_{page + 1}"))
         buttons.append(nav)
+        buttons.append([InlineKeyboardButton(
+            text="🔢 К странице",
+            callback_data=f"join_pack_goto_page_{pack_id}_{page}"
+        )])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"user_pack_{pack_id}")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await edit_message(
-            callback,
-            f"📱 <b>Выберите аккаунт для вступления:</b>\nСтраница: {page + 1}/{total_pages}",
-            markup
-        )
+        text = f"📱 <b>Выберите аккаунт для вступления:</b>\nСтраница: {page + 1}/{total_pages}"
+        if isinstance(target, CallbackQuery):
+            await edit_message(target, text, markup)
+        else:
+            await send_photo(target, 'catalog.jpg', text, markup)
 
     @dp.callback_query(lambda c: c.data and c.data.startswith('join_pack_') and c.data.split('_')[2].isdigit())
     async def join_pack_callback(callback: CallbackQuery, state: FSMContext):
@@ -6215,6 +6479,27 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await _answer_callback(callback, "📭 В паке нет чатов!", show_alert=True)
             return
         await render_join_pack_account_selection(callback, pack_id, page=page)
+
+    @dp.callback_query(F.data.startswith('join_pack_goto_page_'))
+    async def join_pack_goto_page_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        parts = callback.data.split('_')
+        pack_id = int(parts[4])
+        page = int(parts[5])
+        await state.set_state(AccountPageStates.WAITING_PAGE)
+        await state.update_data(
+            account_page_context='join_pack',
+            account_page_pack_id=pack_id,
+            account_page_current=page,
+        )
+        await edit_message(
+            callback,
+            "🔢 <b>Переход к странице аккаунтов</b>\n\n"
+            "Введите номер страницы:",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="account_page_cancel")]
+            ])
+        )
 
     @dp.callback_query(F.data.startswith('join_pack_acc_'))
     async def join_pack_acc_callback(callback: CallbackQuery, state: FSMContext):

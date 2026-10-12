@@ -3079,7 +3079,8 @@ class AccountSessionManager:
     async def start_spam_job(self, account_ids: list, targets: list, bot, user_id: int,
                              mode: str = 'post', custom_text: str = '',
                              custom_entities: str = None, delay_min: int = 30,
-                             delay_max: int = 90, postbot_id: str = ''):
+                             delay_max: int = 90, postbot_id: str = '',
+                             forward_chat_id: str = '', forward_message_id: int = 0):
         """Run a multi-account mailing with one status bar and a shared queue.
 
         An account that receives FloodWait/PeerFlood leaves the queue. Other
@@ -3122,7 +3123,7 @@ class AccountSessionManager:
                 self.run_limited(self._spam_shared_worker(
                     account_id, work_queue, shared_state, bot, user_id,
                     mode, custom_text, custom_entities, delay_min, delay_max,
-                    postbot_id
+                    postbot_id, forward_chat_id, forward_message_id
                 )),
                 name=f'spam-{report_id}-{account_id}'
             )
@@ -3132,7 +3133,8 @@ class AccountSessionManager:
     async def _spam_shared_worker(self, account_id: int, work_queue, shared_state: dict,
                                   bot, user_id: int, mode: str, custom_text: str,
                                   custom_entities: str, delay_min: int, delay_max: int,
-                                  postbot_id: str):
+                                  postbot_id: str, forward_chat_id: str = '',
+                                  forward_message_id: int = 0):
         """Process the shared mailing queue for one account only."""
         report_id = int(shared_state.get('report_id') or 0)
         account = db.get_account(account_id) or {}
@@ -3165,8 +3167,22 @@ class AccountSessionManager:
             selected_postbot_id = normalize_postbot_id(postbot_id)
             if mode == 'postbot' and not selected_postbot_id:
                 selected_postbot_id = normalize_postbot_id(account.get('postbot_post_id', ''))
+            forward_source = forward_chat_id
+            try:
+                if str(forward_source).lstrip('-').isdigit():
+                    forward_source = int(forward_source)
+            except (TypeError, ValueError):
+                pass
             post_text = account.get('post_text', '') if mode == 'post' else custom_text
             post_photo = account.get('post_photo', '') if mode == 'post' else ''
+            if mode == 'forward' and (not forward_source or int(forward_message_id or 0) <= 0):
+                account_stopped = True
+                if bot and not notifications_hidden:
+                    await self._safe_bot_message(
+                        bot, user_id,
+                        f'⚠️ [{acc_name}] Не задан источник поста для репоста — аккаунт исключён'
+                    )
+                return
             if mode == 'postbot' and not selected_postbot_id:
                 account_stopped = True
                 if bot and not notifications_hidden:
@@ -3175,7 +3191,7 @@ class AccountSessionManager:
                         f'⚠️ [{acc_name}] Нет ID поста @PostBot — аккаунт исключён'
                     )
                 return
-            if not post_text and not selected_postbot_id:
+            if mode != 'forward' and not post_text and not selected_postbot_id:
                 account_stopped = True
                 if bot and not notifications_hidden:
                     await self._safe_bot_message(
@@ -3256,7 +3272,17 @@ class AccountSessionManager:
                     if entities_to_send and text_to_send != post_text:
                         entities_to_send = None
 
-                    if selected_postbot_id:
+                    if mode == 'forward':
+                        await self.tg_call(
+                            lambda: client.forward_messages(
+                                peer, forward_source, int(forward_message_id)
+                            ),
+                            account_id=account_id, bot=bot, user_id=user_id,
+                            description=f'forward -> {peer}',
+                            notify=not notifications_hidden,
+                            raise_on_skip=True,
+                        )
+                    elif selected_postbot_id:
                         await self.send_via_postbot(
                             client, peer, selected_postbot_id, account_id,
                             bot=bot, user_id=user_id,
