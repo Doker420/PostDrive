@@ -24,6 +24,9 @@ assert 'blacklist_menu' in H
 assert 'save_spam_draft' in H
 assert 'spam_preview' in H
 assert 'operation_history' in H
+assert 'CampaignStates' in H
+assert 'campaign_repeat_' in H
+assert 'campaign_delete_confirm_' in H
 assert 'backup_create' in H
 assert 'SESSION_ENCRYPTION_KEY' in S
 assert '_protect_session(session_string)' in S
@@ -49,6 +52,22 @@ try:
 
     draft_id = db.create_campaign_draft(123, 'Morning', settings={'spam_speed': 'slow'})
     assert db.get_campaign_draft(draft_id, 123)['settings']['spam_speed'] == 'slow'
+
+    campaign_id = db.create_campaign(123, 'Morning send', 'spam', can_repeat=True)
+    campaign = db.get_campaign(campaign_id, 123)
+    assert campaign['name'] == 'Morning send'
+    assert campaign['status'] == 'selecting' and campaign['can_repeat'] is True
+    db.update_campaign(campaign_id, 123, settings={'targets': ['@example']})
+    report_id = db.create_operation_report(123, 'spam', title='Рассылка',
+                                           total=1, campaign_id=campaign_id)
+    db.start_campaign(campaign_id, 123, report_id=report_id)
+    assert db.get_campaign(campaign_id, 123)['status'] == 'running'
+    db.finish_operation_report(report_id, 'finished')
+    assert db.get_campaign(campaign_id, 123)['status'] == 'completed'
+    assert db.get_operation_report(report_id, 123)['campaign_id'] == campaign_id
+    assert db.delete_campaign(campaign_id, 123) is True
+    assert db.get_campaign(campaign_id, 123) is None
+
     audit_id = db.write_audit(123, 'test', 'draft', draft_id, {'ok': True})
     assert audit_id
 

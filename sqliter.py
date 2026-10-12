@@ -826,6 +826,7 @@ class DBConnection(metaclass=_PoolBoundMeta):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             account_id INTEGER DEFAULT 0,
+            campaign_id INTEGER DEFAULT 0,
             operation_type TEXT NOT NULL,
             title TEXT DEFAULT '',
             status TEXT DEFAULT 'running',
@@ -949,6 +950,28 @@ class DBConnection(metaclass=_PoolBoundMeta):
             FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE,
             UNIQUE(user_id, target)
         )''')
+
+        # Named campaigns are the durable user-facing container around one or
+        # more operation reports. Settings are JSON parameters only; credentials
+        # and session material are deliberately never stored here.
+        c.execute('''CREATE TABLE IF NOT EXISTS campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            operation_type TEXT NOT NULL,
+            status TEXT DEFAULT 'selecting',
+            can_repeat INTEGER DEFAULT 1,
+            current_report_id INTEGER DEFAULT 0,
+            run_count INTEGER DEFAULT 0,
+            settings_json TEXT DEFAULT '{}',
+            last_error TEXT DEFAULT '',
+            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+            started_at INTEGER DEFAULT 0,
+            finished_at INTEGER DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+        )''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_campaigns_user ON campaigns(user_id, updated_at)')
 
         # Reusable campaign drafts contain only campaign parameters, never
         # session strings, API hashes or other credentials.
@@ -1085,6 +1108,8 @@ class DBConnection(metaclass=_PoolBoundMeta):
         self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN privacy_count INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN already_member_count INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN account_error_count INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'ALTER TABLE operation_reports ADD COLUMN campaign_id INTEGER DEFAULT 0')
+        self._safe_ddl(c, 'CREATE INDEX IF NOT EXISTS idx_operation_reports_campaign ON operation_reports(campaign_id, started_at)')
         self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN user_id_val INTEGER DEFAULT 0')
         self._safe_ddl(c, 'ALTER TABLE parsed_users ADD COLUMN source_chat_id TEXT DEFAULT \'\'')
         for _ddl in (
@@ -2457,12 +2482,12 @@ class DBConnection(metaclass=_PoolBoundMeta):
     # ==================== LONG-RUNNING OPERATION REPORTS ====================
     def create_operation_report(self, user_id: int, operation_type: str,
                                 title: str = '', total: int = 0,
-                                account_id: int = 0) -> int:
+                                account_id: int = 0, campaign_id: int = 0) -> int:
         self.c.execute(
             'INSERT INTO operation_reports '
-            '(user_id, account_id, operation_type, title, status, total, started_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (user_id, account_id or 0, operation_type, title[:200],
+            '(user_id, account_id, campaign_id, operation_type, title, status, total, started_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (user_id, account_id or 0, campaign_id or 0, operation_type, title[:200],
              'running', max(0, int(total or 0)), int(time.time()))
         )
         self.conn_ctx.commit()
@@ -2517,6 +2542,35 @@ class DBConnection(metaclass=_PoolBoundMeta):
             'UPDATE operation_reports SET status = ?, finished_at = ? WHERE id = ?',
             (status, int(time.time()), int(report_id))
         )
+        self.c.execute('SELECT campaign_id FROM operation_reports WHERE id = ?', (int(report_id),))
+        row = self.c.fetchone()
+        campaign_id = int(row[0] or 0) if row else 0
+        if campaign_id:
+            self.c.execute(
+                "SELECT COUNT(*) FROM operation_reports WHERE campaign_id = ? AND status = 'running'",
+                (campaign_id,)
+            )
+            running_reports = int(self.c.fetchone()[0] or 0)
+            if running_reports:
+                campaign_status = 'running'
+                campaign_error = ''
+            else:
+                self.c.execute(
+                    'SELECT COUNT(*) FROM operation_reports WHERE campaign_id = ? '
+                    "AND (status IN ('failed', 'interrupted', 'stopped') "
+                    'OR error_count > 0 OR account_error_count > 0)',
+                    (campaign_id,)
+                )
+                problem_reports = int(self.c.fetchone()[0] or 0)
+                campaign_status = 'problem' if problem_reports else 'completed'
+                campaign_error = status if campaign_status == 'problem' else ''
+            self.c.execute(
+                'UPDATE campaigns SET status = ?, last_error = ?, '
+                "finished_at = CASE WHEN ? = 'running' THEN finished_at ELSE ? END, "
+                'updated_at = ? WHERE id = ?',
+                (campaign_status, campaign_error, campaign_status,
+                 int(time.time()), int(time.time()), campaign_id)
+            )
         self.conn_ctx.commit()
 
     def add_operation_report_item(self, report_id: int, account_id: int = 0,
@@ -3061,6 +3115,138 @@ class DBConnection(metaclass=_PoolBoundMeta):
         if changed:
             self.conn_ctx.commit()
         return changed
+
+    # ==================== NAMED CAMPAIGNS ====================
+    def create_campaign(self, user_id: int, name: str,
+                        operation_type: str = 'spam', settings: dict = None,
+                        can_repeat: bool = True) -> int:
+        now = int(time.time())
+        payload = json.dumps(settings or {}, ensure_ascii=False, separators=(',', ':'))
+        self.c.execute(
+            'INSERT INTO campaigns '
+            '(user_id, name, operation_type, status, can_repeat, settings_json, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (int(user_id), str(name or 'Без названия').strip()[:120],
+             str(operation_type or 'spam')[:40], 'selecting', int(bool(can_repeat)),
+             payload, now, now)
+        )
+        self.conn_ctx.commit()
+        return int(self.c.lastrowid)
+
+    def _campaign_row(self, row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not row:
+            return row
+        try:
+            row['settings'] = json.loads(row.get('settings_json') or '{}')
+        except (TypeError, ValueError):
+            row['settings'] = {}
+        row['can_repeat'] = bool(row.get('can_repeat'))
+        return row
+
+    def get_campaign(self, campaign_id: int, user_id: int = None) -> Optional[Dict[str, Any]]:
+        query = 'SELECT * FROM campaigns WHERE id = ?'
+        params = [int(campaign_id)]
+        if user_id is not None:
+            query += ' AND user_id = ?'
+            params.append(int(user_id))
+        self.c.execute(query, tuple(params))
+        return self._campaign_row(self._dict_fetchone())
+
+    def get_user_campaigns(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        self.c.execute(
+            'SELECT * FROM campaigns WHERE user_id = ? '
+            'ORDER BY CASE status WHEN \'running\' THEN 0 WHEN \'problem\' THEN 1 '
+            'WHEN \'selecting\' THEN 2 ELSE 3 END, updated_at DESC LIMIT ?',
+            (int(user_id), max(1, min(int(limit), 200)))
+        )
+        return [self._campaign_row(row) for row in self._dict_fetchall()]
+
+    def update_campaign(self, campaign_id: int, user_id: int,
+                        name: str = None, status: str = None,
+                        settings: dict = None, last_error: str = None,
+                        current_report_id: int = None) -> bool:
+        fields, values = [], []
+        if name is not None:
+            fields.append('name = ?')
+            values.append(str(name).strip()[:120])
+        if status is not None:
+            allowed = {'selecting', 'running', 'completed', 'problem'}
+            fields.append('status = ?')
+            values.append(str(status) if status in allowed else 'problem')
+        if settings is not None:
+            fields.append('settings_json = ?')
+            values.append(json.dumps(settings, ensure_ascii=False, separators=(',', ':')))
+        if last_error is not None:
+            fields.append('last_error = ?')
+            values.append(str(last_error)[:500])
+        if current_report_id is not None:
+            fields.append('current_report_id = ?')
+            values.append(int(current_report_id or 0))
+        if not fields:
+            return False
+        fields.append('updated_at = ?')
+        values.append(int(time.time()))
+        values.extend((int(campaign_id), int(user_id)))
+        self.c.execute(
+            'UPDATE campaigns SET ' + ', '.join(fields) +
+            ' WHERE id = ? AND user_id = ?', tuple(values)
+        )
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def start_campaign(self, campaign_id: int, user_id: int,
+                       report_id: int = 0, settings: dict = None) -> bool:
+        fields = ['status = ?', 'current_report_id = ?', 'run_count = run_count + 1',
+                  'started_at = ?', 'updated_at = ?', 'last_error = ?']
+        values = ['running', int(report_id or 0), int(time.time()), int(time.time()), '']
+        if settings is not None:
+            fields.insert(3, 'settings_json = ?')
+            values.insert(3, json.dumps(settings, ensure_ascii=False, separators=(',', ':')))
+        values.extend((int(campaign_id), int(user_id)))
+        self.c.execute('UPDATE campaigns SET ' + ', '.join(fields) +
+                       ' WHERE id = ? AND user_id = ?', tuple(values))
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def finish_campaign(self, campaign_id: int, status: str = 'completed',
+                        error: str = '') -> bool:
+        status = status if status in {'completed', 'problem'} else 'problem'
+        self.c.execute(
+            'UPDATE campaigns SET status = ?, last_error = ?, finished_at = ?, updated_at = ? '
+            'WHERE id = ?',
+            (status, str(error or '')[:500], int(time.time()), int(time.time()), int(campaign_id))
+        )
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def delete_campaign(self, campaign_id: int, user_id: int) -> bool:
+        row = self.get_campaign(campaign_id, user_id)
+        if not row or row.get('status') == 'running':
+            return False
+        self.c.execute('DELETE FROM campaigns WHERE id = ? AND user_id = ?',
+                       (int(campaign_id), int(user_id)))
+        changed = bool(self.c.rowcount)
+        self.conn_ctx.commit()
+        return changed
+
+    def list_campaigns(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.get_user_campaigns(user_id, limit=limit)
+
+    def set_campaign_status(self, campaign_id: int, user_id: int,
+                            status: str, error: str = '') -> bool:
+        if status == 'running':
+            return self.start_campaign(campaign_id, user_id)
+        if status in {'completed', 'problem'}:
+            campaign = self.get_campaign(campaign_id, user_id)
+            return bool(campaign) and self.finish_campaign(campaign_id, status, error)
+        return self.update_campaign(campaign_id, user_id, status=status,
+                                    last_error=error)
+
+    def remove_campaign(self, campaign_id: int, user_id: int) -> bool:
+        return self.delete_campaign(campaign_id, user_id)
 
     # ==================== CAMPAIGN DRAFTS ====================
     def create_campaign_draft(self, user_id: int, name: str,

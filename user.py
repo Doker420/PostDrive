@@ -3096,11 +3096,13 @@ class AccountSessionManager:
 
     async def _open_operation_report(self, user_id: int, operation_type: str,
                                      title: str, total: int = 0,
-                                     account_id: int = 0, bot=None) -> int:
+                                     account_id: int = 0, bot=None, campaign_id: int = 0) -> int:
         report_id = db.create_operation_report(
             user_id, operation_type, title=title, total=total,
-            account_id=account_id
+            account_id=account_id, campaign_id=campaign_id
         )
+        if campaign_id:
+            db.start_campaign(campaign_id, user_id, report_id=report_id)
         self.active_operation_reports[report_id] = {
             'user_id': user_id, 'bot': bot or self._bot,
             'operation_type': operation_type, 'account_id': account_id,
@@ -3216,7 +3218,7 @@ class AccountSessionManager:
                              custom_entities: str = None, delay_min: int = 30,
                              delay_max: int = 90, postbot_id: str = '',
                              forward_chat_id: str = '', forward_message_id: int = 0,
-                             delete_after_send: bool = False):
+                             delete_after_send: bool = False, campaign_id: int = 0):
         """Run a multi-account mailing with one status bar and a shared queue.
 
         An account that receives FloodWait/PeerFlood leaves the queue. Other
@@ -3257,7 +3259,8 @@ class AccountSessionManager:
             return 0, f'Превышен лимит одновременных задач ({self.MAX_TASKS_PER_USER})'
 
         report_id = await self._open_operation_report(
-            user_id, 'spam', 'Рассылка', total=len(targets), bot=bot
+            user_id, 'spam', 'Рассылка', total=len(targets), bot=bot,
+            campaign_id=campaign_id
         )
         if (db.get_operation_report(report_id) or {}).get('status') != 'running':
             await self._release_user_quota(user_id)
@@ -3589,7 +3592,8 @@ class AccountSessionManager:
         await self._release_user_quota(int(job.get('user_id') or 0))
 
     async def start_invite_job(self, account_ids: list, chat_id: str, users: list,
-                               bot, user_id: int, auto_join: bool = True):
+                               bot, user_id: int, auto_join: bool = True,
+                               campaign_id: int = 0):
         """Запускает инвайтинг с общей очередью и одним отчётом/status bar."""
         account_ids = list(dict.fromkeys(int(account_id) for account_id in account_ids if account_id))
         account_ids = [account_id for account_id in account_ids
@@ -3607,7 +3611,8 @@ class AccountSessionManager:
         for target in users:
             work_queue.put_nowait(target)
         report_id = await self._open_operation_report(
-            user_id, 'invite', 'Инвайтинг', total=len(users), bot=bot
+            user_id, 'invite', 'Инвайтинг', total=len(users), bot=bot,
+            campaign_id=campaign_id
         )
         # A user may press Stop immediately after the status message arrives.
         # Do not create workers if that callback already closed the report.
@@ -3673,7 +3678,8 @@ class AccountSessionManager:
                 await self._finish_operation_report(report_id, status)
             self.active_invite_jobs.pop(report_id, None)
 
-    async def start_neurocomment(self, account_id: int, bot, user_id: int):
+    async def start_neurocomment(self, account_id: int, bot, user_id: int,
+                                 campaign_id: int = 0):
         logging.info(f"🟢 start_neurocomment called for account {account_id}")
         if account_id in self.active_comment_tasks:
             logging.warning(f"⚠️ Neurocomment already running for account {account_id}")
@@ -3722,7 +3728,8 @@ class AccountSessionManager:
         task_id = db.register_task(user_id, account_id, 'neurocomment', 'starting')
         report_id = await self._open_operation_report(
             user_id, 'neurocomment', 'Нейрокомментинг',
-            total=len(channels), account_id=account_id, bot=bot
+            total=len(channels), account_id=account_id, bot=bot,
+            campaign_id=campaign_id
         )
         self.active_comment_report_ids[account_id] = report_id
         self.active_comment_task_ids[account_id] = task_id

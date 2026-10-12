@@ -239,6 +239,9 @@ class BlacklistStates(StatesGroup):
 class CampaignDraftStates(StatesGroup):
     WAITING_NAME = State()
 
+class CampaignStates(StatesGroup):
+    WAITING_NAME = State()
+
 class AccountPostStates(StatesGroup):
     WAITING_TEXT = State()
     WAITING_PHOTO = State()
@@ -1335,11 +1338,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             )],
             [InlineKeyboardButton(text="📮 Через @PostBot", callback_data="spam_postbot_mode")],
             [InlineKeyboardButton(text="📇 По контактам аккаунтов", callback_data="spam_targets_contacts")],
-            [InlineKeyboardButton(text="👁 Предпросмотр кампании", callback_data="spam_preview")],
             [InlineKeyboardButton(text="💾 Сохранить черновик", callback_data="save_spam_draft")],
             [InlineKeyboardButton(text="🔄 Обновить выбор", callback_data="refresh_mass_spam")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")]
         ]
+        if data.get('campaign_repeat') and data.get('targets'):
+            buttons.insert(4, [InlineKeyboardButton(
+                text=f"🔁 Запустить прежние цели ({len(data.get('targets') or [])})",
+                callback_data="campaign_repeat_launch"
+            )])
+        buttons.insert(4, [InlineKeyboardButton(text="👁 Предпросмотр кампании", callback_data="spam_preview")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await state.set_state(MassActionStates.WAITING_TARGETS)
         if isinstance(message_or_callback, Message):
@@ -1546,7 +1554,26 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
 
         if action == 'spam':
+            campaign_id = int(data.get('campaign_id') or 0)
+            repeat = bool(data.get('campaign_repeat'))
             await state.clear()
+            if repeat and data.get('spam_mode') and data.get('targets'):
+                # A repeat keeps the saved operation parameters and target list;
+                # only the accounts are chosen again by the user.
+                repeat_data = {
+                    key: data.get(key) for key in (
+                        'spam_mode', 'spam_speed', 'custom_spam_text',
+                        'custom_spam_entities', 'spam_postbot_id',
+                        'spam_forward_chat', 'spam_forward_message_id',
+                        'delete_after_send', 'targets'
+                    ) if data.get(key) is not None
+                }
+                repeat_data.update(campaign_id=campaign_id,
+                                   campaign_repeat=True,
+                                   spam_account_ids=selected)
+                await state.update_data(**repeat_data)
+                await ask_for_spam_targets(callback, state)
+                return
             text = (
                 f"🚀 <b>Рассылка</b>\n\n"
                 f"Выбрано аккаунтов: {len(selected)}\n\n"
@@ -1562,14 +1589,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             markup = InlineKeyboardMarkup(inline_keyboard=buttons)
             await state.set_state(MassActionStates.SELECTING_ACCOUNTS)
             await state.update_data(
+                campaign_id=campaign_id,
                 spam_account_ids=selected,
                 delete_after_send=False,
             )
             await edit_message(callback, text, markup)
         elif action == 'invite':
+            campaign_id = int(data.get('campaign_id') or 0)
             await state.clear()
             await state.set_state(InviteStates.SELECTING_CHAT)
             await state.update_data(
+                campaign_id=campaign_id,
                 invite_account_ids=selected,
                 invite_chat_page=0,
                 invite_auto_join=True,
@@ -1586,7 +1616,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 reply_markup=cancel_inline_keyboard(),
             )
         elif action == 'join_link':
-            await state.update_data(mass_join_account_ids=selected)
+            await state.update_data(campaign_id=int(data.get('campaign_id') or 0),
+                                    mass_join_account_ids=selected)
             await state.set_state(MassActionStates.WAITING_JOIN_LINKS)
             await edit_message(
                 callback,
@@ -1597,6 +1628,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 reply_markup=cancel_inline_keyboard(),
             )
         elif action == 'spambot':
+            campaign_id = int(data.get('campaign_id') or 0)
             await state.clear()
             await edit_message(
                 callback,
@@ -1604,6 +1636,14 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                 f"Проверяю аккаунты: {len(selected)}. Это может занять несколько минут..."
             )
             results = await _run_mass_spambot_check(selected, callback.from_user.id)
+            if campaign_id:
+                all_ok = bool(results) and all(item.get('ok') for item in results)
+                db.update_campaign(
+                    campaign_id, callback.from_user.id,
+                    status='completed' if all_ok else 'problem',
+                    last_error='' if all_ok else 'У одного или нескольких аккаунтов обнаружена проблема',
+                    settings={'account_ids': selected, 'results': results},
+                )
             await edit_message(
                 callback,
                 _format_mass_spambot_result(results),
@@ -1742,6 +1782,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def process_mass_join_links(message: Message, state: FSMContext):
         data = await state.get_data()
         requested_ids = data.get('mass_join_account_ids') or []
+        campaign_id = int(data.get('campaign_id') or 0)
         links = []
         if message.document:
             try:
@@ -1776,6 +1817,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             asyncio.create_task(account_manager.run_limited(
                 account_manager.join_chats_batch(account_id, links, bot, user_id)
             ))
+        if campaign_id:
+            db.update_campaign(
+                campaign_id, user_id, status='completed',
+                settings={'links': links, 'account_ids': account_ids},
+            )
         await message.answer(
             f"🚀 Вступление запущено на {len(account_ids)} аккаунтах.\n"
             f"Ссылок в очереди: {len(links)}.",
@@ -1901,10 +1947,24 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         # Общая очередь и status bar создаются внутри менеджера. Каждый
         # свободный аккаунт атомарно забирает следующую цель; в статусном
         # сообщении доступны остановка и отчёт с выгрузкой CSV.
+        campaign_id = int(data.get('campaign_id') or 0)
+        if campaign_id:
+            db.update_campaign(
+                campaign_id, user_id,
+                settings={
+                    'invite_chat_id': chat_id,
+                    'invite_targets': unique_users,
+                    'invite_auto_join': bool(data.get('invite_auto_join', True)),
+                    'account_ids': valid_account_ids,
+                },
+            )
         report_id = await account_manager.start_invite_job(
             valid_account_ids, chat_id, unique_users, bot, user_id,
-            auto_join=bool(data.get('invite_auto_join', True))
+            auto_join=bool(data.get('invite_auto_join', True)),
+            campaign_id=campaign_id,
         )
+        if campaign_id and not report_id:
+            db.finish_campaign(campaign_id, 'problem', 'Не удалось запустить инвайтинг')
 
         await state.clear()
         await message.answer(
@@ -2007,6 +2067,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             await answer_to.answer("❌ Не выбрано ни одного аккаунта.")
             return
 
+        campaign_id = int(data.get('campaign_id') or 0)
+        if campaign_id:
+            db.update_campaign(
+                campaign_id, user_id,
+                settings={
+                    'spam_mode': mode, 'spam_speed': speed,
+                    'custom_spam_text': custom_text,
+                    'custom_spam_entities': custom_entities,
+                    'spam_postbot_id': postbot_id,
+                    'spam_forward_chat': forward_chat,
+                    'spam_forward_message_id': forward_message_id,
+                    'delete_after_send': delete_after_send,
+                    'targets': parsed_targets,
+                },
+            )
+
         report_id, start_error = await account_manager.start_spam_job(
             account_ids, parsed_targets, bot, user_id,
             mode=mode, custom_text=custom_text,
@@ -2016,8 +2092,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             forward_chat_id=forward_chat,
             forward_message_id=forward_message_id,
             delete_after_send=delete_after_send,
+            campaign_id=campaign_id,
         )
         if start_error:
+            if campaign_id:
+                db.finish_campaign(campaign_id, 'problem', start_error)
             await answer_to.answer(f"❌ Не удалось запустить рассылку: {start_error}")
             return
 
@@ -2025,6 +2104,11 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             f"✅ Рассылка запущена в фоне: задача #{report_id}.\n"
             "Прогресс, остановка, отчёт и скачивание остатка доступны в статусном сообщении.",
             reply_markup=main_menu_keyboard(user_id))
+
+    # The repeat callback is registered above this helper, but handlers are
+    # invoked only after registration completes. Keep a closure alias so the
+    # callback uses the same launch path without duplicating any logic.
+    launch_campaign_spam = _start_spam_distribution
 
     @dp.callback_query(F.data == "spam_mode_forward", MassActionStates.SELECTING_ACCOUNTS)
     async def spam_mode_forward_callback(callback: CallbackQuery, state: FSMContext):
@@ -3207,6 +3291,66 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
 
         await render_accounts_screen(message, user_id, page=0)
 
+    async def render_campaigns_menu(target, user_id: int, page: int = 0):
+        """Render durable named campaigns before exposing operation setup."""
+        campaigns = db.get_user_campaigns(user_id, limit=200)
+        per_page = 10
+        total_pages = max(1, (len(campaigns) + per_page - 1) // per_page)
+        page = max(0, min(int(page or 0), total_pages - 1))
+        visible = campaigns[page * per_page:(page + 1) * per_page]
+        status_labels = {
+            'selecting': '🟡 настройка',
+            'running': '🔵 ⏳ выполняется',
+            'completed': '🟢 завершена',
+            'problem': '🔴 проблема',
+        }
+        operation_labels = {
+            'spam': 'рассылка', 'invite': 'инвайтинг',
+            'join_link': 'вступление', 'spambot': 'спамблок',
+            'neuro': 'нейрокомментинг',
+        }
+        lines = [
+            '📣 <b>Кампании</b>',
+            'Сначала создайте кампанию и задайте имя — затем выберите аккаунты и параметры.',
+            '',
+        ]
+        buttons = []
+        for campaign in visible:
+            status = campaign.get('status') or 'problem'
+            label = status_labels.get(status, '🔴 проблема')
+            name = str(campaign.get('name') or 'Без названия').replace('\n', ' ')[:34]
+            operation = operation_labels.get(campaign.get('operation_type'), campaign.get('operation_type') or '')
+            lines.append(f"{label} <b>{html_escape(name)}</b> · {html_escape(operation)}")
+            # Telegram inline keyboards do not expose reliable background colors
+            # on all clients, so the status color is explicit in the button label.
+            buttons.append([InlineKeyboardButton(
+                text=f"{label} {name[:28]}",
+                callback_data=f"campaign_open_{campaign['id']}"
+            )])
+        if not campaigns:
+            lines.append('Созданных кампаний пока нет.')
+        if total_pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'campaign_page_{page - 1}'))
+            nav.append(InlineKeyboardButton(text=f'{page + 1}/{total_pages}', callback_data='noop'))
+            if page < total_pages - 1:
+                nav.append(InlineKeyboardButton(text='➡️', callback_data=f'campaign_page_{page + 1}'))
+            buttons.append(nav)
+        buttons.extend([
+            [InlineKeyboardButton(text='➕ Новая кампания', callback_data='campaign_new')],
+            [InlineKeyboardButton(text='📐 Черновики кампаний', callback_data='campaign_drafts')],
+            [InlineKeyboardButton(text='📜 История операций', callback_data='operation_history')],
+            [InlineKeyboardButton(text='🚫 Blacklist / отписки', callback_data='blacklist_menu')],
+            [InlineKeyboardButton(text='◀️ Главная', callback_data='back_to_main')],
+        ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+        text = '\n'.join(lines)
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=markup)
+        else:
+            await edit_message(target, text, markup)
+
     @dp.message(F.text == '📣 Кампании')
     async def campaigns_menu_handler(message: Message, state: FSMContext):
         await state.clear()
@@ -3214,19 +3358,22 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not db.is_user_subscribed(user_id, ADMIN):
             await message.answer("🔒 Для использования кампаний требуется активная подписка.")
             return
-        await message.answer(
-            "📣 <b>Кампании</b>\n\nВыберите действие и аккаунты для него:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📨 Рассылка", callback_data="campaign_spam"),
-                 InlineKeyboardButton(text="📥 Инвайтинг", callback_data="campaign_invite")],
-                [InlineKeyboardButton(text="➕ Вступление по ссылке", callback_data="campaign_join"),
-                 InlineKeyboardButton(text="🛡 Спамблок", callback_data="campaign_spambot")],
-                [InlineKeyboardButton(text="🧠 Нейрокомментинг", callback_data="campaign_neuro")],
-                [InlineKeyboardButton(text="📱 Аккаунты и автопостинг", callback_data="campaign_accounts")],
-                [InlineKeyboardButton(text="📐 Черновики кампаний", callback_data="campaign_drafts")],
-                [InlineKeyboardButton(text="📜 История операций", callback_data="operation_history")],
-                [InlineKeyboardButton(text="🚫 Blacklist / отписки", callback_data="blacklist_menu")],
-                [InlineKeyboardButton(text="◀️ Главная", callback_data="back_to_main")],
+        await render_campaigns_menu(message, user_id)
+
+    @dp.callback_query(F.data == 'campaign_new')
+    async def campaign_new_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        await edit_message(
+            callback,
+            '➕ <b>Новая кампания</b>\n\nВыберите тип операции:',
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='📨 Рассылка', callback_data='campaign_spam'),
+                 InlineKeyboardButton(text='📥 Инвайтинг', callback_data='campaign_invite')],
+                [InlineKeyboardButton(text='➕ Вступление по ссылке', callback_data='campaign_join'),
+                 InlineKeyboardButton(text='🛡 Спамблок', callback_data='campaign_spambot')],
+                [InlineKeyboardButton(text='🧠 Нейрокомментинг', callback_data='campaign_neuro')],
+                [InlineKeyboardButton(text='◀️ Назад', callback_data='campaigns_from_history')],
             ])
         )
 
@@ -3242,20 +3389,144 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             'campaign_invite': 'invite',
             'campaign_join': 'join_link',
             'campaign_spambot': 'spambot',
+            'campaign_neuro': 'neuro',
         }.get(callback.data)
         user_id = callback.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
             await _answer_callback(callback, "🔒 Требуется активная подписка!", show_alert=True)
             return
-        await state.clear()
         if callback.data == 'campaign_accounts':
+            await state.clear()
             await render_accounts_screen(callback, user_id, page=0)
-        elif callback.data == 'campaign_neuro':
-            await neurocomment_menu_handler(callback.message, state, user_id=user_id)
         elif callback.data == 'campaign_drafts':
+            await state.clear()
             await render_campaign_drafts(callback, user_id)
         else:
-            await show_account_selection(callback, action, state, page=0)
+            await state.clear()
+            await state.update_data(new_campaign_action=action)
+            await state.set_state(CampaignStates.WAITING_NAME)
+            await edit_message(
+                callback,
+                f"📝 <b>Новая кампания: {html_escape(action or '')}</b>\n\n"
+                "Введите имя кампании. Оно будет отображаться в списке и отчётах:",
+                cancel_inline_keyboard()
+            )
+
+    @dp.message(CampaignStates.WAITING_NAME)
+    async def campaign_name_message(message: Message, state: FSMContext):
+        name = ' '.join((message.text or '').split())[:120]
+        if not name:
+            await message.answer('❌ Имя кампании не должно быть пустым.')
+            return
+        data = await state.get_data()
+        action = data.get('new_campaign_action') or 'spam'
+        campaign_id = db.create_campaign(
+            message.from_user.id, name, action,
+            can_repeat=(action == 'spam')
+        )
+        db.write_audit(message.from_user.id, 'campaign_created', 'campaign', campaign_id,
+                       {'name': name, 'operation_type': action})
+        await state.clear()
+        await state.update_data(campaign_id=campaign_id, action_type=action)
+        await message.answer(f"✅ Кампания «{html_escape(name)}» создана. Теперь выберите аккаунты.")
+        if action == 'neuro':
+            # The neurocommenting menu is itself the account picker. The named
+            # campaign remains in selecting state until a worker is started.
+            await neurocomment_menu_handler(message, state, user_id=message.from_user.id)
+        else:
+            await show_account_selection(message, action, state, page=0)
+
+    @dp.callback_query(F.data.startswith('campaign_page_'))
+    async def campaign_page_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        await render_campaigns_menu(callback, callback.from_user.id,
+                                     int(callback.data.rsplit('_', 1)[1]))
+
+    @dp.callback_query(F.data.startswith('campaign_open_'))
+    async def campaign_open_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        campaign_id = int(callback.data.rsplit('_', 1)[1])
+        campaign = db.get_campaign(campaign_id, callback.from_user.id)
+        if not campaign:
+            await _answer_callback(callback, 'Кампания не найдена', show_alert=True)
+            return
+        labels = {'selecting': '🟡 настройка', 'running': '🔵 ⏳ выполняется',
+                  'completed': '🟢 завершена', 'problem': '🔴 проблема'}
+        operation = html_escape(campaign.get('operation_type') or '')
+        text = (
+            f"📣 <b>{html_escape(campaign.get('name') or '')}</b>\n\n"
+            f"Тип: {operation}\n"
+            f"Статус: <b>{labels.get(campaign.get('status'), '🔴 проблема')}</b>\n"
+            f"Запусков: {int(campaign.get('run_count') or 0)}\n"
+        )
+        if campaign.get('last_error'):
+            text += f"Причина: {html_escape(campaign['last_error'][:300])}\n"
+        buttons = []
+        report_id = int(campaign.get('current_report_id') or 0)
+        if report_id:
+            buttons.append([InlineKeyboardButton(text='📊 Открыть отчёт', callback_data=f'operation_view_{report_id}')])
+        if campaign.get('status') != 'running' and campaign.get('can_repeat') and campaign.get('operation_type') == 'spam':
+            buttons.append([InlineKeyboardButton(text='🔁 Повторить с выбором аккаунтов', callback_data=f'campaign_repeat_{campaign_id}')])
+        if campaign.get('status') != 'running':
+            buttons.append([InlineKeyboardButton(text='🗑 Удалить кампанию', callback_data=f'campaign_delete_{campaign_id}')])
+        buttons.append([InlineKeyboardButton(text='◀️ К списку кампаний', callback_data='campaigns_from_history')])
+        await edit_message(callback, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+    @dp.callback_query(F.data.startswith('campaign_repeat_') & (F.data != 'campaign_repeat_launch'))
+    async def campaign_repeat_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        campaign_id = int(callback.data.rsplit('_', 1)[1])
+        campaign = db.get_campaign(campaign_id, callback.from_user.id)
+        if not campaign or not campaign.get('can_repeat') or campaign.get('operation_type') != 'spam':
+            await _answer_callback(callback, 'Повторный запуск недоступен', show_alert=True)
+            return
+        if campaign.get('status') == 'running':
+            await _answer_callback(callback, 'Кампания уже выполняется', show_alert=True)
+            return
+        await state.clear()
+        settings = campaign.get('settings') or {}
+        await state.update_data(campaign_id=campaign_id, action_type='spam',
+                                campaign_repeat=True, spam_account_ids=[],
+                                **settings)
+        await show_account_selection(callback, 'spam', state, page=0)
+
+    @dp.callback_query(F.data == 'campaign_repeat_launch', MassActionStates.WAITING_TARGETS)
+    async def campaign_repeat_launch_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        data = await state.get_data()
+        targets = list(data.get('targets') or [])
+        if not targets or not data.get('spam_account_ids'):
+            await _answer_callback(callback, 'Нет сохранённых целей или аккаунтов', show_alert=True)
+            return
+        await launch_campaign_spam(callback.message, state, callback.from_user.id, targets, data)
+
+    @dp.callback_query(F.data.startswith('campaign_delete_') & ~F.data.startswith('campaign_delete_confirm_'))
+    async def campaign_delete_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        campaign_id = int(callback.data.rsplit('_', 1)[1])
+        campaign = db.get_campaign(campaign_id, callback.from_user.id)
+        if not campaign:
+            await _answer_callback(callback, 'Кампания не найдена', show_alert=True)
+            return
+        if campaign.get('status') == 'running':
+            await _answer_callback(callback, 'Сначала остановите работающую кампанию', show_alert=True)
+            return
+        await edit_message(callback,
+            f"❓ Удалить кампанию «{html_escape(campaign.get('name') or '')}»? Отчёты останутся в истории.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='🗑 Да, удалить', callback_data=f'campaign_delete_confirm_{campaign_id}')],
+                [InlineKeyboardButton(text='❌ Отмена', callback_data=f'campaign_open_{campaign_id}')],
+            ]))
+
+    @dp.callback_query(F.data.startswith('campaign_delete_confirm_'))
+    async def campaign_delete_confirm_callback(callback: CallbackQuery):
+        await _answer_callback(callback)
+        campaign_id = int(callback.data.rsplit('_', 1)[1])
+        if not db.delete_campaign(campaign_id, callback.from_user.id):
+            await _answer_callback(callback, 'Кампанию нельзя удалить во время выполнения', show_alert=True)
+            return
+        db.write_audit(callback.from_user.id, 'campaign_deleted', 'campaign', campaign_id, {})
+        await render_campaigns_menu(callback, callback.from_user.id)
 
     @dp.callback_query(F.data == "add_account_start")
     async def add_account_start_callback(callback: CallbackQuery, state: FSMContext):
@@ -4286,9 +4557,12 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         for report in visible:
             icon = labels.get(report.get('status'), '❔')
             title = html_escape(report.get('title') or report.get('operation_type') or '')
+            campaign_id = int(report.get('campaign_id') or 0)
+            campaign = db.get_campaign(campaign_id, user_id) if campaign_id else None
+            campaign_suffix = f" · 📣 {html_escape(campaign.get('name')[:20])}" if campaign else ''
             lines.append(
                 f"{icon} #{report['id']} {title} · {report.get('success_count', 0)}/{report.get('total', 0)} · "
-                f"{_format_time(report.get('started_at'))}"
+                f"{_format_time(report.get('started_at'))}{campaign_suffix}"
             )
             buttons.append([InlineKeyboardButton(
                 text=f"#{report['id']} · {(report.get('title') or report.get('operation_type') or '')[:24]}",
@@ -4382,6 +4656,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             lines.append('Черновиков пока нет.')
         buttons.extend([
             [InlineKeyboardButton(text='➕ Новый черновик', callback_data='draft_new')],
+            [InlineKeyboardButton(text='📣 К кампаниям', callback_data='campaigns_from_drafts')],
             [InlineKeyboardButton(text='📱 К аккаунтам', callback_data='back_to_accounts')],
         ])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -4395,13 +4670,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
     async def campaigns_from_drafts_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
         await state.clear()
-        await campaigns_menu_handler(callback.message, state)
+        await render_campaigns_menu(callback, callback.from_user.id)
 
     @dp.callback_query(F.data == 'campaigns_from_history')
     async def campaigns_from_history_callback(callback: CallbackQuery, state: FSMContext):
         await _answer_callback(callback)
         await state.clear()
-        await campaigns_menu_handler(callback.message, state)
+        await render_campaigns_menu(callback, callback.from_user.id)
 
     @dp.callback_query(F.data == 'spam_preview', MassActionStates.WAITING_TARGETS)
     async def spam_preview_callback(callback: CallbackQuery, state: FSMContext):
@@ -4486,7 +4761,16 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
             return
         await _answer_callback(callback)
         await state.clear()
-        await state.update_data(**(draft.get('settings') or {}), spam_account_ids=[])
+        settings = draft.get('settings') or {}
+        campaign_id = db.create_campaign(
+            callback.from_user.id, draft.get('name') or 'Кампания из черновика',
+            draft.get('operation_type') or 'spam', settings=settings,
+            can_repeat=(draft.get('operation_type') or 'spam') == 'spam',
+        )
+        db.write_audit(callback.from_user.id, 'campaign_created_from_draft',
+                       'campaign', campaign_id, {'draft_id': draft_id})
+        await state.update_data(campaign_id=campaign_id,
+                                **settings, spam_account_ids=[])
         await edit_message(callback,
             f"📐 Черновик «{html_escape(draft.get('name') or '')}» загружен.\n\n"
             'Теперь выберите аккаунты для запуска.',
@@ -5514,7 +5798,10 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         # из-за чего меню не перерисовывалось и статус визуально не менялся.
         state_data = await state.get_data()
         page = int(state_data.get('neuro_page') or 0)
+        campaign_id = int(state_data.get('campaign_id') or 0)
         await state.clear()
+        if campaign_id:
+            await state.update_data(campaign_id=campaign_id)
         if user_id is None:
             user_id = message.from_user.id
         if not db.is_user_subscribed(user_id, ADMIN):
@@ -5591,6 +5878,7 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         await _answer_callback(callback, "⏳ Запускаю нейрокомментинг...", show_alert=False)
         data = await state.get_data()
         account_ids = [int(account_id) for account_id in data.get('nc_selected_accounts', [])]
+        campaign_id = int(data.get('campaign_id') or 0)
         await state.clear()
         if not account_ids:
             await _answer_callback(callback, "❌ Не выбраны аккаунты.", show_alert=True)
@@ -5606,7 +5894,8 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
                     return name, False, 'Доступ запрещён'
                 try:
                     ok, result = await account_manager.start_neurocomment(
-                        account_id, bot, callback.from_user.id
+                        account_id, bot, callback.from_user.id,
+                        campaign_id=campaign_id
                     )
                     return name, bool(ok), str(result or '')
                 except asyncio.CancelledError:
@@ -6205,11 +6494,17 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         if not nc:
             await _answer_callback(callback, "❌ Сначала настройте режим нейрокомментинга!", show_alert=True)
             return
+        state_data = await state.get_data()
+        campaign_id = int(state_data.get('campaign_id') or 0)
         new_state = 0 if nc.get('enabled') == 1 else 1
         db.update_neurocomment_settings(account_id, enabled=new_state)
         if new_state == 1:
-            ok, msg = await account_manager.start_neurocomment(account_id, bot, callback.from_user.id)
+            ok, msg = await account_manager.start_neurocomment(
+                account_id, bot, callback.from_user.id, campaign_id=campaign_id
+            )
             if not ok:
+                if campaign_id:
+                    db.finish_campaign(campaign_id, 'problem', msg)
                 # Иначе в БД оставался enabled=1: меню показывало 🟢, а воркер не работал
                 db.update_neurocomment_settings(account_id, enabled=0)
                 if 'ограничен' in msg or 'заблокирован' in msg or 'паузе' in msg:
