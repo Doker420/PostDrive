@@ -181,7 +181,10 @@ def test_user_safety_guards_are_present():
     assert "mass_join_link" in handlers
     assert "MassActionStates.WAITING_JOIN_LINKS" in handlers
     assert "mass_spambot_check" in handlers
+    assert "mass_select_all_" in handlers
     assert "_run_mass_spambot_check" in handlers
+    assert "nc_select_all" in handlers
+    assert "nc_start_selected" in handlers
     assert "PAGE_DIGITS" in handlers
     assert "1️⃣" in handlers
     assert "spam_mode_forward" in handlers

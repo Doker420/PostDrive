@@ -1177,6 +1177,13 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
         if page_numbers:
             buttons.append(page_numbers)
+        all_account_ids = [int(account['id']) for account in accounts]
+        selected_ids = {int(account_id) for account_id in selected}
+        all_selected = bool(all_account_ids) and set(all_account_ids).issubset(selected_ids)
+        buttons.append([InlineKeyboardButton(
+            text="☑️ Снять выбор со всех" if all_selected else "☑️ Выбрать все аккаунты",
+            callback_data=f"mass_select_all_{action}"
+        )])
         buttons.append([InlineKeyboardButton(text="✅ Далее", callback_data=f"mass_action_next_{action}")])
         buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1405,6 +1412,21 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         else:
             selected.append(account_id)
         await state.update_data(selected_accounts=selected)
+        await show_account_selection(callback, action, state)
+
+    @dp.callback_query(F.data.startswith('mass_select_all_'))
+    async def mass_select_all_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        action = callback.data[len('mass_select_all_'):]
+        accounts = db.get_user_accounts(callback.from_user.id)
+        all_ids = [int(account['id']) for account in accounts]
+        data = await state.get_data()
+        selected = {int(account_id) for account_id in (data.get('selected_accounts') or [])}
+        if all_ids and set(all_ids).issubset(selected):
+            selected = set()
+        else:
+            selected = set(all_ids)
+        await state.update_data(selected_accounts=list(selected))
         await show_account_selection(callback, action, state)
 
     async def _run_mass_spambot_check(account_ids: list, user_id: int) -> list:
@@ -4826,12 +4848,94 @@ def register_all_handlers(dp: Dispatcher, bot: Bot, config: dict):
         )
         if page_numbers:
             buttons.append(page_numbers)
+        buttons.append([InlineKeyboardButton(
+            text="☑️ Выбрать все аккаунты",
+            callback_data="nc_select_all"
+        )])
         buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons)
         await send_photo(
             message, 'acc.jpg',
-            f"🧠 <b>Нейрокомментинг</b>\n\nВыберите аккаунт:\nСтраница: {page + 1}/{total_pages}",
+            f"🧠 <b>Нейрокомментинг</b>\n\nВыберите аккаунт или все аккаунты:\nСтраница: {page + 1}/{total_pages}",
             markup
+        )
+
+    @dp.callback_query(F.data == 'nc_select_all')
+    async def nc_select_all_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        accounts = db.get_user_accounts(callback.from_user.id)
+        account_ids = [int(account['id']) for account in accounts]
+        if not account_ids:
+            await _answer_callback(callback, "📱 У вас нет аккаунтов!", show_alert=True)
+            return
+        await state.set_state(NeuroCommentStates.SELECTING_ACCOUNTS)
+        await state.update_data(nc_selected_accounts=account_ids)
+        await edit_message(
+            callback,
+            "🧠 <b>Нейрокомментинг</b>\n\n"
+            f"Выбраны все аккаунты: <b>{len(account_ids)}</b>\n"
+            "Будет запущен текущий сохранённый режим каждого аккаунта.\n"
+            "Аккаунты без настроенных каналов или промта будут пропущены.",
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Запустить на всех", callback_data="nc_start_selected")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="nc_bulk_cancel")],
+            ])
+        )
+
+    @dp.callback_query(F.data == 'nc_bulk_cancel')
+    async def nc_bulk_cancel_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback)
+        await state.clear()
+        await neurocomment_menu_handler(callback.message, state, callback.from_user.id)
+
+    @dp.callback_query(F.data == 'nc_start_selected')
+    async def nc_start_selected_callback(callback: CallbackQuery, state: FSMContext):
+        await _answer_callback(callback, "⏳ Запускаю нейрокомментинг...", show_alert=False)
+        data = await state.get_data()
+        account_ids = [int(account_id) for account_id in data.get('nc_selected_accounts', [])]
+        await state.clear()
+        if not account_ids:
+            await _answer_callback(callback, "❌ Не выбраны аккаунты.", show_alert=True)
+            return
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def start_one(account_id):
+            async with semaphore:
+                account = db.get_account(account_id) or {}
+                name = account.get('account_name') or f"Аккаунт #{account_id}"
+                if int(account.get('user_id') or 0) != int(callback.from_user.id):
+                    return name, False, 'Доступ запрещён'
+                try:
+                    ok, result = await account_manager.start_neurocomment(
+                        account_id, bot, callback.from_user.id
+                    )
+                    return name, bool(ok), str(result or '')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.error('Массовый запуск нейрокомментинга #%s: %s', account_id, error, exc_info=True)
+                    return name, False, f'{type(error).__name__}: {error}'
+
+        results = await asyncio.gather(*(start_one(account_id) for account_id in account_ids))
+        started = sum(1 for _name, ok, _result in results if ok)
+        lines = [
+            "🧠 <b>Массовый запуск нейрокомментинга завершён</b>",
+            f"✅ Запущено: {started}/{len(results)}",
+        ]
+        for name, ok, result in results:
+            detail = ' '.join(result.split())
+            lines.append(
+                f"{'✅' if ok else '⚠️'} <b>{html_escape(name)}</b>"
+                + (f": {html_escape(detail[:180])}" if detail else '')
+            )
+        await edit_message(
+            callback,
+            '\n'.join(lines)[:3900],
+            InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🧠 К нейрокомментингу", callback_data="back_to_neurocomment")],
+                [InlineKeyboardButton(text="📱 К аккаунтам", callback_data="back_to_accounts")],
+            ])
         )
 
     @dp.callback_query(F.data.startswith('nc_page_'))
